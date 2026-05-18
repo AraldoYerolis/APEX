@@ -21,12 +21,13 @@ def create_app(settings=None, conn=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Startup is handled in main.py before the server starts
+        # Startup is handled in main.py before the server starts.
         yield
-        # Shutdown
-        from apex.db.connection import close_db
+        # DB teardown is handled in main.py's finally block, which owns the
+        # connection lifetime.  Do not call close_db() here — the lifespan
+        # runs before main.py's finally, so closing here causes the subsequent
+        # repo.log_event("SHUTDOWN") call to hit an already-closed connection.
         logger.info("APEX shutting down...")
-        close_db()
 
     app = FastAPI(
         title="APEX",

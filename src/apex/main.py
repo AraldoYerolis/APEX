@@ -243,10 +243,35 @@ async def run() -> None:
     try:
         await server.serve()
     finally:
-        scheduler.shutdown(wait=False)
-        if _ws_manager:
-            await _ws_manager.stop()
-        repo.log_event(conn, "SHUTDOWN", "APEX stopped")
+        # Shutdown order matters:
+        #   1. Stop the scheduler first so no new jobs fire against a closing conn.
+        #   2. Stop the WebSocket manager.
+        #   3. Log SHUTDOWN while the connection is still open.
+        #   4. Close the DB last.
+        # Each step is wrapped individually so a failure in one never prevents
+        # the rest from running (and never produces an unhandled traceback on exit).
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"Scheduler shutdown error: {e}")
+
+        try:
+            if _ws_manager:
+                await _ws_manager.stop()
+        except Exception as e:
+            logger.warning(f"WebSocket shutdown error: {e}")
+
+        try:
+            repo.log_event(conn, "SHUTDOWN", "APEX stopped")
+        except Exception as e:
+            logger.warning(f"Could not write SHUTDOWN event: {e}")
+
+        try:
+            from apex.db.connection import close_db
+            close_db()
+        except Exception as e:
+            logger.warning(f"DB close error: {e}")
+
         logger.info("APEX shutdown complete")
 
 

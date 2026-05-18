@@ -34,6 +34,11 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def is_open() -> bool:
+    """Return True if a connection exists and has not been closed."""
+    return _conn is not None
+
+
 def close_db() -> None:
     global _conn
     if _conn is not None:
