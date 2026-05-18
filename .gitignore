@@ -43,3 +43,6 @@ Thumbs.db
 .coverage
 htmlcov/
 .ruff_cache/
+
+# Local runbook (contains live VPS details — keep out of git)
+docs/APEX_VPS_RUNBOOK.local.md
