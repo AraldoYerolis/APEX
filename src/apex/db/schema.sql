@@ -143,3 +143,39 @@ CREATE TABLE IF NOT EXISTS app_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at);
+
+-- ---------------------------------------------------------------
+-- signal_observations
+-- Dry-run forward-test tracking. Completely separate from alerts,
+-- paper_trades, and daily_risk. Never consumed by cooldown logic.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_observations (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_uid         TEXT UNIQUE NOT NULL,
+    observed_at             TEXT NOT NULL,           -- ISO8601 UTC
+    symbol                  TEXT NOT NULL,
+    direction               TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+    signal_type             TEXT NOT NULL CHECK(signal_type IN ('SETUP_FORMING','CONFIRMED_SETUP')),
+    -- Price levels: NULL for SETUP_FORMING (no risk_plan at that stage)
+    entry_price             REAL,
+    stop_price              REAL,
+    target_1r               REAL,
+    target_2r               REAL,
+    status                  TEXT NOT NULL DEFAULT 'OBSERVED'
+                                CHECK(status IN ('OBSERVED','HIT_1R','HIT_2R','STOPPED','EXPIRED')),
+    outcome_r               REAL,                    -- +1/+2/-1 on close; NULL while open
+    max_favorable_excursion REAL,                    -- running max move toward target (in R)
+    max_adverse_excursion   REAL,                    -- running max move against position (in R)
+    expires_at              TEXT NOT NULL,
+    closed_at               TEXT,
+    metadata_json           TEXT,                    -- trend/pullback reasons at observation time
+    created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_symbol
+    ON signal_observations(symbol, signal_type, status);
+CREATE INDEX IF NOT EXISTS idx_observations_uid
+    ON signal_observations(observation_uid);
+CREATE INDEX IF NOT EXISTS idx_observations_open
+    ON signal_observations(status, expires_at);

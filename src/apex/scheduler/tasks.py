@@ -1,6 +1,7 @@
 """Scheduled background tasks."""
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from apex.data.candle_store import CandleStore
 from apex.data.hyperliquid_client import HyperliquidClient
 from apex.data.market_universe import refresh_universe
 from apex.db import repository as repo
-from apex.db.models import Alert
+from apex.db.models import Alert, SignalObservation
 from apex.notifications.pushover_client import PushoverClient
 from apex.notifications.templates import (
     format_confirmed_alert,
@@ -129,6 +130,13 @@ async def run_signal_scan(
             if candidate.suppressed:
                 summary.engine_suppressed += 1
                 continue
+
+            # Record observation for dry-run signal quality tracking.
+            # Only active in dry-run mode — this feature is intentionally scoped
+            # to observation-only operation. Live-alert mode is handled separately
+            # if and when that is explicitly designed.
+            if settings.dry_run_mode:
+                _record_observation(candidate, conn, settings)
 
             outcome = await _send_alert(candidate, conn, settings, pushover)
             if outcome == "SENT":
@@ -321,3 +329,220 @@ async def run_followup_check(
                 logger.info(f"Follow-up sent for trade {trade.trade_uid}")
         except Exception as e:
             logger.error(f"Follow-up error for trade {trade_row['trade_uid']}: {e}")
+
+
+def _record_observation(
+    candidate: SignalCandidate,
+    conn: sqlite3.Connection,
+    settings: Settings,
+) -> None:
+    """Record or refresh a signal observation for dry-run quality tracking.
+
+    Deduplication: if an open (OBSERVED, not yet expired) row already exists
+    for this symbol/direction/signal_type, touch its updated_at and return.
+    Only inserts a new row when no open observation exists (first time, or
+    after the previous one closed/expired).
+
+    Safety guarantees — this function NEVER:
+      - writes to the alerts table
+      - reads or writes alert cooldown state
+      - writes to daily_risk
+      - sends Pushover notifications
+      - requires exchange credentials
+    """
+    try:
+        rp = candidate.pullback.risk_plan  # None for SETUP_FORMING
+
+        existing = repo.get_open_signal_observation(
+            conn, candidate.symbol, candidate.direction, candidate.alert_type
+        )
+        if existing is not None:
+            repo.touch_signal_observation(conn, existing["observation_uid"])
+            return
+
+        metadata = {
+            "trend_reason": candidate.trend.reason,
+            "pullback_reason": candidate.pullback.reason,
+        }
+        obs = SignalObservation(
+            observation_uid=new_uid(),
+            observed_at=utcnow_iso(),
+            symbol=candidate.symbol,
+            direction=candidate.direction,
+            signal_type=candidate.alert_type,
+            entry_price=rp.entry_price if rp else None,
+            stop_price=rp.stop_price if rp else None,
+            target_1r=rp.target_1r if rp else None,
+            target_2r=rp.target_2r if rp else None,
+            expires_at=minutes_from_now(settings.setup_expiration_minutes),
+            metadata_json=json.dumps(metadata),
+        )
+        repo.insert_signal_observation(conn, obs)
+        logger.debug(
+            f"Observation recorded: {candidate.alert_type} | "
+            f"{candidate.symbol} {candidate.direction}"
+        )
+    except Exception as e:
+        # Observation failure must never interrupt the scan or alert flow.
+        logger.warning(f"Failed to record observation for {candidate.symbol}: {e}")
+
+
+async def run_observation_evaluation(
+    conn: sqlite3.Connection,
+    candle_store: CandleStore,
+    settings: Settings,
+) -> None:
+    """Evaluate open signal observations against current candle data.
+
+    For each open CONFIRMED_SETUP observation, uses the most recent closed
+    candle's high/low range to check for outcome. SETUP_FORMING observations
+    have no price levels and are only expired.
+
+    Outcome priority (checked in this order):
+      1. Expired (expires_at <= now) → EXPIRED
+      2. Conservative stop-first on ambiguous same-candle touch:
+         LONG:  low <= stop_price AND high >= target  → STOPPED
+         SHORT: high >= stop_price AND low <= target  → STOPPED
+         Rationale: when both levels are breached in the same setup-timeframe candle,
+         the order of events is unknowable. Marking STOPPED is the conservative
+         (pessimistic) assumption. This avoids inflating win rates.
+      3. target_2r reached → HIT_2R (outcome_r = +2.0)
+      4. target_1r reached → HIT_1R (outcome_r = +1.0)
+      5. stop reached      → STOPPED (outcome_r = -1.0)
+      6. None of the above → update MFE/MAE and leave OBSERVED
+
+    MFE/MAE are updated on every pass, even when the observation stays OBSERVED.
+    MFE/MAE are expressed in R units relative to the entry price.
+
+    Safety: this function NEVER writes to alerts, paper_trades, daily_risk,
+    or snoozes. It is read-only with respect to all live-trading state.
+    """
+    # Defensive guard: observation tracking is a dry-run-only feature.
+    # The scheduler job is only registered in dry-run mode, but this guard
+    # ensures correctness if that ever changes.
+    if not settings.dry_run_mode:
+        return
+
+    try:
+        open_obs = repo.get_open_signal_observations(conn)
+        if not open_obs:
+            return
+
+        now = utcnow_iso()
+
+        for row in open_obs:
+            uid = row["observation_uid"]
+            symbol = row["symbol"]
+            direction = row["direction"]
+            signal_type = row["signal_type"]
+
+            # 1. Expiry check (applies to all signal types)
+            # Pass through any accumulated MFE/MAE so they are not overwritten with NULL.
+            if now >= row["expires_at"]:
+                repo.close_signal_observation(
+                    conn, uid,
+                    status="EXPIRED",
+                    closed_at=now,
+                    mfe=row["max_favorable_excursion"],
+                    mae=row["max_adverse_excursion"],
+                )
+                logger.debug(f"Observation {uid[:8]} expired: {symbol} {direction}")
+                continue
+
+            # 2. SETUP_FORMING: no price levels to evaluate — expiry only
+            if signal_type == "SETUP_FORMING":
+                continue
+
+            entry_price = row["entry_price"]
+            stop_price = row["stop_price"]
+            target_1r = row["target_1r"]
+            target_2r = row["target_2r"]
+
+            if None in (entry_price, stop_price, target_1r, target_2r):
+                # Incomplete price data — skip evaluation for this observation
+                continue
+
+            # 3. Get most recent closed candle high/low
+            df = candle_store.get_df(symbol, settings.setup_timeframe)
+            if df is None or df.empty:
+                continue
+
+            last = df.iloc[-1]
+            high = float(last["high"])
+            low = float(last["low"])
+
+            # 4. Update running MFE/MAE (in R units from entry)
+            r_size = abs(entry_price - stop_price)
+            if r_size <= 0:
+                continue
+
+            if direction == "LONG":
+                cur_favorable = (high - entry_price) / r_size
+                cur_adverse = (entry_price - low) / r_size
+            else:  # SHORT
+                cur_favorable = (entry_price - low) / r_size
+                cur_adverse = (high - entry_price) / r_size
+
+            new_mfe = max(row["max_favorable_excursion"] or 0.0, cur_favorable)
+            new_mae = max(row["max_adverse_excursion"] or 0.0, cur_adverse)
+
+            # 5. Determine outcome
+            new_status = None
+            outcome_r = None
+
+            if direction == "LONG":
+                stop_hit = low <= stop_price
+                t1_hit = high >= target_1r
+                t2_hit = high >= target_2r
+
+                if stop_hit and (t1_hit or t2_hit):
+                    # Ambiguous same-candle: conservative stop-first
+                    new_status = "STOPPED"
+                    outcome_r = -1.0
+                elif t2_hit:
+                    new_status = "HIT_2R"
+                    outcome_r = 2.0
+                elif t1_hit:
+                    new_status = "HIT_1R"
+                    outcome_r = 1.0
+                elif stop_hit:
+                    new_status = "STOPPED"
+                    outcome_r = -1.0
+
+            else:  # SHORT
+                stop_hit = high >= stop_price
+                t1_hit = low <= target_1r
+                t2_hit = low <= target_2r
+
+                if stop_hit and (t1_hit or t2_hit):
+                    # Ambiguous same-candle: conservative stop-first
+                    new_status = "STOPPED"
+                    outcome_r = -1.0
+                elif t2_hit:
+                    new_status = "HIT_2R"
+                    outcome_r = 2.0
+                elif t1_hit:
+                    new_status = "HIT_1R"
+                    outcome_r = 1.0
+                elif stop_hit:
+                    new_status = "STOPPED"
+                    outcome_r = -1.0
+
+            if new_status:
+                repo.close_signal_observation(
+                    conn, uid,
+                    status=new_status,
+                    outcome_r=outcome_r,
+                    closed_at=now,
+                    mfe=new_mfe,
+                    mae=new_mae,
+                )
+                logger.debug(
+                    f"Observation {uid[:8]} closed: {symbol} {direction} "
+                    f"→ {new_status} ({outcome_r:+.1f}R)"
+                )
+            else:
+                repo.update_observation_excursions(conn, uid, mfe=new_mfe, mae=new_mae)
+
+    except Exception as e:
+        logger.error(f"Observation evaluation error: {e}", exc_info=True)

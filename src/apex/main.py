@@ -21,6 +21,7 @@ from apex.logging_config import configure_logging
 from apex.notifications.pushover_client import PushoverClient
 from apex.scheduler.tasks import (
     run_followup_check,
+    run_observation_evaluation,
     run_signal_scan,
     run_universe_refresh,
 )
@@ -220,6 +221,18 @@ async def run() -> None:
         args=[conn, settings, pushover],
         id="followup_check",
     )
+
+    # Observation evaluation every 60 seconds — dry-run mode only.
+    # Gated here so the job is never registered in live-alert mode.
+    # run_observation_evaluation also has a defensive early return for safety.
+    if settings.dry_run_mode:
+        scheduler.add_job(
+            run_observation_evaluation,
+            "interval",
+            seconds=60,
+            args=[conn, _candle_store, settings],
+            id="observation_evaluation",
+        )
 
     scheduler.start()
     logger.info("Scheduler started")

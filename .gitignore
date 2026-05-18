@@ -46,3 +46,6 @@ htmlcov/
 
 # Local runbook (contains live VPS details — keep out of git)
 docs/APEX_VPS_RUNBOOK.local.md
+
+# Local review artifacts
+review_artifacts/

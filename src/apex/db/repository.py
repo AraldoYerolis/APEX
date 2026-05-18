@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from apex.db.models import Alert, DailyRisk, Market, PaperTrade, Snooze
+from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalObservation, Snooze
 
 
 def _now_utc() -> str:
@@ -333,6 +333,127 @@ def is_snoozed(conn: sqlite3.Connection, symbol: str) -> bool:
         (symbol, now),
     ).fetchone()
     return row is not None
+
+
+# ------------------------------------------------------------------ signal_observations
+
+def insert_signal_observation(conn: sqlite3.Connection, obs: SignalObservation) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO signal_observations (
+            observation_uid, observed_at, symbol, direction, signal_type,
+            entry_price, stop_price, target_1r, target_2r,
+            expires_at, metadata_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            obs.observation_uid,
+            obs.observed_at,
+            obs.symbol,
+            obs.direction,
+            obs.signal_type,
+            obs.entry_price,
+            obs.stop_price,
+            obs.target_1r,
+            obs.target_2r,
+            obs.expires_at,
+            obs.metadata_json,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_open_signal_observation(
+    conn: sqlite3.Connection,
+    symbol: str,
+    direction: str,
+    signal_type: str,
+) -> Optional[sqlite3.Row]:
+    """Return the open (OBSERVED, not yet expired) row for this symbol/direction/type.
+
+    Used for deduplication: if a row exists, the caller should touch it rather
+    than inserting a duplicate. An observation is considered still-open when
+    status='OBSERVED' AND expires_at > now — even if we haven't formally run
+    the evaluation job yet.
+    """
+    now = _now_utc()
+    return conn.execute(
+        """
+        SELECT * FROM signal_observations
+        WHERE symbol=? AND direction=? AND signal_type=?
+          AND status='OBSERVED' AND expires_at>?
+        ORDER BY observed_at DESC LIMIT 1
+        """,
+        (symbol, direction, signal_type, now),
+    ).fetchone()
+
+
+def touch_signal_observation(conn: sqlite3.Connection, uid: str) -> None:
+    """Refresh updated_at on an existing open observation (dedupe hit)."""
+    conn.execute(
+        "UPDATE signal_observations SET updated_at=? WHERE observation_uid=?",
+        (_now_utc(), uid),
+    )
+    conn.commit()
+
+
+def get_open_signal_observations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all OBSERVED rows for evaluation."""
+    return conn.execute(
+        "SELECT * FROM signal_observations WHERE status='OBSERVED' ORDER BY observed_at ASC"
+    ).fetchall()
+
+
+def close_signal_observation(
+    conn: sqlite3.Connection,
+    uid: str,
+    *,
+    status: str,
+    outcome_r: Optional[float] = None,
+    closed_at: Optional[str] = None,
+    mfe: Optional[float] = None,
+    mae: Optional[float] = None,
+) -> None:
+    """Mark an observation as closed with a final outcome."""
+    conn.execute(
+        """
+        UPDATE signal_observations
+        SET status=?, outcome_r=?, closed_at=?,
+            max_favorable_excursion=?, max_adverse_excursion=?,
+            updated_at=?
+        WHERE observation_uid=?
+        """,
+        (
+            status,
+            outcome_r,
+            closed_at or _now_utc(),
+            mfe,
+            mae,
+            _now_utc(),
+            uid,
+        ),
+    )
+    conn.commit()
+
+
+def update_observation_excursions(
+    conn: sqlite3.Connection,
+    uid: str,
+    *,
+    mfe: float,
+    mae: float,
+) -> None:
+    """Update running MFE/MAE on an observation that remains open."""
+    conn.execute(
+        """
+        UPDATE signal_observations
+        SET max_favorable_excursion=?, max_adverse_excursion=?, updated_at=?
+        WHERE observation_uid=?
+        """,
+        (mfe, mae, _now_utc(), uid),
+    )
+    conn.commit()
 
 
 # ------------------------------------------------------------------ app_events

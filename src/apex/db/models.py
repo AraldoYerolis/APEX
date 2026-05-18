@@ -92,3 +92,25 @@ class Snooze:
     snoozed_until: str
     reason: Optional[str] = None
     id: Optional[int] = None
+
+
+@dataclass
+class SignalObservation:
+    observation_uid: str
+    observed_at: str
+    symbol: str
+    direction: str   # LONG | SHORT
+    signal_type: str  # SETUP_FORMING | CONFIRMED_SETUP
+    expires_at: str
+    # Price levels are None for SETUP_FORMING (no risk_plan at that stage)
+    entry_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    target_1r: Optional[float] = None
+    target_2r: Optional[float] = None
+    status: str = "OBSERVED"
+    outcome_r: Optional[float] = None
+    max_favorable_excursion: Optional[float] = None
+    max_adverse_excursion: Optional[float] = None
+    closed_at: Optional[str] = None
+    metadata_json: Optional[str] = None
+    id: Optional[int] = None
