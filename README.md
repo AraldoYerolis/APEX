@@ -151,6 +151,37 @@ PYTHONPATH=src python scripts/send_simulated_alert.py --type CONFIRMED_SETUP --s
 
 ---
 
+## Local HTTP Action Route Smoke Test
+
+Validates every action route end-to-end through real HTTP against a locally
+running APEX server — no Pushover, no live trades, no private keys.
+
+**Terminal 1 — start APEX:**
+```bash
+PYTHONPATH=src .venv/bin/python -m apex.main
+```
+
+**Terminal 2 — run the smoke test:**
+```bash
+PYTHONPATH=src .venv/bin/python scripts/smoke_test_action_routes.py
+```
+
+What it checks:
+- `/action/alerts/{uid}/enter` → alert status=ENTERED, paper_trade created
+- `/action/alerts/{uid}/skip` → alert status=SKIPPED
+- `/action/alerts/{uid}/snooze-15` → alert status=SNOOZED, snooze row in DB
+- `/action/trades/{uid}/win` → trade status=WIN
+- `/action/trades/{uid}/breakeven` → trade status=BREAKEVEN
+- `/action/trades/{uid}/loss` → trade status=LOSS, daily_risk incremented
+- Duplicate actions → idempotent "Already Entered / Already Closed" response
+- Invalid token → "Invalid Token" response
+- Missing alert/trade → "Not Found" response
+
+All smoke rows use the symbol `SMOKE_BTC` and UIDs prefixed with `smoke_` so
+they are easy to identify and clean up manually if needed.
+
+---
+
 ## Running Unit Tests
 
 ```bash
@@ -158,7 +189,7 @@ PYTHONPATH=src pytest tests/ -v
 ```
 
 Tests cover: EMA, RSI, ATR, VWAP, trend bias, risk sizing, throttles, daily lockout,
-action tokens.
+action tokens, action handler lifecycle, dry-run alert accounting, shutdown ordering.
 
 ---
 
