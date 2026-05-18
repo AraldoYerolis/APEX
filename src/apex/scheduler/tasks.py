@@ -85,16 +85,29 @@ async def run_signal_scan(
     logger.info(f"Scan complete: {alerts_sent} alerts sent from {len(markets)} markets")
 
 
+def _dry_run_prefix(settings: Settings) -> str:
+    return "[DRY RUN] " if settings.dry_run_mode else ""
+
+
 async def _send_alert(
     candidate: SignalCandidate,
     conn: sqlite3.Connection,
     settings: Settings,
     pushover: PushoverClient,
 ) -> None:
-    """Persist alert and send Pushover notification."""
+    """Persist alert and send Pushover notification (if enabled)."""
     result = candidate.pullback
     trend = candidate.trend
     alert_type = candidate.alert_type
+    prefix = _dry_run_prefix(settings)
+
+    # --- Gate: alert type enabled? ---
+    if alert_type not in settings.alert_types_enabled_list:
+        logger.info(
+            f"{prefix}SUPPRESSED ({alert_type} not in ALERT_TYPES_ENABLED) | "
+            f"{candidate.symbol} {candidate.direction}"
+        )
+        return
 
     alert_uid = new_uid()
     now = utcnow_iso()
@@ -152,7 +165,22 @@ async def _send_alert(
         )
         priority = settings.pushover_default_priority
 
-    # Persist message body
+    # --- Gate: alerts enabled? ---
+    if not settings.alerts_enabled:
+        logger.info(
+            f"{prefix}WOULD-BE ALERT | {alert_type} | "
+            f"{candidate.symbol} {candidate.direction} | "
+            f"title={title!r} | reason={result.reason} | "
+            f"(suppressed: ALERTS_ENABLED=false)"
+        )
+        repo.log_event(
+            conn,
+            "ALERT_SUPPRESSED",
+            f"{prefix}{alert_type}: {candidate.symbol} {candidate.direction} — ALERTS_ENABLED=false",
+            metadata={"alert_uid": alert_uid, "reason": result.reason},
+        )
+        return
+
     repo.log_event(
         conn,
         "ALERT_GENERATED",

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     apex_db_path: str = "./data/apex.db"
     apex_public_base_url: str = ""
 
+    # Alert controls
+    alerts_enabled: bool = False
+    dry_run_mode: bool = True
+    # Comma-separated: SETUP_FORMING, CONFIRMED_SETUP, or both
+    alert_types_enabled: str = "CONFIRMED_SETUP"
+
     # FastAPI
     apex_host: str = "127.0.0.1"
     apex_port: int = 8000
@@ -82,6 +88,12 @@ class Settings(BaseSettings):
     # --- derived helpers ---
 
     @property
+    def alert_types_enabled_list(self) -> list[str]:
+        valid = {"SETUP_FORMING", "CONFIRMED_SETUP"}
+        result = [t.strip().upper() for t in self.alert_types_enabled.split(",") if t.strip()]
+        return [t for t in result if t in valid]
+
+    @property
     def priority_symbols_list(self) -> list[str]:
         return [s.strip().upper() for s in self.priority_symbols.split(",") if s.strip()]
 
@@ -106,15 +118,15 @@ class Settings(BaseSettings):
         return v.upper()
 
     @model_validator(mode="after")
-    def _warn_missing_pushover(self) -> "Settings":
-        missing = []
+    def _startup_warnings(self) -> "Settings":
+        missing_pushover = []
         if not self.pushover_app_token:
-            missing.append("PUSHOVER_APP_TOKEN")
+            missing_pushover.append("PUSHOVER_APP_TOKEN")
         if not self.pushover_user_key:
-            missing.append("PUSHOVER_USER_KEY")
-        if missing:
+            missing_pushover.append("PUSHOVER_USER_KEY")
+        if missing_pushover:
             print(
-                f"[APEX CONFIG WARNING] Pushover not configured: {missing}. "
+                f"[APEX CONFIG WARNING] Pushover not configured: {missing_pushover}. "
                 "Alerts will not be sent.",
                 file=sys.stderr,
             )
@@ -128,6 +140,22 @@ class Settings(BaseSettings):
             print(
                 "[APEX CONFIG WARNING] ACTION_TOKEN_SECRET is using the default value. "
                 "Set a strong random secret in production.",
+                file=sys.stderr,
+            )
+        if not self.alerts_enabled:
+            print(
+                "[APEX CONFIG] ALERTS_ENABLED=false — strategy alerts will be logged but NOT sent.",
+                file=sys.stderr,
+            )
+        if self.dry_run_mode:
+            print(
+                "[APEX CONFIG] DRY_RUN_MODE=true — logs will be prefixed [DRY RUN].",
+                file=sys.stderr,
+            )
+        if not self.alert_types_enabled_list:
+            print(
+                "[APEX CONFIG WARNING] ALERT_TYPES_ENABLED is empty or invalid. "
+                "No alert types will be sent.",
                 file=sys.stderr,
             )
         return self

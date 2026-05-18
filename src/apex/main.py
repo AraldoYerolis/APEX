@@ -107,13 +107,31 @@ async def run() -> None:
 
     logger.info("=" * 60)
     logger.info("APEX starting up")
-    logger.info(f"  env={settings.apex_env}")
-    logger.info(f"  db={settings.apex_db_path}")
-    logger.info(f"  scan_mode={settings.scan_mode}")
-    logger.info(f"  account_size=${settings.account_size_usd}")
-    logger.info(f"  max_risk_per_trade=${settings.max_risk_usd:.2f}")
-    logger.info(f"  max_daily_loss=${settings.max_daily_loss_usd:.2f}")
-    logger.info(f"  action_links={'enabled' if settings.apex_public_base_url else 'DISABLED'}")
+    logger.info(f"  env                  = {settings.apex_env}")
+    logger.info(f"  db                   = {settings.apex_db_path}")
+    logger.info(f"  scan_mode            = {settings.scan_mode}")
+    logger.info(f"  account_size         = ${settings.account_size_usd}")
+    logger.info(f"  max_risk_per_trade   = ${settings.max_risk_usd:.2f}")
+    logger.info(f"  max_daily_loss       = ${settings.max_daily_loss_usd:.2f}")
+    logger.info(f"  alerts_enabled       = {settings.alerts_enabled}")
+    logger.info(f"  dry_run_mode         = {settings.dry_run_mode}")
+    logger.info(f"  alert_types_enabled  = {settings.alert_types_enabled_list or '(none)'}")
+    logger.info(
+        f"  pushover_configured  = "
+        f"{bool(settings.pushover_app_token and settings.pushover_user_key)}"
+    )
+    logger.info(
+        f"  action_links         = "
+        f"{'enabled' if settings.apex_public_base_url else 'DISABLED (APEX_PUBLIC_BASE_URL not set)'}"
+    )
+    if not settings.alerts_enabled:
+        logger.warning(
+            "  *** ALERTS_ENABLED=false: strategy alerts will be logged but NOT sent ***"
+        )
+    if settings.dry_run_mode:
+        logger.warning(
+            "  *** DRY_RUN_MODE=true: suppressed-alert log lines will show [DRY RUN] ***"
+        )
     logger.info("=" * 60)
 
     # Initialize DB
@@ -138,6 +156,9 @@ async def run() -> None:
     if not scan_symbols:
         logger.warning("No scan-enabled symbols found. Check config and connectivity.")
         # Allow startup to continue in degraded mode
+    else:
+        logger.info(f"Scan-enabled symbols ({len(scan_symbols)}): {', '.join(scan_symbols[:15])}"
+                    + (f" ... +{len(scan_symbols)-15} more" if len(scan_symbols) > 15 else ""))
 
     timeframes = [
         settings.trend_timeframe,
@@ -207,6 +228,8 @@ async def run() -> None:
 
     # Create and run FastAPI app
     app = create_app(settings=settings, conn=conn)
+    app.state.scheduler = scheduler
+    app.state.scan_symbols = scan_symbols
 
     config = uvicorn.Config(
         app=app,

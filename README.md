@@ -69,19 +69,22 @@ cp .env.example .env
 
 Key variables:
 
-| Variable | Description |
-|---|---|
-| `PUSHOVER_APP_TOKEN` | Pushover app token (required for alerts) |
-| `PUSHOVER_USER_KEY` | Pushover user key (required for alerts) |
-| `APEX_PUBLIC_BASE_URL` | Your public domain (required for action links) |
-| `ACTION_TOKEN_SECRET` | Random secret for HMAC tokens — **change this!** |
-| `ACCOUNT_SIZE_USD` | Your account size for position sizing |
-| `RISK_PER_TRADE_PCT` | Max risk per trade as % of account (default: 1) |
-| `MAX_DAILY_PLANNED_LOSS_PCT` | Daily loss lockout threshold (default: 3%) |
-| `SCAN_MODE` | `MAJOR_ONLY` (default) or `ALL_PERPS` |
-| `PRIORITY_SYMBOLS` | Always-scan symbols: `BTC,ETH,SOL,HYPE` |
+| Variable | Default | Description |
+|---|---|---|
+| `PUSHOVER_APP_TOKEN` | (empty) | Pushover app token — required to send alerts |
+| `PUSHOVER_USER_KEY` | (empty) | Pushover user key — required to send alerts |
+| `APEX_PUBLIC_BASE_URL` | (empty) | Your public domain — required for action links |
+| `ACTION_TOKEN_SECRET` | (placeholder) | HMAC secret for action links — **change this!** |
+| `ALERTS_ENABLED` | `false` | Master alert switch — set `true` to send live alerts |
+| `DRY_RUN_MODE` | `true` | Adds `[DRY RUN]` prefix to suppressed-alert log lines |
+| `ALERT_TYPES_ENABLED` | `CONFIRMED_SETUP` | Which alert types to send — `SETUP_FORMING`, `CONFIRMED_SETUP`, or both comma-separated |
+| `ACCOUNT_SIZE_USD` | `100` | Your account size for position sizing |
+| `RISK_PER_TRADE_PCT` | `1` | Max risk per trade as % of account |
+| `MAX_DAILY_PLANNED_LOSS_PCT` | `3` | Daily loss lockout threshold |
+| `SCAN_MODE` | `MAJOR_ONLY` | `MAJOR_ONLY` or `ALL_PERPS` |
+| `PRIORITY_SYMBOLS` | `BTC,ETH,SOL,HYPE` | Always-scan symbols regardless of volume |
 
-See `.env.example` for full reference.
+See `.env.example` for the full reference.
 
 ---
 
@@ -106,14 +109,44 @@ Status: `curl http://127.0.0.1:8000/status`
 
 ---
 
+## Local Runtime Safety
+
+APEX defaults to a safe, non-alerting state out of the box:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ALERTS_ENABLED` | `false` | Bot scans and logs, but **never sends Pushover notifications** |
+| `DRY_RUN_MODE` | `true` | Log lines for suppressed alerts show `[DRY RUN]` prefix |
+| `ALERT_TYPES_ENABLED` | `CONFIRMED_SETUP` | Only CONFIRMED setups will send (when enabled) |
+
+**Enable alerts only when you are ready:**
+
+```ini
+# In .env
+ALERTS_ENABLED=true
+DRY_RUN_MODE=false
+ALERT_TYPES_ENABLED=CONFIRMED_SETUP
+```
+
+Smoke test scripts (`smoke_test_pushover.py`, `send_simulated_alert.py`) bypass the
+`ALERTS_ENABLED` flag intentionally — they send directly via Pushover to test credentials
+and message formatting.
+
+---
+
 ## Running Smoke Tests
 
 ```bash
 # Test Hyperliquid connectivity (no credentials needed)
 PYTHONPATH=src python scripts/smoke_test_hyperliquid.py
 
-# Test Pushover (requires PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY in .env)
+# Test Pushover credentials and delivery
 PYTHONPATH=src python scripts/smoke_test_pushover.py
+
+# Send a simulated strategy alert to test message formatting
+PYTHONPATH=src python scripts/send_simulated_alert.py --type SETUP_FORMING
+PYTHONPATH=src python scripts/send_simulated_alert.py --type CONFIRMED_SETUP
+PYTHONPATH=src python scripts/send_simulated_alert.py --type CONFIRMED_SETUP --symbol ETH --direction SHORT
 ```
 
 ---
