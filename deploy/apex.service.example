@@ -1,0 +1,26 @@
+[Unit]
+Description=APEX Hyperliquid Alert Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apex
+EnvironmentFile=/opt/apex/.env
+ExecStart=/opt/apex/.venv/bin/python -m apex.main
+Restart=always
+RestartSec=5
+User=apex
+Group=apex
+
+# Safety limits
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex
+
+[Install]
+WantedBy=multi-user.target
