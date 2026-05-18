@@ -13,9 +13,12 @@ RestartSec=5
 User=apex
 Group=apex
 
-# Safety limits
+# Sandboxing — allows writes only to /opt/apex/data
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/opt/apex/data
 
 # Logging
 StandardOutput=journal
