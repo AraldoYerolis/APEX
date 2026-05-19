@@ -5,11 +5,13 @@ interpretation. Never modifies any data or starts any services.
 
 Usage (run from repo root):
     PYTHONPATH=src python scripts/debug_signal_conditions.py
+    PYTHONPATH=src python scripts/debug_signal_conditions.py --since 2026-05-01T00:00:00Z
 
 Requires APEX_DB_PATH to be set in .env (or defaults to ./data/apex.db).
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import defaultdict
 from typing import Any
@@ -28,7 +30,16 @@ def _effective_final_status(row: Any) -> str:
     return row["final_status"] or row["status"]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="APEX signal conditions debug report")
+    parser.add_argument(
+        "--since",
+        metavar="ISO_TIMESTAMP",
+        default=None,
+        help="Filter observations to those with observed_at >= TIMESTAMP (e.g. 2026-05-01T00:00:00Z)",
+    )
+    args = parser.parse_args(argv)
+
     settings = get_settings()
     conn = init_db(settings.apex_db_path)
 
@@ -37,6 +48,8 @@ def main() -> None:
     print("=" * 68)
     print("  APEX Debug: Signal Conditions")
     print("=" * 68)
+    if args.since:
+        print(f"  Filtered since      : {args.since}")
     print()
     print("  Safety:")
     print(f"    alerts_enabled   : {settings.alerts_enabled}")
@@ -71,11 +84,17 @@ def main() -> None:
     except Exception:
         pass  # app_events table may not exist in test environments
 
-    # --- Fetch all observations ---
+    # --- Fetch observations (optionally filtered) ---
     try:
-        rows = conn.execute(
-            "SELECT * FROM signal_observations ORDER BY observed_at DESC"
-        ).fetchall()
+        if args.since:
+            rows = conn.execute(
+                "SELECT * FROM signal_observations WHERE observed_at >= ? ORDER BY observed_at DESC",
+                (args.since,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM signal_observations ORDER BY observed_at DESC"
+            ).fetchall()
     except Exception as e:
         print(f"\n  ERROR: could not query signal_observations: {e}", file=sys.stderr)
         close_db()

@@ -1025,7 +1025,7 @@ def test_report_script_runs(tmp_path, monkeypatch):
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        mod.main()
+        mod.main([])
 
     assert "APEX Signal Observations Report" in buf.getvalue()
 
@@ -1052,7 +1052,7 @@ def test_debug_script_runs(tmp_path, monkeypatch):
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        mod.main()
+        mod.main([])
 
     assert "APEX Debug: Signal Conditions" in buf.getvalue()
 

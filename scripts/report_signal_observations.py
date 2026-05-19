@@ -2,12 +2,14 @@
 
 Usage (run from repo root):
     PYTHONPATH=src python scripts/report_signal_observations.py
+    PYTHONPATH=src python scripts/report_signal_observations.py --since 2026-05-01T00:00:00Z
 
 Requires APEX_DB_PATH to be set in .env (or defaults to ./data/apex.db).
 Does not start the bot, does not write any data.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import defaultdict
 from typing import Any
@@ -37,14 +39,29 @@ def _effective_final_status(row: Any) -> str:
     return row["final_status"] or row["status"]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="APEX signal observations report")
+    parser.add_argument(
+        "--since",
+        metavar="ISO_TIMESTAMP",
+        default=None,
+        help="Filter observations to those with observed_at >= TIMESTAMP (e.g. 2026-05-01T00:00:00Z)",
+    )
+    args = parser.parse_args(argv)
+
     settings = get_settings()
     conn = init_db(settings.apex_db_path)
 
     try:
-        rows = conn.execute(
-            "SELECT * FROM signal_observations ORDER BY observed_at DESC"
-        ).fetchall()
+        if args.since:
+            rows = conn.execute(
+                "SELECT * FROM signal_observations WHERE observed_at >= ? ORDER BY observed_at DESC",
+                (args.since,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM signal_observations ORDER BY observed_at DESC"
+            ).fetchall()
     except Exception as e:
         print(f"ERROR: could not query signal_observations: {e}", file=sys.stderr)
         print("Has the DB been initialized with the latest schema?", file=sys.stderr)
@@ -141,6 +158,8 @@ def main() -> None:
     print("=" * 68)
     print("  APEX Signal Observations Report")
     print("=" * 68)
+    if args.since:
+        print(f"  Filtered since      : {args.since}")
     print(f"  Total observations  : {total}")
     print(f"  Open (OBSERVED)     : {len(open_obs)}")
     print(f"  Closed              : {len(closed_obs)}")
