@@ -405,6 +405,34 @@ def get_open_signal_observations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def record_tp1_milestone(
+    conn: sqlite3.Connection,
+    uid: str,
+    *,
+    hit_at: str,
+    time_seconds: float,
+    mfe: Optional[float] = None,
+    mae: Optional[float] = None,
+) -> None:
+    """Record that TP1 was reached without closing the observation.
+
+    The observation remains OBSERVED so it continues to be evaluated for
+    TP2, stop, or expiry. Only called when hit_1r_at is currently NULL.
+    MFE/MAE are updated alongside the milestone timestamp.
+    """
+    conn.execute(
+        """
+        UPDATE signal_observations
+        SET hit_1r_at=?, time_to_1r_seconds=?,
+            max_favorable_excursion=?, max_adverse_excursion=?,
+            updated_at=?
+        WHERE observation_uid=?
+        """,
+        (hit_at, time_seconds, mfe, mae, _now_utc(), uid),
+    )
+    conn.commit()
+
+
 def close_signal_observation(
     conn: sqlite3.Connection,
     uid: str,
@@ -414,13 +442,39 @@ def close_signal_observation(
     closed_at: Optional[str] = None,
     mfe: Optional[float] = None,
     mae: Optional[float] = None,
+    # Milestone 10A additions — all optional for backward compatibility
+    hit_1r_at: Optional[str] = None,
+    hit_2r_at: Optional[str] = None,
+    stopped_at: Optional[str] = None,
+    expired_at: Optional[str] = None,
+    first_terminal_status: Optional[str] = None,
+    final_status: Optional[str] = None,
+    time_to_1r_seconds: Optional[float] = None,
+    time_to_2r_seconds: Optional[float] = None,
+    time_to_stop_seconds: Optional[float] = None,
+    time_to_expiry_seconds: Optional[float] = None,
+    hit_1r_before_stop: Optional[int] = None,
+    hit_1r_before_expiry: Optional[int] = None,
 ) -> None:
-    """Mark an observation as closed with a final outcome."""
+    """Mark an observation as closed with a final outcome.
+
+    hit_1r_at and time_to_1r_seconds use COALESCE so that a value set
+    earlier by record_tp1_milestone is preserved when TP2 or stop closes
+    the observation later. All Milestone 10A params default to None for
+    backward compatibility with call sites that don't supply them.
+    """
     conn.execute(
         """
         UPDATE signal_observations
         SET status=?, outcome_r=?, closed_at=?,
             max_favorable_excursion=?, max_adverse_excursion=?,
+            hit_1r_at=COALESCE(hit_1r_at, ?),
+            hit_2r_at=?, stopped_at=?, expired_at=?,
+            first_terminal_status=?, final_status=?,
+            time_to_1r_seconds=COALESCE(time_to_1r_seconds, ?),
+            time_to_2r_seconds=?, time_to_stop_seconds=?,
+            time_to_expiry_seconds=?,
+            hit_1r_before_stop=?, hit_1r_before_expiry=?,
             updated_at=?
         WHERE observation_uid=?
         """,
@@ -430,6 +484,18 @@ def close_signal_observation(
             closed_at or _now_utc(),
             mfe,
             mae,
+            hit_1r_at,          # COALESCE: preserve existing value from record_tp1_milestone
+            hit_2r_at,
+            stopped_at,
+            expired_at,
+            first_terminal_status,
+            final_status,
+            time_to_1r_seconds,  # COALESCE: preserve existing value
+            time_to_2r_seconds,
+            time_to_stop_seconds,
+            time_to_expiry_seconds,
+            hit_1r_before_stop,
+            hit_1r_before_expiry,
             _now_utc(),
             uid,
         ),

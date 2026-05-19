@@ -113,4 +113,17 @@ class SignalObservation:
     max_adverse_excursion: Optional[float] = None
     closed_at: Optional[str] = None
     metadata_json: Optional[str] = None
+    # Milestone 10A: non-terminal TP1 tracking
+    hit_1r_at: Optional[str] = None
+    hit_2r_at: Optional[str] = None
+    stopped_at: Optional[str] = None
+    expired_at: Optional[str] = None
+    first_terminal_status: Optional[str] = None
+    final_status: Optional[str] = None
+    time_to_1r_seconds: Optional[float] = None
+    time_to_2r_seconds: Optional[float] = None
+    time_to_stop_seconds: Optional[float] = None
+    time_to_expiry_seconds: Optional[float] = None
+    hit_1r_before_stop: Optional[int] = None
+    hit_1r_before_expiry: Optional[int] = None
     id: Optional[int] = None

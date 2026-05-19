@@ -274,6 +274,7 @@ def test_dedupe_after_stopped_allows_new_observation(db):
 # ------------------------------------------------------------------ evaluation: LONG
 
 async def test_evaluate_long_hit_1r(db):
+    """TP1 hit is now a non-terminal milestone: observation stays OBSERVED."""
     settings = _make_settings()
     # entry=100, stop=99, t1=101, t2=102
     _insert_obs(db)
@@ -282,9 +283,12 @@ async def test_evaluate_long_hit_1r(db):
     await run_observation_evaluation(db, store, settings)
 
     row = db.execute("SELECT * FROM signal_observations").fetchone()
-    assert row["status"] == "HIT_1R"
-    assert row["outcome_r"] == 1.0
-    assert row["closed_at"] is not None
+    # Observation stays open — TP1 is a milestone, not a terminal close
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+    assert row["time_to_1r_seconds"] is not None
+    assert row["closed_at"] is None
+    assert row["outcome_r"] is None
 
 
 async def test_evaluate_long_hit_2r(db):
@@ -328,6 +332,7 @@ async def test_evaluate_long_conservative_stop_first(db):
 # ------------------------------------------------------------------ evaluation: SHORT
 
 async def test_evaluate_short_hit_1r(db):
+    """SHORT TP1 hit is a milestone: observation stays OBSERVED."""
     settings = _make_settings()
     # SHORT: entry=100, stop=101, t1=99, t2=98
     _insert_obs(db, direction="SHORT", stop=101.0, t1=99.0, t2=98.0)
@@ -336,8 +341,10 @@ async def test_evaluate_short_hit_1r(db):
     await run_observation_evaluation(db, store, settings)
 
     row = db.execute("SELECT * FROM signal_observations").fetchone()
-    assert row["status"] == "HIT_1R"
-    assert row["outcome_r"] == 1.0
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+    assert row["time_to_1r_seconds"] is not None
+    assert row["closed_at"] is None
 
 
 async def test_evaluate_short_hit_2r(db):
@@ -755,3 +762,302 @@ async def test_mfe_mae_preserved_when_expired(db):
     # MFE/MAE from the first pass must still be present, not overwritten with NULL
     assert row["max_favorable_excursion"] is not None
     assert row["max_adverse_excursion"] is not None
+
+
+# ------------------------------------------------------------------ Milestone 10A: TP1 non-terminal
+
+async def test_tp1_milestone_then_tp2_long(db):
+    """After TP1 milestone, a subsequent TP2 candle closes the observation HIT_2R."""
+    settings = _make_settings()
+    _insert_obs(db)  # entry=100, stop=99, t1=101, t2=102
+
+    # Pass 1: TP1 hit — stays open
+    store1 = _make_candle_store(high=101.5, low=100.2)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+
+    # Pass 2: TP2 hit
+    store2 = _make_candle_store(high=102.5, low=101.0)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "HIT_2R"
+    assert row["outcome_r"] == 2.0
+    assert row["hit_1r_at"] is not None        # milestone preserved
+    assert row["hit_2r_at"] is not None
+    assert row["time_to_2r_seconds"] is not None
+    assert row["final_status"] == "HIT_2R"
+    assert row["closed_at"] is not None
+
+
+async def test_tp1_milestone_then_stopped_long(db):
+    """After TP1 milestone, a stop candle closes STOPPED with hit_1r_before_stop=1."""
+    settings = _make_settings()
+    _insert_obs(db)
+
+    # Pass 1: TP1 hit
+    store1 = _make_candle_store(high=101.5, low=100.2)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+
+    # Pass 2: stop hit
+    store2 = _make_candle_store(high=100.8, low=98.5)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "STOPPED"
+    assert row["outcome_r"] == -1.0
+    assert row["hit_1r_at"] is not None        # milestone preserved
+    assert row["hit_1r_before_stop"] == 1
+    assert row["stopped_at"] is not None
+    assert row["time_to_stop_seconds"] is not None
+    assert row["final_status"] == "STOPPED"
+
+
+async def test_tp1_milestone_then_expired(db):
+    """After TP1 milestone, expiry closes EXPIRED with hit_1r_before_expiry=1."""
+    settings = _make_settings()
+    obs = _insert_obs(db)
+
+    # Pass 1: TP1 hit
+    store1 = _make_candle_store(high=101.5, low=100.2)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+
+    # Force expiry
+    db.execute(
+        "UPDATE signal_observations SET expires_at=? WHERE observation_uid=?",
+        (minutes_ago_iso(1), obs.observation_uid),
+    )
+    db.commit()
+
+    store2 = _make_candle_store(high=100.5, low=100.1)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "EXPIRED"
+    assert row["hit_1r_at"] is not None        # milestone preserved through expiry
+    assert row["hit_1r_before_expiry"] == 1
+    assert row["expired_at"] is not None
+    assert row["time_to_expiry_seconds"] is not None
+    assert row["final_status"] == "EXPIRED"
+
+
+async def test_stopped_without_tp1_has_flag_false(db):
+    """Stop before TP1: hit_1r_before_stop=0."""
+    settings = _make_settings()
+    _insert_obs(db)
+
+    store = _make_candle_store(high=100.5, low=98.5)  # stop hit, TP1 not hit
+    await run_observation_evaluation(db, store, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "STOPPED"
+    assert row["hit_1r_before_stop"] == 0
+    assert row["hit_1r_at"] is None
+
+
+async def test_expired_without_tp1_has_flag_false(db):
+    """Expiry before TP1: hit_1r_before_expiry=0."""
+    settings = _make_settings()
+    obs = _insert_obs(db, expires_minutes=15)
+
+    # Force expiry without ever hitting TP1
+    db.execute(
+        "UPDATE signal_observations SET expires_at=? WHERE observation_uid=?",
+        (minutes_ago_iso(1), obs.observation_uid),
+    )
+    db.commit()
+
+    store = _make_candle_store(high=100.3, low=99.8)
+    await run_observation_evaluation(db, store, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "EXPIRED"
+    assert row["hit_1r_before_expiry"] == 0
+    assert row["hit_1r_at"] is None
+
+
+async def test_direct_tp2_without_prior_tp1(db):
+    """TP2 hit directly (no prior TP1 pass): both hit_1r_at and hit_2r_at are set."""
+    settings = _make_settings()
+    _insert_obs(db)
+
+    store = _make_candle_store(high=102.5, low=100.5)  # high crosses t2 directly
+    await run_observation_evaluation(db, store, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "HIT_2R"
+    assert row["outcome_r"] == 2.0
+    assert row["hit_1r_at"] is not None   # implicitly set (TP1 is on the way to TP2)
+    assert row["hit_2r_at"] is not None
+    assert row["time_to_1r_seconds"] is not None
+    assert row["time_to_2r_seconds"] is not None
+    assert row["final_status"] == "HIT_2R"
+
+
+async def test_conservative_stop_after_tp1_same_candle(db):
+    """After TP1 milestone, same candle hits both stop and TP2: conservative STOPPED."""
+    settings = _make_settings()
+    _insert_obs(db)
+
+    # Pass 1: TP1 only
+    store1 = _make_candle_store(high=101.5, low=100.2)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+
+    # Pass 2: same candle hits both TP2 (high=102.5) and stop (low=98.5)
+    store2 = _make_candle_store(high=102.5, low=98.5)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "STOPPED"
+    assert row["outcome_r"] == -1.0
+    assert row["hit_1r_before_stop"] == 1   # TP1 was recorded in pass 1
+    assert row["final_status"] == "STOPPED"
+
+
+async def test_tp1_milestone_then_tp2_short(db):
+    """SHORT: after TP1 milestone, TP2 closes HIT_2R."""
+    settings = _make_settings()
+    # SHORT: entry=100, stop=101, t1=99, t2=98
+    _insert_obs(db, direction="SHORT", stop=101.0, t1=99.0, t2=98.0)
+
+    # Pass 1: TP1 hit (low=98.5 <= t1=99, but not <= t2=98)
+    store1 = _make_candle_store(high=100.5, low=98.5)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+
+    # Pass 2: TP2 hit
+    store2 = _make_candle_store(high=100.2, low=97.5)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "HIT_2R"
+    assert row["outcome_r"] == 2.0
+    assert row["final_status"] == "HIT_2R"
+
+
+async def test_tp1_milestone_mfe_mae_preserved(db):
+    """MFE/MAE accumulated before TP1 are preserved after the milestone is recorded."""
+    settings = _make_settings()
+    _insert_obs(db)
+
+    # Pass 1: favorable move but below TP1
+    store1 = _make_candle_store(high=100.8, low=99.7)
+    await run_observation_evaluation(db, store1, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is None
+
+    # Pass 2: TP1 hit — milestone recorded; MFE should update
+    store2 = _make_candle_store(high=101.5, low=100.1)
+    await run_observation_evaluation(db, store2, settings)
+
+    row = db.execute("SELECT * FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    assert row["hit_1r_at"] is not None
+    # MFE should reflect the TP1 pass (high=101.5, entry=100, r=1 → MFE=1.5)
+    assert row["max_favorable_excursion"] is not None
+    assert row["max_favorable_excursion"] >= 0.8  # at least as large as pass 1
+
+
+def test_existing_observations_readable_after_migration(db):
+    """Rows inserted without the new columns are still queryable (NULL for new fields)."""
+    # Insert using the minimal INSERT that mirrors pre-10A behavior
+    import uuid
+    uid = str(uuid.uuid4())
+    db.execute(
+        """
+        INSERT INTO signal_observations
+            (observation_uid, observed_at, symbol, direction, signal_type,
+             entry_price, stop_price, target_1r, target_2r, expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (uid, "2026-01-01T00:00:00Z", "LEGACY_BTC", "LONG", "CONFIRMED_SETUP",
+         100.0, 99.0, 101.0, 102.0, "2026-01-01T01:00:00Z"),
+    )
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM signal_observations WHERE observation_uid=?", (uid,)
+    ).fetchone()
+    assert row is not None
+    assert row["symbol"] == "LEGACY_BTC"
+    assert row["hit_1r_at"] is None       # new column — NULL on legacy row
+    assert row["final_status"] is None    # new column — NULL on legacy row
+    assert row["hit_1r_before_stop"] is None
+
+
+def test_report_script_runs(tmp_path, monkeypatch):
+    """report_signal_observations main() runs end-to-end on a real temp DB."""
+    import io
+    from contextlib import redirect_stdout
+
+    db_path = str(tmp_path / "report_test.db")
+    monkeypatch.setenv("APEX_DB_PATH", db_path)
+    monkeypatch.setenv("ACTION_TOKEN_SECRET", "test-secret")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "fake")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "fake")
+    monkeypatch.setenv("ALERTS_ENABLED", "false")
+    monkeypatch.setenv("DRY_RUN_MODE", "true")
+
+    from apex.db.connection import close_db, init_db
+    conn = init_db(db_path)
+    _insert_obs(conn)
+    close_db()
+
+    import scripts.report_signal_observations as mod
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.main()
+
+    assert "APEX Signal Observations Report" in buf.getvalue()
+
+
+def test_debug_script_runs(tmp_path, monkeypatch):
+    """debug_signal_conditions main() runs end-to-end and does not modify the DB."""
+    import io
+    from contextlib import redirect_stdout
+
+    db_path = str(tmp_path / "debug_test.db")
+    monkeypatch.setenv("APEX_DB_PATH", db_path)
+    monkeypatch.setenv("ACTION_TOKEN_SECRET", "test-secret")
+    monkeypatch.setenv("PUSHOVER_APP_TOKEN", "fake")
+    monkeypatch.setenv("PUSHOVER_USER_KEY", "fake")
+    monkeypatch.setenv("ALERTS_ENABLED", "false")
+    monkeypatch.setenv("DRY_RUN_MODE", "true")
+
+    from apex.db.connection import close_db, init_db
+    conn = init_db(db_path)
+    _insert_obs(conn)
+    close_db()
+
+    import scripts.debug_signal_conditions as mod
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.main()
+
+    assert "APEX Debug: Signal Conditions" in buf.getvalue()
+
+    # Verify DB is untouched — observation must still be OBSERVED
+    conn2 = init_db(db_path)
+    row = conn2.execute("SELECT status FROM signal_observations").fetchone()
+    assert row["status"] == "OBSERVED"
+    close_db()

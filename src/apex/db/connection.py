@@ -6,6 +6,42 @@ from pathlib import Path
 
 _conn: sqlite3.Connection | None = None
 
+# Milestone 10A: new nullable columns for signal_observations.
+# SQLite does not support ADD COLUMN IF NOT EXISTS, so we try each ALTER and
+# swallow the OperationalError that fires when the column already exists.
+_SIGNAL_OBS_NEW_COLUMNS = [
+    ("hit_1r_at",              "TEXT"),
+    ("hit_2r_at",              "TEXT"),
+    ("stopped_at",             "TEXT"),
+    ("expired_at",             "TEXT"),
+    ("first_terminal_status",  "TEXT"),
+    ("final_status",           "TEXT"),
+    ("time_to_1r_seconds",     "REAL"),
+    ("time_to_2r_seconds",     "REAL"),
+    ("time_to_stop_seconds",   "REAL"),
+    ("time_to_expiry_seconds", "REAL"),
+    ("hit_1r_before_stop",     "INTEGER"),
+    ("hit_1r_before_expiry",   "INTEGER"),
+]
+
+
+def _migrate_signal_observations(conn: sqlite3.Connection) -> None:
+    """Add Milestone 10A columns to signal_observations on existing databases.
+
+    Safe to run on both fresh installs (columns already in schema.sql) and
+    existing databases (ALTER TABLE is a no-op when the column is present
+    because the error is caught).
+    """
+    for col, col_type in _SIGNAL_OBS_NEW_COLUMNS:
+        try:
+            conn.execute(
+                f"ALTER TABLE signal_observations ADD COLUMN {col} {col_type}"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            # "duplicate column name" — column already exists; skip.
+            pass
+
 
 def get_connection() -> sqlite3.Connection:
     global _conn
@@ -29,6 +65,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
     with open(schema_path) as f:
         conn.executescript(f.read())
     conn.commit()
+
+    _migrate_signal_observations(conn)
 
     _conn = conn
     return conn

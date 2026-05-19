@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime as _dt, timezone as _tz
 from typing import Literal
 
 from apex.actions.tokens import generate_token
@@ -331,6 +332,14 @@ async def run_followup_check(
             logger.error(f"Follow-up error for trade {trade_row['trade_uid']}: {e}")
 
 
+def _seconds_between(earlier: str, later: str) -> float:
+    """Elapsed seconds between two ISO8601 UTC timestamps (``%Y-%m-%dT%H:%M:%SZ``)."""
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    t0 = _dt.strptime(earlier, fmt).replace(tzinfo=_tz.utc)
+    t1 = _dt.strptime(later, fmt).replace(tzinfo=_tz.utc)
+    return (t1 - t0).total_seconds()
+
+
 def _record_observation(
     candidate: SignalCandidate,
     conn: sqlite3.Connection,
@@ -398,28 +407,32 @@ async def run_observation_evaluation(
     candle's high/low range to check for outcome. SETUP_FORMING observations
     have no price levels and are only expired.
 
-    Outcome priority (checked in this order):
-      1. Expired (expires_at <= now) → EXPIRED
-      2. Conservative stop-first on ambiguous same-candle touch:
-         LONG:  low <= stop_price AND high >= target  → STOPPED
-         SHORT: high >= stop_price AND low <= target  → STOPPED
-         Rationale: when both levels are breached in the same setup-timeframe candle,
-         the order of events is unknowable. Marking STOPPED is the conservative
-         (pessimistic) assumption. This avoids inflating win rates.
-      3. target_2r reached → HIT_2R (outcome_r = +2.0)
-      4. target_1r reached → HIT_1R (outcome_r = +1.0)
-      5. stop reached      → STOPPED (outcome_r = -1.0)
-      6. None of the above → update MFE/MAE and leave OBSERVED
+    TP1 is a milestone, not a terminal event (Milestone 10A).
+    When TP1 is hit the observation stays OBSERVED so that TP2, stop, or
+    expiry can still be recorded. hit_1r_at is written via record_tp1_milestone.
 
-    MFE/MAE are updated on every pass, even when the observation stays OBSERVED.
-    MFE/MAE are expressed in R units relative to the entry price.
+    Outcome priority:
+      Pre-TP1 (hit_1r_at is NULL):
+        1. Expired             → EXPIRED  (hit_1r_before_expiry=0)
+        2. Same-candle ambiguity (stop + any target): conservative STOPPED (hit_1r_before_stop=0)
+        3. TP2 directly hit    → HIT_2R   (hit_1r_at also set; TP1 logically passed)
+        4. TP1 hit             → milestone recorded, observation stays OBSERVED
+        5. Stop hit            → STOPPED  (hit_1r_before_stop=0)
+        6. Nothing             → update MFE/MAE, stay OBSERVED
+
+      Post-TP1 (hit_1r_at is not NULL):
+        1. Expired             → EXPIRED  (hit_1r_before_expiry=1)
+        2. Same-candle ambiguity (stop + TP2): conservative STOPPED (hit_1r_before_stop=1)
+        3. TP2 hit             → HIT_2R   (hit_1r_before_stop not applicable)
+        4. Stop hit            → STOPPED  (hit_1r_before_stop=1)
+        5. Nothing             → update MFE/MAE, stay OBSERVED
+
+    MFE/MAE are updated on every pass in R units relative to entry_price.
 
     Safety: this function NEVER writes to alerts, paper_trades, daily_risk,
     or snoozes. It is read-only with respect to all live-trading state.
     """
     # Defensive guard: observation tracking is a dry-run-only feature.
-    # The scheduler job is only registered in dry-run mode, but this guard
-    # ensures correctness if that ever changes.
     if not settings.dry_run_mode:
         return
 
@@ -437,7 +450,6 @@ async def run_observation_evaluation(
             signal_type = row["signal_type"]
 
             # 1. Expiry check (applies to all signal types)
-            # Pass through any accumulated MFE/MAE so they are not overwritten with NULL.
             if now >= row["expires_at"]:
                 repo.close_signal_observation(
                     conn, uid,
@@ -445,11 +457,16 @@ async def run_observation_evaluation(
                     closed_at=now,
                     mfe=row["max_favorable_excursion"],
                     mae=row["max_adverse_excursion"],
+                    expired_at=now,
+                    time_to_expiry_seconds=_seconds_between(row["observed_at"], now),
+                    hit_1r_before_expiry=1 if row["hit_1r_at"] else 0,
+                    first_terminal_status="EXPIRED",
+                    final_status="EXPIRED",
                 )
                 logger.debug(f"Observation {uid[:8]} expired: {symbol} {direction}")
                 continue
 
-            # 2. SETUP_FORMING: no price levels to evaluate — expiry only
+            # 2. SETUP_FORMING: no price levels — expiry only
             if signal_type == "SETUP_FORMING":
                 continue
 
@@ -459,7 +476,6 @@ async def run_observation_evaluation(
             target_2r = row["target_2r"]
 
             if None in (entry_price, stop_price, target_1r, target_2r):
-                # Incomplete price data — skip evaluation for this observation
                 continue
 
             # 3. Get most recent closed candle high/low
@@ -479,70 +495,126 @@ async def run_observation_evaluation(
             if direction == "LONG":
                 cur_favorable = (high - entry_price) / r_size
                 cur_adverse = (entry_price - low) / r_size
-            else:  # SHORT
+            else:
                 cur_favorable = (entry_price - low) / r_size
                 cur_adverse = (high - entry_price) / r_size
 
             new_mfe = max(row["max_favorable_excursion"] or 0.0, cur_favorable)
             new_mae = max(row["max_adverse_excursion"] or 0.0, cur_adverse)
 
-            # 5. Determine outcome
-            new_status = None
-            outcome_r = None
-
+            # 5. Detect which levels were crossed this candle
             if direction == "LONG":
                 stop_hit = low <= stop_price
                 t1_hit = high >= target_1r
                 t2_hit = high >= target_2r
-
-                if stop_hit and (t1_hit or t2_hit):
-                    # Ambiguous same-candle: conservative stop-first
-                    new_status = "STOPPED"
-                    outcome_r = -1.0
-                elif t2_hit:
-                    new_status = "HIT_2R"
-                    outcome_r = 2.0
-                elif t1_hit:
-                    new_status = "HIT_1R"
-                    outcome_r = 1.0
-                elif stop_hit:
-                    new_status = "STOPPED"
-                    outcome_r = -1.0
-
-            else:  # SHORT
+            else:
                 stop_hit = high >= stop_price
                 t1_hit = low <= target_1r
                 t2_hit = low <= target_2r
 
-                if stop_hit and (t1_hit or t2_hit):
-                    # Ambiguous same-candle: conservative stop-first
-                    new_status = "STOPPED"
-                    outcome_r = -1.0
-                elif t2_hit:
-                    new_status = "HIT_2R"
-                    outcome_r = 2.0
-                elif t1_hit:
-                    new_status = "HIT_1R"
-                    outcome_r = 1.0
-                elif stop_hit:
-                    new_status = "STOPPED"
-                    outcome_r = -1.0
+            already_hit_1r = row["hit_1r_at"] is not None
 
-            if new_status:
-                repo.close_signal_observation(
-                    conn, uid,
-                    status=new_status,
-                    outcome_r=outcome_r,
-                    closed_at=now,
-                    mfe=new_mfe,
-                    mae=new_mae,
-                )
-                logger.debug(
-                    f"Observation {uid[:8]} closed: {symbol} {direction} "
-                    f"→ {new_status} ({outcome_r:+.1f}R)"
-                )
+            # 6. Apply outcome logic
+            if not already_hit_1r:
+                # Pre-TP1 branch
+                if stop_hit and (t1_hit or t2_hit):
+                    # Same-candle ambiguity: conservative stop-first
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="STOPPED", outcome_r=-1.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        stopped_at=now,
+                        time_to_stop_seconds=_seconds_between(row["observed_at"], now),
+                        hit_1r_before_stop=0,
+                        first_terminal_status="STOPPED", final_status="STOPPED",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} STOPPED (conservative, pre-TP1): {symbol} {direction}"
+                    )
+                elif t2_hit:
+                    # Direct TP2 hit — TP1 was logically passed on the way
+                    t_secs = _seconds_between(row["observed_at"], now)
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="HIT_2R", outcome_r=2.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        hit_1r_at=now, time_to_1r_seconds=t_secs,
+                        hit_2r_at=now, time_to_2r_seconds=t_secs,
+                        first_terminal_status="HIT_2R", final_status="HIT_2R",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} HIT_2R (direct, TP1 implicit): {symbol} {direction}"
+                    )
+                elif t1_hit:
+                    # TP1 milestone — stay open for TP2 / stop / expiry
+                    repo.record_tp1_milestone(
+                        conn, uid,
+                        hit_at=now,
+                        time_seconds=_seconds_between(row["observed_at"], now),
+                        mfe=new_mfe, mae=new_mae,
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} TP1 milestone (continuing): {symbol} {direction}"
+                    )
+                elif stop_hit:
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="STOPPED", outcome_r=-1.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        stopped_at=now,
+                        time_to_stop_seconds=_seconds_between(row["observed_at"], now),
+                        hit_1r_before_stop=0,
+                        first_terminal_status="STOPPED", final_status="STOPPED",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} STOPPED: {symbol} {direction}"
+                    )
+                else:
+                    repo.update_observation_excursions(conn, uid, mfe=new_mfe, mae=new_mae)
+
             else:
-                repo.update_observation_excursions(conn, uid, mfe=new_mfe, mae=new_mae)
+                # Post-TP1 branch: track TP2 or stop only
+                if stop_hit and t2_hit:
+                    # Same-candle ambiguity after TP1: conservative stop-first
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="STOPPED", outcome_r=-1.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        stopped_at=now,
+                        time_to_stop_seconds=_seconds_between(row["observed_at"], now),
+                        hit_1r_before_stop=1,
+                        first_terminal_status="STOPPED", final_status="STOPPED",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} STOPPED (conservative, post-TP1): {symbol} {direction}"
+                    )
+                elif t2_hit:
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="HIT_2R", outcome_r=2.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        hit_2r_at=now,
+                        time_to_2r_seconds=_seconds_between(row["observed_at"], now),
+                        first_terminal_status="HIT_2R", final_status="HIT_2R",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} HIT_2R (after TP1): {symbol} {direction}"
+                    )
+                elif stop_hit:
+                    repo.close_signal_observation(
+                        conn, uid,
+                        status="STOPPED", outcome_r=-1.0, closed_at=now,
+                        mfe=new_mfe, mae=new_mae,
+                        stopped_at=now,
+                        time_to_stop_seconds=_seconds_between(row["observed_at"], now),
+                        hit_1r_before_stop=1,
+                        first_terminal_status="STOPPED", final_status="STOPPED",
+                    )
+                    logger.debug(
+                        f"Obs {uid[:8]} STOPPED (post-TP1): {symbol} {direction}"
+                    )
+                else:
+                    repo.update_observation_excursions(conn, uid, mfe=new_mfe, mae=new_mae)
 
     except Exception as e:
         logger.error(f"Observation evaluation error: {e}", exc_info=True)

@@ -169,6 +169,20 @@ CREATE TABLE IF NOT EXISTS signal_observations (
     expires_at              TEXT NOT NULL,
     closed_at               TEXT,
     metadata_json           TEXT,                    -- trend/pullback reasons at observation time
+    -- Milestone 10A: TP1 is non-terminal; tracked as a milestone, not a close event.
+    -- These columns are NULL on rows written before this milestone (backward compat).
+    hit_1r_at               TEXT,                    -- ISO8601 UTC when TP1 first reached
+    hit_2r_at               TEXT,                    -- ISO8601 UTC when TP2 reached
+    stopped_at              TEXT,                    -- ISO8601 UTC when stopped
+    expired_at              TEXT,                    -- ISO8601 UTC when expired
+    first_terminal_status   TEXT,                    -- HIT_2R | STOPPED | EXPIRED
+    final_status            TEXT,                    -- same as first_terminal_status for now
+    time_to_1r_seconds      REAL,                    -- seconds from observed_at to hit_1r_at
+    time_to_2r_seconds      REAL,                    -- seconds from observed_at to hit_2r_at
+    time_to_stop_seconds    REAL,                    -- seconds from observed_at to stopped_at
+    time_to_expiry_seconds  REAL,                    -- seconds from observed_at to expired_at
+    hit_1r_before_stop      INTEGER,                 -- 1 if TP1 was hit before stop; 0 otherwise
+    hit_1r_before_expiry    INTEGER,                 -- 1 if TP1 was hit before expiry; 0 otherwise
     created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
