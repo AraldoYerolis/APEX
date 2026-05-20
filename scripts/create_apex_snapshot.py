@@ -19,10 +19,16 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure scripts/ is importable when running from repo root via PYTHONPATH=src
+# Ensure both the repo root (for `import scripts.*`) and src/ (for `from apex.*`)
+# are on sys.path so this script works when run as:
+#   python scripts/create_apex_snapshot.py        (no PYTHONPATH set)
+#   PYTHONPATH=src python scripts/create_apex_snapshot.py
 _SCRIPTS_DIR = Path(__file__).resolve().parent
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR.parent))
+_REPO_ROOT = _SCRIPTS_DIR.parent
+_SRC_DIR = _REPO_ROOT / "src"
+for _p in (str(_REPO_ROOT), str(_SRC_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def _run(cmd: list[str], *, timeout: int = 10) -> str:
@@ -167,6 +173,20 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(debug_out)
     except ImportError as e:
         lines.append(f"  Could not import debug script: {e}")
+
+    # ------------------------------------------------------------------
+    # Signal learning report
+    # ------------------------------------------------------------------
+    _section(lines, "Signal Learning Report")
+    try:
+        import scripts.report_signal_learning as _learning
+        learning_argv = ["--limit", "500"]
+        if args.since:
+            learning_argv += ["--since", args.since]
+        learning_out = _capture_script(_learning.main, learning_argv)
+        lines.append(learning_out)
+    except ImportError as e:
+        lines.append(f"  Could not import learning script: {e}")
 
     # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)

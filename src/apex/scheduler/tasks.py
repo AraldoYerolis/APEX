@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime as _dt, timezone as _tz
-from typing import Literal
+from typing import Literal, Optional
 
 from apex.actions.tokens import generate_token
 from apex.config import Settings
@@ -14,7 +15,7 @@ from apex.data.candle_store import CandleStore
 from apex.data.hyperliquid_client import HyperliquidClient
 from apex.data.market_universe import refresh_universe
 from apex.db import repository as repo
-from apex.db.models import Alert, SignalObservation
+from apex.db.models import Alert, SignalFeature, SignalObservation
 from apex.notifications.pushover_client import PushoverClient
 from apex.notifications.templates import (
     format_confirmed_alert,
@@ -137,7 +138,7 @@ async def run_signal_scan(
             # to observation-only operation. Live-alert mode is handled separately
             # if and when that is explicitly designed.
             if settings.dry_run_mode:
-                _record_observation(candidate, conn, settings)
+                _record_observation(candidate, conn, settings, candle_store)
 
             outcome = await _send_alert(candidate, conn, settings, pushover)
             if outcome == "SENT":
@@ -340,10 +341,123 @@ def _seconds_between(earlier: str, later: str) -> float:
     return (t1 - t0).total_seconds()
 
 
+def _nan_to_none(v: float) -> Optional[float]:
+    """Return None if v is NaN or None, otherwise return v."""
+    if v is None:
+        return None
+    try:
+        return None if math.isnan(v) else v
+    except (TypeError, ValueError):
+        return None
+
+
+def _capture_signal_features(
+    candidate: SignalCandidate,
+    obs_uid: str,
+    obs_at: str,
+    conn: sqlite3.Connection,
+    settings: Settings,
+    candle_store: CandleStore,
+) -> None:
+    """Capture indicator/market context snapshot for this observation.
+
+    Called once per new observation insert. Failure is swallowed so it never
+    interrupts the scan or alert flow. Inserts via INSERT OR IGNORE so calling
+    twice for the same obs uid is safe.
+    """
+    try:
+        from apex.strategy.trend_filter import compute_trend_bias
+
+        rp = candidate.pullback.risk_plan
+        pullback = candidate.pullback
+        trend = candidate.trend
+
+        # Last closed candle on the setup timeframe
+        df_setup = candle_store.get_df(candidate.symbol, settings.setup_timeframe)
+        candle_open = candle_high = candle_low = candle_close = candle_volume = None
+        candle_open_time = None
+        if df_setup is not None and not df_setup.empty:
+            last = df_setup.iloc[-1]
+            candle_open = float(last["open"])
+            candle_high = float(last["high"])
+            candle_low = float(last["low"])
+            candle_close = float(last["close"])
+            candle_volume = float(last["volume"])
+            candle_open_time = int(last["open_time"])
+
+        # Indicator values (NaN → None)
+        price = _nan_to_none(pullback.current_price)
+        vwap = _nan_to_none(pullback.vwap_val)
+        atr = _nan_to_none(pullback.atr_val)
+        rsi = _nan_to_none(pullback.rsi_val)
+        ema_fast = _nan_to_none(trend.ema_fast)
+        ema_slow = _nan_to_none(trend.ema_slow)
+
+        price_vs_vwap_pct = None
+        if price and vwap and vwap != 0:
+            price_vs_vwap_pct = (price - vwap) / vwap * 100
+
+        ema_spread_pct = None
+        if ema_fast and ema_slow and ema_slow != 0:
+            ema_spread_pct = (ema_fast - ema_slow) / ema_slow * 100
+
+        atr_pct = None
+        if atr and price and price != 0:
+            atr_pct = atr / price * 100
+
+        # BTC/ETH macro context
+        btc_bias = eth_bias = None
+        df_btc = candle_store.get_df("BTC", settings.trend_timeframe)
+        if df_btc is not None and not df_btc.empty:
+            btc_bias = compute_trend_bias(df_btc).bias
+
+        df_eth = candle_store.get_df("ETH", settings.trend_timeframe)
+        if df_eth is not None and not df_eth.empty:
+            eth_bias = compute_trend_bias(df_eth).bias
+
+        feature = SignalFeature(
+            observation_uid=obs_uid,
+            captured_at=utcnow_iso(),
+            symbol=candidate.symbol,
+            direction=candidate.direction,
+            signal_type=candidate.alert_type,
+            observed_at=obs_at,
+            entry_price=rp.entry_price if rp else None,
+            stop_price=rp.stop_price if rp else None,
+            target_1r=rp.target_1r if rp else None,
+            target_2r=rp.target_2r if rp else None,
+            candle_open=candle_open,
+            candle_high=candle_high,
+            candle_low=candle_low,
+            candle_close=candle_close,
+            candle_volume=candle_volume,
+            candle_open_time=candle_open_time,
+            rsi_val=rsi,
+            atr_val=atr,
+            vwap_val=vwap,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            price_vs_vwap_pct=price_vs_vwap_pct,
+            ema_spread_pct=ema_spread_pct,
+            atr_pct=atr_pct,
+            trend_bias=trend.bias,
+            trend_reason=trend.reason,
+            pullback_state=str(pullback.state),
+            pullback_reason=pullback.reason,
+            btc_trend_bias=btc_bias,
+            eth_trend_bias=eth_bias,
+        )
+        repo.insert_signal_feature(conn, feature)
+        logger.debug(f"Feature captured for observation {obs_uid[:8]}: {candidate.symbol}")
+    except Exception as e:
+        logger.warning(f"Failed to capture signal features for {obs_uid[:8]}: {e}")
+
+
 def _record_observation(
     candidate: SignalCandidate,
     conn: sqlite3.Connection,
     settings: Settings,
+    candle_store: Optional[CandleStore] = None,
 ) -> None:
     """Record or refresh a signal observation for dry-run quality tracking.
 
@@ -373,9 +487,11 @@ def _record_observation(
             "trend_reason": candidate.trend.reason,
             "pullback_reason": candidate.pullback.reason,
         }
+        obs_uid = new_uid()
+        obs_at = utcnow_iso()
         obs = SignalObservation(
-            observation_uid=new_uid(),
-            observed_at=utcnow_iso(),
+            observation_uid=obs_uid,
+            observed_at=obs_at,
             symbol=candidate.symbol,
             direction=candidate.direction,
             signal_type=candidate.alert_type,
@@ -391,6 +507,11 @@ def _record_observation(
             f"Observation recorded: {candidate.alert_type} | "
             f"{candidate.symbol} {candidate.direction}"
         )
+
+        if candle_store is not None:
+            _capture_signal_features(
+                candidate, obs_uid, obs_at, conn, settings, candle_store
+            )
     except Exception as e:
         # Observation failure must never interrupt the scan or alert flow.
         logger.warning(f"Failed to record observation for {candidate.symbol}: {e}")
@@ -463,6 +584,7 @@ async def run_observation_evaluation(
                     first_terminal_status="EXPIRED",
                     final_status="EXPIRED",
                 )
+                repo.update_signal_feature_outcome_from_observation(conn, uid)
                 logger.debug(f"Observation {uid[:8]} expired: {symbol} {direction}")
                 continue
 
@@ -528,6 +650,7 @@ async def run_observation_evaluation(
                         hit_1r_before_stop=0,
                         first_terminal_status="STOPPED", final_status="STOPPED",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} STOPPED (conservative, pre-TP1): {symbol} {direction}"
                     )
@@ -542,6 +665,7 @@ async def run_observation_evaluation(
                         hit_2r_at=now, time_to_2r_seconds=t_secs,
                         first_terminal_status="HIT_2R", final_status="HIT_2R",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} HIT_2R (direct, TP1 implicit): {symbol} {direction}"
                     )
@@ -553,6 +677,7 @@ async def run_observation_evaluation(
                         time_seconds=_seconds_between(row["observed_at"], now),
                         mfe=new_mfe, mae=new_mae,
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} TP1 milestone (continuing): {symbol} {direction}"
                     )
@@ -566,6 +691,7 @@ async def run_observation_evaluation(
                         hit_1r_before_stop=0,
                         first_terminal_status="STOPPED", final_status="STOPPED",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} STOPPED: {symbol} {direction}"
                     )
@@ -585,6 +711,7 @@ async def run_observation_evaluation(
                         hit_1r_before_stop=1,
                         first_terminal_status="STOPPED", final_status="STOPPED",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} STOPPED (conservative, post-TP1): {symbol} {direction}"
                     )
@@ -597,6 +724,7 @@ async def run_observation_evaluation(
                         time_to_2r_seconds=_seconds_between(row["observed_at"], now),
                         first_terminal_status="HIT_2R", final_status="HIT_2R",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} HIT_2R (after TP1): {symbol} {direction}"
                     )
@@ -610,6 +738,7 @@ async def run_observation_evaluation(
                         hit_1r_before_stop=1,
                         first_terminal_status="STOPPED", final_status="STOPPED",
                     )
+                    repo.update_signal_feature_outcome_from_observation(conn, uid)
                     logger.debug(
                         f"Obs {uid[:8]} STOPPED (post-TP1): {symbol} {direction}"
                     )

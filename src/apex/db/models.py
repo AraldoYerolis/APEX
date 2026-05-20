@@ -127,3 +127,67 @@ class SignalObservation:
     hit_1r_before_stop: Optional[int] = None
     hit_1r_before_expiry: Optional[int] = None
     id: Optional[int] = None
+
+
+@dataclass
+class SignalFeature:
+    """Snapshot of indicator/market context at observation time.
+
+    Captured once per new observation insert. Outcome fields are populated
+    later by update_signal_feature_outcome_from_observation.
+    """
+    observation_uid: str
+    captured_at: str
+    symbol: str
+    direction: str
+    signal_type: str
+    observed_at: str
+    # Price levels
+    entry_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    target_1r: Optional[float] = None
+    target_2r: Optional[float] = None
+    # Candle context
+    candle_open: Optional[float] = None
+    candle_high: Optional[float] = None
+    candle_low: Optional[float] = None
+    candle_close: Optional[float] = None
+    candle_volume: Optional[float] = None
+    candle_open_time: Optional[int] = None
+    # Indicators
+    rsi_val: Optional[float] = None
+    atr_val: Optional[float] = None
+    vwap_val: Optional[float] = None
+    ema_fast: Optional[float] = None
+    ema_slow: Optional[float] = None
+    price_vs_vwap_pct: Optional[float] = None
+    ema_spread_pct: Optional[float] = None
+    atr_pct: Optional[float] = None
+    # Trend/setup context
+    trend_bias: Optional[str] = None
+    trend_reason: Optional[str] = None
+    pullback_state: Optional[str] = None
+    pullback_reason: Optional[str] = None
+    # Market context
+    btc_trend_bias: Optional[str] = None
+    eth_trend_bias: Optional[str] = None
+    market_regime_label: Optional[str] = None
+    relative_strength_rank: Optional[int] = None
+    relative_strength_score: Optional[float] = None
+    # Outcome fields (synced after close)
+    outcome_status: Optional[str] = None
+    outcome_r: Optional[float] = None
+    hit_1r_at: Optional[str] = None
+    hit_2r_at: Optional[str] = None
+    stopped_at: Optional[str] = None
+    expired_at: Optional[str] = None
+    time_to_1r_seconds: Optional[float] = None
+    time_to_2r_seconds: Optional[float] = None
+    time_to_stop_seconds: Optional[float] = None
+    time_to_expiry_seconds: Optional[float] = None
+    hit_1r_before_stop: Optional[int] = None
+    hit_1r_before_expiry: Optional[int] = None
+    # Metadata
+    feature_version: str = "10B_v1"
+    metadata_json: Optional[str] = None
+    id: Optional[int] = None

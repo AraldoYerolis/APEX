@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalObservation, Snooze
+from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalFeature, SignalObservation, Snooze
 
 
 def _now_utc() -> str:
@@ -518,6 +518,116 @@ def update_observation_excursions(
         WHERE observation_uid=?
         """,
         (mfe, mae, _now_utc(), uid),
+    )
+    conn.commit()
+
+
+# ------------------------------------------------------------------ signal_features
+
+def insert_signal_feature(conn: sqlite3.Connection, feature: SignalFeature) -> None:
+    """Insert a signal feature row. INSERT OR IGNORE — safe to call twice for same obs uid."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO signal_features (
+            observation_uid, captured_at, symbol, direction, signal_type, observed_at,
+            entry_price, stop_price, target_1r, target_2r,
+            candle_open, candle_high, candle_low, candle_close, candle_volume, candle_open_time,
+            rsi_val, atr_val, vwap_val, ema_fast, ema_slow,
+            price_vs_vwap_pct, ema_spread_pct, atr_pct,
+            trend_bias, trend_reason, pullback_state, pullback_reason,
+            btc_trend_bias, eth_trend_bias, market_regime_label,
+            relative_strength_rank, relative_strength_score,
+            feature_version, metadata_json
+        ) VALUES (
+            ?,?,?,?,?,?,
+            ?,?,?,?,
+            ?,?,?,?,?,?,
+            ?,?,?,?,?,
+            ?,?,?,
+            ?,?,?,?,
+            ?,?,?,
+            ?,?,
+            ?,?
+        )
+        """,
+        (
+            feature.observation_uid, feature.captured_at, feature.symbol,
+            feature.direction, feature.signal_type, feature.observed_at,
+            feature.entry_price, feature.stop_price, feature.target_1r, feature.target_2r,
+            feature.candle_open, feature.candle_high, feature.candle_low,
+            feature.candle_close, feature.candle_volume, feature.candle_open_time,
+            feature.rsi_val, feature.atr_val, feature.vwap_val,
+            feature.ema_fast, feature.ema_slow,
+            feature.price_vs_vwap_pct, feature.ema_spread_pct, feature.atr_pct,
+            feature.trend_bias, feature.trend_reason,
+            feature.pullback_state, feature.pullback_reason,
+            feature.btc_trend_bias, feature.eth_trend_bias, feature.market_regime_label,
+            feature.relative_strength_rank, feature.relative_strength_score,
+            feature.feature_version, feature.metadata_json,
+        ),
+    )
+    conn.commit()
+
+
+def get_signal_features(
+    conn: sqlite3.Connection,
+    since: Optional[str] = None,
+    signal_type: Optional[str] = None,
+    limit: int = 200,
+) -> list[sqlite3.Row]:
+    """Return signal feature rows, newest first."""
+    conditions = []
+    params: list = []
+    if since:
+        conditions.append("captured_at >= ?")
+        params.append(since)
+    if signal_type:
+        conditions.append("signal_type = ?")
+        params.append(signal_type)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    return conn.execute(
+        f"SELECT * FROM signal_features {where} ORDER BY captured_at DESC LIMIT ?",
+        params,
+    ).fetchall()
+
+
+def update_signal_feature_outcome_from_observation(
+    conn: sqlite3.Connection,
+    uid: str,
+) -> None:
+    """Sync outcome fields from signal_observations into signal_features.
+
+    Called after every evaluation pass that changes an observation's state.
+    Safe to call when no matching signal_features row exists (no-op in that case).
+    Never modifies the signal_observations row.
+    """
+    row = conn.execute(
+        "SELECT * FROM signal_observations WHERE observation_uid=?", (uid,)
+    ).fetchone()
+    if row is None:
+        return
+    outcome_status = row["final_status"] or row["status"]
+    conn.execute(
+        """
+        UPDATE signal_features
+        SET outcome_status=?, outcome_r=?,
+            hit_1r_at=?, hit_2r_at=?, stopped_at=?, expired_at=?,
+            time_to_1r_seconds=?, time_to_2r_seconds=?,
+            time_to_stop_seconds=?, time_to_expiry_seconds=?,
+            hit_1r_before_stop=?, hit_1r_before_expiry=?,
+            updated_at=?
+        WHERE observation_uid=?
+        """,
+        (
+            outcome_status, row["outcome_r"],
+            row["hit_1r_at"], row["hit_2r_at"], row["stopped_at"], row["expired_at"],
+            row["time_to_1r_seconds"], row["time_to_2r_seconds"],
+            row["time_to_stop_seconds"], row["time_to_expiry_seconds"],
+            row["hit_1r_before_stop"], row["hit_1r_before_expiry"],
+            _now_utc(),
+            uid,
+        ),
     )
     conn.commit()
 

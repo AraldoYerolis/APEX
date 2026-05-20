@@ -193,3 +193,75 @@ CREATE INDEX IF NOT EXISTS idx_observations_uid
     ON signal_observations(observation_uid);
 CREATE INDEX IF NOT EXISTS idx_observations_open
     ON signal_observations(status, expires_at);
+
+-- ---------------------------------------------------------------
+-- signal_features
+-- Captures indicator/market context at observation time.
+-- Outcome fields are denormalized from signal_observations and
+-- synced after each evaluation pass.
+-- Dry-run only. Never modifies alerts, paper_trades, or live state.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_features (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_uid         TEXT NOT NULL UNIQUE REFERENCES signal_observations(observation_uid),
+    captured_at             TEXT NOT NULL,
+    symbol                  TEXT NOT NULL,
+    direction               TEXT NOT NULL,
+    signal_type             TEXT NOT NULL,
+    observed_at             TEXT NOT NULL,
+    -- Price levels
+    entry_price             REAL,
+    stop_price              REAL,
+    target_1r               REAL,
+    target_2r               REAL,
+    -- Candle context (last closed candle at capture time, setup_timeframe)
+    candle_open             REAL,
+    candle_high             REAL,
+    candle_low              REAL,
+    candle_close            REAL,
+    candle_volume           REAL,
+    candle_open_time        INTEGER,
+    -- Indicator snapshot
+    rsi_val                 REAL,
+    atr_val                 REAL,
+    vwap_val                REAL,
+    ema_fast                REAL,
+    ema_slow                REAL,
+    price_vs_vwap_pct       REAL,        -- (price - vwap) / vwap * 100
+    ema_spread_pct          REAL,        -- (ema_fast - ema_slow) / ema_slow * 100
+    atr_pct                 REAL,        -- atr / price * 100
+    -- Trend/setup context
+    trend_bias              TEXT,        -- LONG | SHORT | NONE
+    trend_reason            TEXT,
+    pullback_state          TEXT,
+    pullback_reason         TEXT,
+    -- Market context (populated where available)
+    btc_trend_bias          TEXT,
+    eth_trend_bias          TEXT,
+    market_regime_label     TEXT,
+    relative_strength_rank  INTEGER,
+    relative_strength_score REAL,
+    -- Outcome fields (synced from signal_observations after close/milestone)
+    outcome_status          TEXT,        -- mirrors status / final_status
+    outcome_r               REAL,
+    hit_1r_at               TEXT,
+    hit_2r_at               TEXT,
+    stopped_at              TEXT,
+    expired_at              TEXT,
+    time_to_1r_seconds      REAL,
+    time_to_2r_seconds      REAL,
+    time_to_stop_seconds    REAL,
+    time_to_expiry_seconds  REAL,
+    hit_1r_before_stop      INTEGER,
+    hit_1r_before_expiry    INTEGER,
+    -- Metadata
+    feature_version         TEXT NOT NULL DEFAULT '10B_v1',
+    metadata_json           TEXT,
+    created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_features_uid
+    ON signal_features(observation_uid);
+CREATE INDEX IF NOT EXISTS idx_signal_features_symbol
+    ON signal_features(symbol, signal_type, captured_at);
