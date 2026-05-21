@@ -215,6 +215,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running strategy filter simulator: {e}")
 
     # ------------------------------------------------------------------
+    # Out-of-sample filter validation report
+    # ------------------------------------------------------------------
+    _section(lines, "Out-of-Sample Filter Validation Report")
+    try:
+        import scripts.validate_strategy_filters as _val
+        val_argv = []
+        if args.since:
+            val_argv += ["--since", args.since]
+        val_out = _capture_script(_val.main, val_argv)
+        lines.append(val_out)
+    except ImportError as e:
+        lines.append(f"  Could not import filter validation script: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running filter validation script: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")

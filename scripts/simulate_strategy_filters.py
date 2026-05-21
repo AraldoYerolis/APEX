@@ -827,7 +827,8 @@ def main(argv: list[str] | None = None) -> None:
 
     eligible = [
         r for r in results
-        if r["verdict"] != "INSUFFICIENT_SAMPLE" and r["n_kept"] >= args.min_n
+        if r["verdict"] not in ("INSUFFICIENT_SAMPLE", "REDUCES_SAMPLE_TOO_MUCH")
+        and r["n_kept"] >= args.min_n
     ]
 
     for r in eligible:

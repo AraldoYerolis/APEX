@@ -182,7 +182,60 @@ PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10
 - Does not store simulation results in DB (stdout/CSV only)
 - Does not promote candidate filters to runtime gates
 
-**Next step (11B):** Candidate runtime gate design — a separate milestone requiring
+---
+
+## Milestone 11B — Out-of-Sample Filter Validation  ← COMPLETE
+
+**Goal:** Chronological train/validation split validation of candidate strategy filters.
+Answer: "Did a filter that improved metrics on historical (train) data also improve
+metrics on a held-out chronological (validation) slice?"
+
+**What was built (11B):**
+- `scripts/validate_strategy_filters.py` — read-only out-of-sample validation report
+- Imports 13 predicate functions from `simulate_strategy_filters` (no duplication)
+- `_stability_label()` — 7-tier stability classification in checked order:
+  INSUFFICIENT_VALIDATION_SAMPLE → HIGH_EXPIRY_RISK → FAILS_VALIDATION →
+  TRAIN_ONLY_OVERFIT → VALIDATION_ONLY_REGIME_SHIFT → VALIDATED_CANDIDATE →
+  PROMISING_NEEDS_MORE_DATA
+- `_stability_score()` — numeric ranking score for validation-set quality
+  (TP1Δ×0.40 + stopΔ×0.30 + avgRΔ×0.20 + expNoTP1Δ×0.10, penalties for high
+  expiry, thin sample, and train-not-improving)
+- 14 non-retrospective candidate filters evaluated (label-based filters excluded —
+  they would leak train-set label assignments into validation)
+- 7 report sections: header+disclaimer / baseline comparison / per-filter table /
+  stability ranking / overfit warning / interpretation / optional CSV export
+- Integrated into `create_apex_snapshot.py` as "Out-of-Sample Filter Validation Report"
+- `tests/test_strategy_filter_validation.py` — 24 tests (unit + integration)
+
+**How to run:**
+```bash
+PYTHONPATH=src python scripts/validate_strategy_filters.py
+PYTHONPATH=src python scripts/validate_strategy_filters.py --since 2026-05-20T10:28:00Z
+PYTHONPATH=src python scripts/validate_strategy_filters.py --split 0.70 --min-n 10
+PYTHONPATH=src python scripts/validate_strategy_filters.py --csv /tmp/filter_validation.csv
+```
+
+**Safety constraints (all maintained):**
+- Read-only: never writes to any DB table
+- Does not change runtime signal generation, alerts, or scheduler behavior
+- Validation results are not written into runtime config
+- Does not enable live trading or alert delivery
+- `ALERTS_ENABLED=false`, `DRY_RUN_MODE=true` are not touched
+
+**Important limitations:**
+- Validation splits are temporal but the overall sample may reflect a single market regime
+- All observations are from dry-run mode — no live execution costs included
+- A VALIDATED_CANDIDATE label is encouraging but NOT sufficient for a runtime gate
+- A dedicated 11C milestone with explicit approval is required before any filter is
+  applied to runtime scanning
+
+**What this milestone does NOT do:**
+- Does not activate any filter in production scanning
+- Does not promote VALIDATED_CANDIDATE filters to runtime gates automatically
+- Does not store validation results in DB (stdout/CSV only)
+- Does not change ALERTS_ENABLED, DRY_RUN_MODE, or any config value
+
+**Next step (11C):** Candidate runtime gate design — a separate milestone requiring
 explicit approval before any filter is applied to live/dry-run scanning.
 
 ---
