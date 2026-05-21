@@ -41,11 +41,12 @@ Each milestone builds on the previous. No milestone skips the safety progression
 ---
 
 ## Milestone 10C — Signal Quality Agent / Learning Report v2  ← COMPLETE
+## Milestone 10C.1 — Fix Diagnostic Scoring, Labels, and Snapshot Git Metadata  ← COMPLETE
 
 **Goal:** Deep read-only analysis of `signal_features` + `signal_observations` history.
 Symbol/direction quality scores, macro alignment, feature buckets, expiry quality.
 
-**What was built:**
+**What was built (10C):**
 - `scripts/report_signal_learning.py` completely rewritten as v2
 - Fixed root bug: `create_apex_snapshot.py` was hardcoding `--limit 500`, causing the
   learning report to only see ~210 of 288 confirmed observations. Removed the cap.
@@ -55,11 +56,22 @@ Symbol/direction quality scores, macro alignment, feature buckets, expiry qualit
   scores and recommendation labels, BTC/ETH macro alignment tables, expiry quality
   (after-TP1 vs without-TP1), feature bucket analysis (RSI, ATR%, VWAP%, EMA spread%)
 - MFE/MAE pulled via SQL LEFT JOIN with `signal_observations` (no schema change)
-- Diagnostic quality score formula: tp1_rate×0.30 + tp2_rate×0.40 − stop_rate×0.20
-  − expiry_no_tp1_rate×0.10 ± MFE/MAE adjustments. Clamped [0, 1].
-- Recommendation labels: PROMISING_OBSERVE / NEEDS_FILTERING / WEAK_OBSERVE_ONLY /
-  INSUFFICIENT_SAMPLE. Min N=10 required for a non-insufficient label.
 - 32 new tests in `tests/test_signal_learning_v2.py`
+
+**What was fixed (10C.1):**
+- **Score formula**: Rewrote `_quality_score` with 0.50 baseline and relative-to-overall
+  adjustments (replaces old fixed-weight formula that produced Score=0.00 for high-expiry
+  setups, making the score useless as a signal)
+- **Label contradiction fixed**: Old formula let Score=0.00 produce PROMISING_OBSERVE.
+  New label has hard constraints: `score <= 0.05` → WEAK; `expiry >= 80%` → never PROMISING
+- **WATCHLIST_NEEDS_EXPIRY_FIX label added**: High expiry but above-avg TP1 or below-avg
+  stop → separate from WEAK_OBSERVE_ONLY (setup quality present, expiry is the fixable issue)
+- **Top actionable findings section**: Collects symbol/direction labels, RSI/ATR bucket
+  anomalies, macro alignment anomalies. Report-only, no runtime changes
+- **Snapshot git metadata fixed**: `git -C <repo_root>` so branch/commit populate correctly
+  when running under systemd or from a non-repo CWD. Shows `unavailable (reason)` explicitly
+  instead of silently blank
+- 8 additional tests in `tests/test_signal_learning_v2.py` (40 total)
 
 **How to run:**
 ```bash
@@ -404,10 +416,11 @@ PYTHONPATH=src python scripts/report_signal_learning.py --limit 200
 ## Milestone ordering summary
 
 ```
-10A  TP1 non-terminal milestone tracking       ← COMPLETE
-10B  Signal feature snapshot                   ← COMPLETE
-10C  Signal quality agent / learning report v2 ← COMPLETE
-10D  Setup scoring agent
+10A   TP1 non-terminal milestone tracking        ← COMPLETE
+10B   Signal feature snapshot                    ← COMPLETE
+10C   Signal quality agent / learning report v2  ← COMPLETE
+10C.1 Fix diagnostic scoring, labels, git meta   ← COMPLETE
+10D   Setup scoring agent
 10E  Multi-TF confirmation
 10F  Support/resistance agent
 10G  Market regime agent

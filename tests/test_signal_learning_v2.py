@@ -214,37 +214,37 @@ def test_ema_spread_bucket_boundaries():
 
 def test_quality_score_none_when_n_lt_10():
     from scripts.report_signal_learning import _quality_score
-    score = _quality_score(0.5, 0.2, 0.1, 0.1, None, None, n=9)
+    score = _quality_score(0.5, 0.2, 0.1, 0.1, None, None, None, n=9)
     assert score is None
 
 
 def test_quality_score_high_tp1_tp2():
     from scripts.report_signal_learning import _quality_score
-    # High TP1 + TP2 → high score
-    score = _quality_score(0.6, 0.3, 0.1, 0.1, None, None, n=20)
+    # High TP1 + TP2, low stop → score well above baseline
+    score = _quality_score(0.6, 0.3, 0.1, 0.1, None, None, None, n=20)
     assert score is not None
-    assert score > 0.2  # 0.6*0.3 + 0.3*0.4 - 0.1*0.2 - 0.1*0.1 = 0.18 + 0.12 - 0.02 - 0.01 = 0.27
+    assert score > 0.5
 
 
 def test_quality_score_clamped_to_zero_on_terrible_stats():
     from scripts.report_signal_learning import _quality_score
     # Worst case: 0 TP1, 0 TP2, 100% stop, 100% expiry no TP1
-    score = _quality_score(0.0, 0.0, 1.0, 1.0, None, None, n=50)
+    score = _quality_score(0.0, 0.0, 1.0, 1.0, None, None, None, n=50)
     assert score == pytest.approx(0.0)
 
 
 def test_quality_score_mfe_bonus():
     from scripts.report_signal_learning import _quality_score
-    base = _quality_score(0.3, 0.1, 0.2, 0.2, None, None, n=20)
-    with_mfe = _quality_score(0.3, 0.1, 0.2, 0.2, 1.5, None, n=20)
+    base = _quality_score(0.3, 0.1, 0.2, 0.2, None, None, None, n=20)
+    with_mfe = _quality_score(0.3, 0.1, 0.2, 0.2, 1.5, None, None, n=20)
     assert with_mfe is not None and base is not None
     assert with_mfe > base
 
 
 def test_quality_score_mae_penalty():
     from scripts.report_signal_learning import _quality_score
-    base = _quality_score(0.3, 0.1, 0.2, 0.2, None, None, n=20)
-    with_mae = _quality_score(0.3, 0.1, 0.2, 0.2, None, 0.9, n=20)
+    base = _quality_score(0.3, 0.1, 0.2, 0.2, None, None, None, n=20)
+    with_mae = _quality_score(0.3, 0.1, 0.2, 0.2, None, 0.9, None, n=20)
     assert with_mae is not None and base is not None
     assert with_mae < base
 
@@ -609,3 +609,126 @@ def test_report_learning_label_summary_printed(tmp_path, monkeypatch):
 
     output = buf.getvalue()
     assert "Label summary" in output
+
+
+# ------------------------------------------------------------------ 10C.1 label/score constraint tests
+
+def test_score_zero_cannot_produce_promising_label():
+    """A score of 0.00 must never produce PROMISING_OBSERVE."""
+    from scripts.report_signal_learning import _recommendation_label
+    label = _recommendation_label(0.00, 0.50, 0.10, 0.30, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label != "PROMISING_OBSERVE"
+
+
+def test_expiry_80pct_cannot_produce_promising_label():
+    """expiry >= 80% must never produce PROMISING_OBSERVE."""
+    from scripts.report_signal_learning import _recommendation_label
+    label = _recommendation_label(0.90, 0.50, 0.05, 0.80, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label != "PROMISING_OBSERVE"
+
+
+def test_high_tp1_low_stop_extreme_expiry_is_watchlist():
+    """High TP1 + low stop + expiry >= 80% → WATCHLIST_NEEDS_EXPIRY_FIX."""
+    from scripts.report_signal_learning import _recommendation_label
+    # tp1_rate >= overall_tp1 * 1.10 and stop_rate <= overall_stop * 0.90
+    label = _recommendation_label(0.70, 0.40, 0.10, 0.85, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label == "WATCHLIST_NEEDS_EXPIRY_FIX"
+
+
+def test_high_stop_below_avg_tp1_extreme_expiry_is_weak():
+    """No above-avg TP1 or good stop + expiry >= 80% → WEAK_OBSERVE_ONLY."""
+    from scripts.report_signal_learning import _recommendation_label
+    # tp1_rate < overall_tp1 * 1.10 and stop_rate > overall_stop * 0.90
+    label = _recommendation_label(0.30, 0.10, 0.25, 0.85, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label == "WEAK_OBSERVE_ONLY"
+
+
+def test_low_tp1_high_stop_is_weak():
+    """Low TP1 rate and high stop rate → WEAK_OBSERVE_ONLY."""
+    from scripts.report_signal_learning import _recommendation_label
+    label = _recommendation_label(0.05, 0.05, 0.40, 0.50, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label == "WEAK_OBSERVE_ONLY"
+
+
+def test_solid_score_acceptable_expiry_can_be_promising():
+    """Solid TP1 + acceptable expiry → PROMISING_OBSERVE."""
+    from scripts.report_signal_learning import _recommendation_label
+    # tp1 = 0.50 >= 0.20 * 1.25 = 0.25; stop = 0.10 <= 0.20 * 1.25 = 0.25; expiry < 0.80
+    label = _recommendation_label(0.80, 0.50, 0.10, 0.40, n=20,
+                                  overall_tp1_rate=0.20, overall_stop_rate=0.20)
+    assert label == "PROMISING_OBSERVE"
+
+
+def test_score_formula_produces_nonzero_spread():
+    """Quality score formula produces different values for good vs bad setups."""
+    from scripts.report_signal_learning import _quality_score
+    good = _quality_score(0.50, 0.30, 0.10, 0.10, None, None, None, n=20)
+    bad = _quality_score(0.05, 0.02, 0.50, 0.70, None, None, None, n=20)
+    assert good is not None and bad is not None
+    assert good > bad + 0.20, f"expected good ({good:.2f}) > bad ({bad:.2f}) + 0.20"
+
+
+def test_top_actionable_findings_section_appears(tmp_path, monkeypatch):
+    """Top actionable findings section appears when one group is PROMISING relative to overall.
+
+    Two groups: BTC LONG all-HIT_2R (tp1=1.0) and ETH LONG all-STOPPED (tp1=0.0).
+    Overall tp1=0.5; BTC tp1=1.0 >= 0.5*1.25=0.625 → PROMISING_OBSERVE → finding emitted.
+    """
+    db_path = str(tmp_path / "findings.db")
+    _make_env_overrides(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # BTC LONG: all HIT_2R — will be PROMISING relative to overall
+    for i in range(12):
+        uid = _insert_obs(conn, utcnow_iso(), symbol="BTC")
+        _insert_feature(conn, uid, symbol="BTC")
+        _close_obs_hit2r(conn, uid)
+
+    # ETH LONG: all STOPPED — drags down overall tp1 rate
+    for i in range(12):
+        uid = _insert_obs(conn, utcnow_iso(), symbol="ETH")
+        _insert_feature(conn, uid, symbol="ETH")
+        _close_obs_stopped(conn, uid)
+
+    close_db()
+
+    import scripts.report_signal_learning as mod
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.main([])
+
+    output = buf.getvalue()
+    assert "Top actionable diagnostic findings" in output
+    assert "Report-only" in output
+
+
+def test_snapshot_git_metadata_not_blank(tmp_path, monkeypatch):
+    """Snapshot Git section shows branch/commit or explicit 'unavailable', never blank."""
+    db_path = str(tmp_path / "snap_git.db")
+    out_path = str(tmp_path / "snap_git.txt")
+    _make_env_overrides(monkeypatch, db_path)
+
+    conn = init_db(db_path)
+    close_db()
+
+    import scripts.create_apex_snapshot as mod
+
+    with redirect_stdout(io.StringIO()):
+        mod.main(["--out", out_path])
+
+    content = Path(out_path).read_text()
+    assert "Git" in content
+    # branch line must be present and non-empty after the colon
+    import re
+    branch_match = re.search(r"branch\s*:\s*(.+)", content)
+    assert branch_match is not None, "branch line missing from Git section"
+    branch_val = branch_match.group(1).strip()
+    assert branch_val != "", "branch value is blank"
+    # must say either a real branch name or 'unavailable (...)'
+    assert branch_val != "unavailable" or "unavailable (" in branch_val

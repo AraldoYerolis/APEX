@@ -105,14 +105,24 @@ def main(argv: list[str] | None = None) -> None:
 
     # ------------------------------------------------------------------
     # Git commit
+    # Use -C <repo_root> so git works regardless of the process CWD.
+    # When running under systemd or as root in /opt/apex, plain `git log`
+    # may silently return empty if the CWD is not inside the repo.
     # ------------------------------------------------------------------
     _section(lines, "Git")
-    git_commit = _run(["git", "log", "-1", "--format=%H %s (%ad)", "--date=short"])
-    git_branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    git_status = _run(["git", "status", "--short"])
-    lines.append(f"  branch : {git_branch}")
-    lines.append(f"  commit : {git_commit}")
-    if git_status:
+    _repo = str(_REPO_ROOT)
+    git_branch = _run(["git", "-C", _repo, "rev-parse", "--abbrev-ref", "HEAD"])
+    git_commit = _run(["git", "-C", _repo, "log", "-1", "--format=%h %s (%ad)", "--date=short"])
+    git_status = _run(["git", "-C", _repo, "status", "--porcelain"])
+
+    branch_val = git_branch if git_branch and not git_branch.startswith("(") else f"unavailable ({git_branch})"
+    commit_val = git_commit if git_commit and not git_commit.startswith("(") else f"unavailable ({git_commit})"
+
+    lines.append(f"  branch : {branch_val}")
+    lines.append(f"  commit : {commit_val}")
+    if git_status.startswith("("):
+        lines.append(f"  dirty  : unavailable ({git_status})")
+    elif git_status:
         lines.append(f"  dirty  : yes")
         for line in git_status.splitlines():
             lines.append(f"    {line}")

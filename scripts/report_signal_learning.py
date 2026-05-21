@@ -182,30 +182,43 @@ def _quality_score(
     expiry_no_tp1_rate: float,
     avg_mfe: Optional[float],
     avg_mae: Optional[float],
+    avg_outcome_r: Optional[float],
     n: int,
+    overall_tp1_rate: float = 0.20,
+    overall_stop_rate: float = 0.20,
 ) -> Optional[float]:
     """Compute a diagnostic quality score in [0, 1].
 
     REPORT-ONLY. Not used for trading, alerts, or config changes.
 
+    Starts from a 0.50 baseline and adjusts relative to overall rates.
+    This produces a useful spread rather than clamping most groups to 0.00.
+
     Formula:
-      base = tp1_rate * 0.30 + tp2_rate * 0.40 - stop_rate * 0.20 - expiry_no_tp1_rate * 0.10
-      MFE bonus  +0.05 if avg_mfe > 1.0R
-      MAE penalty -0.05 if avg_mae > 0.8R
+      score = 0.50
+            + (tp1_rate  - overall_tp1_rate)  * 1.0   # relative TP1 reward
+            + tp2_rate * 0.80                          # absolute TP2 reward
+            - (stop_rate - overall_stop_rate) * 0.70   # relative stop penalty
+            - expiry_no_tp1_rate * 0.40                # expiry-without-TP1 penalty
+            + MFE bonus if avg_mfe > 1.0R
+            - MAE penalty if avg_mae > 0.8R
+            - outcome_r penalty if avg_outcome_r < -0.5
+      Clamped to [0, 1].
     """
     if n < 10:
         return None
-    base = (
-        tp1_rate * 0.30
-        + tp2_rate * 0.40
-        - stop_rate * 0.20
-        - expiry_no_tp1_rate * 0.10
-    )
+    score = 0.50
+    score += (tp1_rate - overall_tp1_rate) * 1.0
+    score += tp2_rate * 0.80
+    score -= (stop_rate - overall_stop_rate) * 0.70
+    score -= expiry_no_tp1_rate * 0.40
     if avg_mfe is not None and avg_mfe > 1.0:
-        base += 0.05
+        score += 0.04
     if avg_mae is not None and avg_mae > 0.8:
-        base -= 0.05
-    return max(0.0, min(1.0, base))
+        score -= 0.04
+    if avg_outcome_r is not None and avg_outcome_r < -0.5:
+        score -= 0.05
+    return max(0.0, min(1.0, score))
 
 
 def _recommendation_label(
@@ -219,21 +232,47 @@ def _recommendation_label(
 ) -> str:
     """Assign a recommendation label for a symbol+direction group.
 
-    REPORT-ONLY. Labels:
-      INSUFFICIENT_SAMPLE  — N < 10
-      PROMISING_OBSERVE    — above-average TP1 and acceptable stop rate
-      NEEDS_FILTERING      — moderate TP1 but high expiry rate
-      WEAK_OBSERVE_ONLY    — low TP1 or high stop rate
+    REPORT-ONLY. Labels (checked in order):
+      INSUFFICIENT_SAMPLE       — N < 10 or score is None
+      WATCHLIST_NEEDS_EXPIRY_FIX — expiry >= 80% but TP1 or stop suggests some
+                                   signal quality worth watching
+      WEAK_OBSERVE_ONLY         — low TP1, high stop, terrible score, or
+                                   extreme expiry without redeeming TP1
+      PROMISING_OBSERVE         — above-average TP1, acceptable stop, expiry < 80%,
+                                   score clearly above minimum threshold
+      NEEDS_FILTERING           — moderate performance, not promising, not terrible
+
+    Hard constraints:
+      - Score <= 0.05 → never PROMISING_OBSERVE
+      - Expiry >= 0.80 → never PROMISING_OBSERVE
     """
     if n < 10 or score is None:
         return "INSUFFICIENT_SAMPLE"
+
     promising_tp1_threshold = overall_tp1_rate * 1.25
     weak_tp1_threshold = overall_tp1_rate * 0.75
     high_stop_threshold = max(overall_stop_rate * 1.25, 0.30)
-    if tp1_rate >= promising_tp1_threshold and stop_rate <= high_stop_threshold:
-        return "PROMISING_OBSERVE"
+
+    # Extreme expiry: separate into watchlist vs weak based on TP1/stop quality
+    if expiry_rate >= 0.80:
+        has_above_avg_tp1 = tp1_rate >= overall_tp1_rate * 1.10
+        has_good_stop = stop_rate <= overall_stop_rate * 0.90
+        if has_above_avg_tp1 or has_good_stop:
+            return "WATCHLIST_NEEDS_EXPIRY_FIX"
+        return "WEAK_OBSERVE_ONLY"
+
+    # Terrible score gate
+    if score <= 0.05:
+        return "WEAK_OBSERVE_ONLY"
+
+    # Weak on TP1 or high stop
     if tp1_rate < weak_tp1_threshold or stop_rate > 0.35:
         return "WEAK_OBSERVE_ONLY"
+
+    # Promising: above-average TP1, acceptable stop, expiry already < 80%
+    if tp1_rate >= promising_tp1_threshold and stop_rate <= high_stop_threshold:
+        return "PROMISING_OBSERVE"
+
     return "NEEDS_FILTERING"
 
 
@@ -529,7 +568,11 @@ def main(argv: list[str] | None = None) -> None:
             avg_mfe = sum(st["mfe_vals"]) / len(st["mfe_vals"]) if st["mfe_vals"] else None
             avg_mae = sum(st["mae_vals"]) / len(st["mae_vals"]) if st["mae_vals"] else None
 
-            score = _quality_score(tp1_r, tp2_r, stop_r, exp_no_tp1_r, avg_mfe, avg_mae, n_closed_g)
+            avg_out_r = sum(st["out_r_vals"]) / len(st["out_r_vals"]) if st["out_r_vals"] else None
+            score = _quality_score(
+                tp1_r, tp2_r, stop_r, exp_no_tp1_r, avg_mfe, avg_mae, avg_out_r,
+                n_closed_g, overall_tp1_rate, overall_stop_rate,
+            )
             label = _recommendation_label(
                 score, tp1_r, stop_r, exp_r, n_closed_g, overall_tp1_rate, overall_stop_rate
             )
@@ -559,7 +602,7 @@ def main(argv: list[str] | None = None) -> None:
         label_counts[label] += 1
     print()
     print("  Label summary (symbol+direction groups):")
-    for lbl in ["PROMISING_OBSERVE", "NEEDS_FILTERING", "WEAK_OBSERVE_ONLY", "INSUFFICIENT_SAMPLE"]:
+    for lbl in ["PROMISING_OBSERVE", "WATCHLIST_NEEDS_EXPIRY_FIX", "NEEDS_FILTERING", "WEAK_OBSERVE_ONLY", "INSUFFICIENT_SAMPLE"]:
         cnt = label_counts.get(lbl, 0)
         if cnt:
             print(f"    {lbl:<25} : {cnt}")
@@ -708,6 +751,104 @@ def main(argv: list[str] | None = None) -> None:
         for field_name, lbl in _INDICATOR_FIELDS:
             vals = [r[field_name] for r in confirmed if r[field_name] is not None]
             print(f"  {lbl:<22} {len(vals):>4}   {_stats_line(vals)}")
+
+    # ------------------------------------------------------------------ top actionable findings
+    # Report-only. Does not recommend enabling alerts or changing runtime filters.
+    if with_outcome and n_closed >= 10:
+        findings: list[str] = []
+
+        # --- Symbol/direction findings ---
+        promising = [(k, sl) for k, sl in scores_and_labels.items() if sl[1] == "PROMISING_OBSERVE"]
+        watchlist = [(k, sl) for k, sl in scores_and_labels.items() if sl[1] == "WATCHLIST_NEEDS_EXPIRY_FIX"]
+        weak = [(k, sl) for k, sl in scores_and_labels.items() if sl[1] == "WEAK_OBSERVE_ONLY"]
+
+        if promising:
+            sym_strs = [f"{s}/{d}" for (s, d), _ in sorted(promising)]
+            findings.append(f"Candidate future review: {', '.join(sym_strs)} labeled PROMISING_OBSERVE — worth monitoring when N grows.")
+        if watchlist:
+            sym_strs = [f"{s}/{d}" for (s, d), _ in sorted(watchlist)]
+            findings.append(f"Candidate future filter: {', '.join(sym_strs)} labeled WATCHLIST_NEEDS_EXPIRY_FIX — setup quality present but expiry too high.")
+        if weak:
+            sym_strs = [f"{s}/{d}" for (s, d), _ in sorted(weak)]
+            findings.append(f"Candidate future filter: {', '.join(sym_strs)} labeled WEAK_OBSERVE_ONLY — low signal quality, no action recommended.")
+
+        # --- Feature bucket findings (RSI and ATR, most actionable) ---
+        for section_label_fb, field_name_fb, bucket_fn_fb, bucket_key_fb in [
+            ("RSI", "rsi_val", _rsi_bucket, "rsi"),
+            ("ATR %price", "atr_pct", _atr_bucket, "atr"),
+        ]:
+            fb: dict[str, list] = defaultdict(list)
+            for r in with_outcome:
+                fb[bucket_fn_fb(r[field_name_fb])].append(r)
+
+            best_tp1_bucket = None
+            best_tp1_rate_fb = -1.0
+            worst_stop_bucket = None
+            worst_stop_rate_fb = -1.0
+
+            for bkt, bkt_rows in fb.items():
+                if len(bkt_rows) < 10 or bkt == "unknown":
+                    continue
+                bst = _outcome_stats(bkt_rows)
+                n_b = bst["n"]
+                bkt_tp1 = bst["tp1"] / n_b
+                bkt_stop = bst["stopped"] / n_b
+                if bkt_tp1 > best_tp1_rate_fb and bkt_tp1 > overall_tp1_rate * 1.2:
+                    best_tp1_rate_fb = bkt_tp1
+                    best_tp1_bucket = (bkt, bkt_tp1, bkt_stop, n_b)
+                if bkt_stop > worst_stop_rate_fb and bkt_stop > overall_stop_rate * 1.3:
+                    worst_stop_rate_fb = bkt_stop
+                    worst_stop_bucket = (bkt, bkt_stop, n_b)
+
+            if best_tp1_bucket:
+                bkt, btp1, bstop, bn = best_tp1_bucket
+                findings.append(
+                    f"Candidate future review: {section_label_fb} bucket '{bkt}' has above-average TP1 "
+                    f"({btp1:.0%} vs {overall_tp1_rate:.0%} avg), N={bn}."
+                )
+            if worst_stop_bucket:
+                bkt, bstop, bn = worst_stop_bucket
+                findings.append(
+                    f"Candidate future filter: avoid {section_label_fb} '{bkt}' — stop rate elevated "
+                    f"({bstop:.0%} vs {overall_stop_rate:.0%} avg), N={bn}."
+                )
+
+        # --- Macro alignment finding ---
+        for macro_field_fa, macro_label_fa in [("btc_trend_bias", "BTC"), ("eth_trend_bias", "ETH")]:
+            ag: dict[str, list] = {"aligned": [], "opposed": [], "neutral": []}
+            for r in with_outcome:
+                ag[_macro_alignment_label(r["direction"], r[macro_field_fa])].append(r)
+            n_al = len(ag["aligned"])
+            n_op = len(ag["opposed"])
+            if n_al >= 10 and n_op >= 10:
+                al_st = _outcome_stats(ag["aligned"])
+                op_st = _outcome_stats(ag["opposed"])
+                al_tp1 = al_st["tp1"] / n_al
+                op_tp1 = op_st["tp1"] / n_op
+                if op_tp1 > al_tp1 * 1.20:
+                    findings.append(
+                        f"Note: {macro_label_fa}-opposed setups have higher TP1 than aligned "
+                        f"({op_tp1:.0%} vs {al_tp1:.0%}). Sample may be unrepresentative — monitor."
+                    )
+
+        if findings:
+            print()
+            print("  Top actionable diagnostic findings")
+            print("  Report-only: do not change runtime filters without a separate milestone.")
+            print()
+            for i, finding in enumerate(findings, 1):
+                # Wrap at ~80 chars
+                prefix = f"    {i}. "
+                words = finding.split()
+                line = prefix
+                for word in words:
+                    if len(line) + len(word) + 1 > 80:
+                        print(line)
+                        line = "       " + word
+                    else:
+                        line += ("" if line == prefix else " ") + word
+                if line.strip():
+                    print(line)
 
     # ------------------------------------------------------------------ feature versions
     ver_counts: dict[str, int] = defaultdict(int)
