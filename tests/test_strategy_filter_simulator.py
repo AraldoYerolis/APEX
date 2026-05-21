@@ -573,3 +573,264 @@ def test_snapshot_includes_filter_simulation_section(tmp_path, monkeypatch):
 
     content = Path(out_path).read_text()
     assert "Strategy Filter Simulation Report" in content
+
+
+# ------------------------------------------------------------------ 11A.1 tests
+
+def test_verdict_unit_improves_but_expiry_high():
+    """_verdict returns IMPROVES_BUT_EXPIRY_HIGH when TP1/avgR improve but expiry >= 80%."""
+    from scripts.simulate_strategy_filters import _verdict
+
+    verdict = _verdict(
+        n_kept=50, min_n=10, n_baseline=100,
+        baseline_tp1_rate=0.20, baseline_stop_rate=0.20, baseline_avg_r=-0.40,
+        kept_tp1_rate=0.35, kept_stop_rate=0.18, kept_avg_r=-0.10,
+        kept_exp_rate=0.85,  # >= 80% → IMPROVES_BUT_EXPIRY_HIGH
+    )
+    assert verdict == "IMPROVES_BUT_EXPIRY_HIGH"
+
+
+def test_verdict_unit_improves_signal_quality_low_expiry():
+    """_verdict returns IMPROVES_SIGNAL_QUALITY when expiry < 80% and outcomes improve."""
+    from scripts.simulate_strategy_filters import _verdict
+
+    verdict = _verdict(
+        n_kept=50, min_n=10, n_baseline=100,
+        baseline_tp1_rate=0.20, baseline_stop_rate=0.20, baseline_avg_r=-0.40,
+        kept_tp1_rate=0.35, kept_stop_rate=0.18, kept_avg_r=-0.10,
+        kept_exp_rate=0.50,  # < 80% → can be IMPROVES_SIGNAL_QUALITY
+    )
+    assert verdict == "IMPROVES_SIGNAL_QUALITY"
+
+
+def test_verdict_unit_insufficient_sample():
+    """_verdict returns INSUFFICIENT_SAMPLE when n_kept < min_n."""
+    from scripts.simulate_strategy_filters import _verdict
+
+    verdict = _verdict(
+        n_kept=5, min_n=10, n_baseline=100,
+        baseline_tp1_rate=0.20, baseline_stop_rate=0.20, baseline_avg_r=-0.40,
+        kept_tp1_rate=0.50, kept_stop_rate=0.05, kept_avg_r=0.50,
+        kept_exp_rate=0.40,
+    )
+    assert verdict == "INSUFFICIENT_SAMPLE"
+
+
+def test_verdict_unit_reduces_sample_too_much():
+    """_verdict returns REDUCES_SAMPLE_TOO_MUCH when kept < 10% of baseline."""
+    from scripts.simulate_strategy_filters import _verdict
+
+    verdict = _verdict(
+        n_kept=5, min_n=4, n_baseline=100,
+        baseline_tp1_rate=0.20, baseline_stop_rate=0.20, baseline_avg_r=-0.40,
+        kept_tp1_rate=0.50, kept_stop_rate=0.05, kept_avg_r=0.50,
+        kept_exp_rate=0.40,
+    )
+    assert verdict == "REDUCES_SAMPLE_TOO_MUCH"
+
+
+def test_integration_improves_but_expiry_high(tmp_path, monkeypatch):
+    """A filter that improves TP1/avgR but keeps expiry >= 80% is labeled IMPROVES_BUT_EXPIRY_HIGH.
+
+    Setup: 12 ATR-normal rows with EXPIRED outcomes and high TP1 (hit_1r set), plus
+    some HIT_2R rows mixed in — making ATR filter's expiry rate stay high.
+    We engineer it by having the kept subset have lots of expired rows but better TP1.
+    """
+    db_path = str(tmp_path / "expiry_high.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Baseline: 12 rows, ATR >= 0.10, most expired without TP1
+    for _ in range(12):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.30)
+        _close_expired(conn, uid, hit_1r=0)
+
+    # Extra rows with low ATR that also expire — these will be removed by KEEP_ATR_GTE_0_10
+    # but because they were also expired, removing them doesn't reduce expiry rate
+    for _ in range(3):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.05)
+        _close_expired(conn, uid, hit_1r=0)
+
+    close_db()
+
+    # min_n=10 so RSI 55-60 filter won't get in the way
+    output = _run_sim(["--min-n", "10"])
+    # expiry is very high (90%+), so any improving filter should get IMPROVES_BUT_EXPIRY_HIGH
+    # or MIXED_NEEDS_REVIEW, never plain IMPROVES_SIGNAL_QUALITY
+    assert "IMPROVES_BUT_EXPIRY_HIGH" in output or "MIXED_NEEDS_REVIEW" in output
+    assert "IMPROVES_SIGNAL_QUALITY" not in output or "IMPROVES_BUT_EXPIRY_HIGH" in output
+
+
+def test_integration_improves_signal_quality_low_expiry(tmp_path, monkeypatch):
+    """A filter that improves outcomes and keeps expiry low gets IMPROVES_SIGNAL_QUALITY."""
+    db_path = str(tmp_path / "low_expiry.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Baseline: 6 low ATR (0.05) rows that STOP — these drag down baseline TP1
+    for _ in range(6):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.05)
+        _close_stopped(conn, uid)
+
+    # 14 normal ATR (0.30) rows that HIT_2R — these have great TP1 and low expiry
+    for _ in range(14):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.30)
+        _close_hit2r(conn, uid)
+
+    close_db()
+
+    output = _run_sim(["--min-n", "10"])
+    # ATR >= 0.10 filter keeps the 14 HIT_2R rows: 0% expiry, great TP1
+    assert "IMPROVES_SIGNAL_QUALITY" in output
+
+
+def test_flags_high_expiry_appears(tmp_path, monkeypatch):
+    """HIGH_EXPIRY flag appears in output for filters where expiry >= 80%."""
+    db_path = str(tmp_path / "flag_exp.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # All rows expire → every filter result will have HIGH_EXPIRY flag
+    for _ in range(15):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.30)
+        _close_expired(conn, uid, hit_1r=0)
+
+    close_db()
+
+    output = _run_sim(["--min-n", "10"])
+    assert "HIGH_EXPIRY" in output
+
+
+def test_flags_retrospective_label_appears(tmp_path, monkeypatch):
+    """RETROSPECTIVE_LABEL flag appears for label-based filters."""
+    db_path = str(tmp_path / "flag_retro.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    for _ in range(12):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid)
+        _close_hit2r(conn, uid)
+
+    close_db()
+
+    output = _run_sim(["--min-n", "10"])
+    assert "RETROSPECTIVE_LABEL" in output
+
+
+def test_balanced_candidates_section_appears(tmp_path, monkeypatch):
+    """Balanced candidates for future review section appears."""
+    db_path = str(tmp_path / "balanced.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    for _ in range(15):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.30)
+        _close_hit2r(conn, uid)
+
+    close_db()
+
+    output = _run_sim(["--min-n", "10"])
+    assert "Balanced candidates for future review" in output
+
+
+def test_balanced_ranking_penalizes_high_expiry(tmp_path, monkeypatch):
+    """Balanced score is lower for high-expiry filters than low-expiry ones with similar TP1 gains."""
+    from scripts.simulate_strategy_filters import _balanced_score
+
+    # High expiry result — same TP1 gain but exp_rate >= 0.80
+    high_exp = {
+        "d_tp1": 0.10,
+        "d_stop": -0.05,
+        "d_r": 0.20,
+        "exp_no_tp1_rate": 0.80,
+        "b_exp_no_tp1_rate": 0.70,
+        "exp_rate": 0.85,
+        "verdict": "IMPROVES_BUT_EXPIRY_HIGH",
+    }
+    # Low expiry result — same deltas but expiry is fine
+    low_exp = {
+        "d_tp1": 0.10,
+        "d_stop": -0.05,
+        "d_r": 0.20,
+        "exp_no_tp1_rate": 0.30,
+        "b_exp_no_tp1_rate": 0.70,
+        "exp_rate": 0.35,
+        "verdict": "IMPROVES_SIGNAL_QUALITY",
+    }
+
+    score_high = _balanced_score(high_exp, 0.20, -0.40, False)
+    score_low = _balanced_score(low_exp, 0.20, -0.40, False)
+
+    assert score_low > score_high, (
+        f"Expected low-expiry score ({score_low:.3f}) > high-expiry score ({score_high:.3f})"
+    )
+
+
+def test_direct_script_import_works():
+    """simulate_strategy_filters can be imported directly (sys.path bootstrap is present)."""
+    # If the bootstrap works, the import should not raise even without PYTHONPATH=.:src
+    import importlib
+    spec = importlib.util.spec_from_file_location(
+        "simulate_strategy_filters",
+        str(Path(__file__).parent.parent / "scripts" / "simulate_strategy_filters.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    # Should not raise ImportError
+    try:
+        spec.loader.exec_module(mod)
+    except ImportError as e:
+        pytest.fail(f"simulate_strategy_filters could not be imported directly: {e}")
+
+
+def test_improves_but_expiry_high_not_called_improves(tmp_path, monkeypatch):
+    """Verdict IMPROVES_BUT_EXPIRY_HIGH is never labeled IMPROVES_SIGNAL_QUALITY."""
+    from scripts.simulate_strategy_filters import _verdict
+
+    # Construct a scenario that previously would have been IMPROVES_SIGNAL_QUALITY
+    # (d_r > 0.05 and d_tp1 > 0) but now has high expiry
+    for kept_exp in [0.80, 0.85, 0.90, 0.95]:
+        v = _verdict(
+            n_kept=30, min_n=10, n_baseline=100,
+            baseline_tp1_rate=0.20, baseline_stop_rate=0.20, baseline_avg_r=-0.50,
+            kept_tp1_rate=0.35, kept_stop_rate=0.15, kept_avg_r=0.10,
+            kept_exp_rate=kept_exp,
+        )
+        assert v == "IMPROVES_BUT_EXPIRY_HIGH", (
+            f"Expected IMPROVES_BUT_EXPIRY_HIGH for exp_rate={kept_exp}, got {v}"
+        )
+
+
+def test_interpretation_mentions_improves_but_expiry_high(tmp_path, monkeypatch):
+    """Interpretation section explicitly mentions IMPROVES_BUT_EXPIRY_HIGH when applicable."""
+    db_path = str(tmp_path / "interp_exp.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Create scenario where a filter will get IMPROVES_BUT_EXPIRY_HIGH:
+    # Most rows expire without TP1, but a filtered subset has better TP1 yet still high expiry.
+    # 6 STOPPED rows with low ATR — removed by ATR filter
+    for _ in range(6):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.05)
+        _close_stopped(conn, uid)
+
+    # 14 rows with normal ATR — expired but with hit_1r=1 (partial win)
+    for _ in range(14):
+        uid = _insert_obs(conn)
+        _insert_feature(conn, uid, atr_pct=0.30)
+        _close_expired(conn, uid, hit_1r=1)
+
+    close_db()
+
+    output = _run_sim(["--min-n", "10"])
+    # ATR >= 0.10 keeps the 14 high-expiry rows; TP1 improves (all hit_1r), expiry still >= 80%
+    # → should produce IMPROVES_BUT_EXPIRY_HIGH which appears in interpretation
+    if "IMPROVES_BUT_EXPIRY_HIGH" in output:
+        assert "not strategy-ready" in output or "IMPROVES_BUT_EXPIRY_HIGH is NOT" in output

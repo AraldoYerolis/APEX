@@ -113,29 +113,46 @@ PYTHONPATH=src python scripts/report_signal_learning.py --limit 200
 ---
 
 ## Milestone 11A — Strategy Filter Simulator  ← COMPLETE
+## Milestone 11A.1 — Usability Fix + Stricter Verdicts  ← COMPLETE
 
 **Goal:** Retrospective simulation of candidate filter rules against historical dry-run
 signal_features + signal_observations data. Answer: "If we had applied these rules,
 what would historical outcomes have looked like?"
 
-**What was built:**
+**What was built (11A):**
 - `scripts/simulate_strategy_filters.py` — read-only report script
 - 28 candidate filter rules across 8 groups (ATR, EMA spread, RSI, VWAP, direction,
   BTC macro alignment, ETH macro alignment, retrospective label-based, combined)
 - Baseline performance section (all closed CONFIRMED_SETUP rows)
-- Per-filter output: rows kept/removed, TP1/TP2/stop/expiry/expiry-no-TP1 rates,
-  avg MFE/MAE/outcome R, deltas vs baseline, verdict label
-- Verdict labels: IMPROVES_SIGNAL_QUALITY / MIXED_NEEDS_REVIEW / WORSE_THAN_BASELINE /
-  REDUCES_SAMPLE_TOO_MUCH / INSUFFICIENT_SAMPLE
-- Ranked "Top simulated filters" section (by delta avg R, delta TP1, delta stop)
+- Per-filter output: rows kept/removed, TP1/TP2/stop/expiry rates, deltas, verdict label
+- Ranked "Top simulated filters" section
 - "Filters that look dangerous" section
-- Interpretation section with dynamic values, RETROSPECTIVE warnings
+- Interpretation section, RETROSPECTIVE warnings
 - Integrated into `create_apex_snapshot.py` as "Strategy Filter Simulation Report"
-- 24 tests in `tests/test_strategy_filter_simulator.py` (220 total in suite)
-- Optional `--csv` export
+
+**What was fixed/added (11A.1):**
+- **Direct script execution fixed**: Added `sys.path` bootstrap (same pattern as
+  `create_apex_snapshot.py`). `PYTHONPATH=src python scripts/simulate_strategy_filters.py`
+  now works correctly without requiring `PYTHONPATH=.:src`.
+- **New verdict label `IMPROVES_BUT_EXPIRY_HIGH`**: A filter that improves TP1 and/or
+  avgR but has expiry >= 80% now receives this label instead of `IMPROVES_SIGNAL_QUALITY`.
+  Prevents misleadingly labeling extreme-expiry filters as "clean improvements."
+- **Verdict order**: INSUFFICIENT_SAMPLE → REDUCES_SAMPLE_TOO_MUCH → WORSE_THAN_BASELINE
+  → IMPROVES_BUT_EXPIRY_HIGH → IMPROVES_SIGNAL_QUALITY → MIXED_NEEDS_REVIEW
+- **Warning flags per filter**: Each result includes a compact `Flags:` line with any
+  applicable flags: HIGH_EXPIRY, THIN_SAMPLE, RETROSPECTIVE_LABEL, STOP_WORSE,
+  TP2_WORSE, AVG_R_WORSE
+- **Balanced candidates section**: New ranking section after "Top simulated filters."
+  Scores = TP1Δ×0.40 + stopΔ×0.30 + avgRΔ×0.20 + exp-no-TP1Δ×0.10 with penalties
+  for high expiry (-0.20), thin sample (-0.10), retrospective label (-0.05).
+- **Interpretation enhanced**: Explicit language for IMPROVES_BUT_EXPIRY_HIGH: "not
+  strategy-ready"; high expiry means timing/exit problem, not entry selection problem.
+- **CSV updated**: Includes `flags` (pipe-separated) and `balanced_score` columns.
+- 13 new tests (37 total in test_strategy_filter_simulator.py; 233 total in suite)
 
 **How to run:**
 ```bash
+# Direct execution (fixed in 11A.1):
 PYTHONPATH=src python scripts/simulate_strategy_filters.py
 PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10:28:00Z
 PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10:28:00Z --min-n 10
@@ -148,16 +165,16 @@ PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10
 - Does not suppress or alter live/dry-run observations
 - Does not enable alerts or trading
 - Retrospective label-based filters use group labels from the same dataset —
-  clearly flagged as RETROSPECTIVE in output. Results may overfit current sample.
+  clearly flagged as RETROSPECTIVE in output and penalized in balanced ranking
 
 **Important limitations / overfitting warnings:**
-- All filters are retrospective: applied to the same data used to compute the baseline.
-  A filter that "improves" signal quality here may not generalise to future data.
-- Label-based filters (group G and H combined) are especially susceptible to overfitting
-  since labels are computed from the filtered dataset itself.
-- Sample sizes for SHORT, rare symbols, and narrow indicator buckets are often < 10,
-  producing INSUFFICIENT_SAMPLE verdicts.
-- High expiry (75%+) remains the dominant failure mode; most filters do not solve it.
+- All filters are retrospective. A filter that "improves" signal quality here may not
+  generalise to future data.
+- IMPROVES_BUT_EXPIRY_HIGH is NOT strategy-ready. High expiry at this level indicates
+  a timing or exit problem, not an entry quality improvement.
+- Label-based filters (G/H) are especially susceptible to overfitting.
+- Sample sizes for SHORT, rare symbols, and narrow indicator buckets are often < 10.
+- High expiry (~75%+) remains the dominant failure mode across most filter subsets.
 
 **What this milestone does NOT do:**
 - Does not activate any filter in production scanning
@@ -479,6 +496,7 @@ explicit approval before any filter is applied to live/dry-run scanning.
 10C   Signal quality agent / learning report v2             ← COMPLETE
 10C.1 Fix diagnostic scoring, labels, git meta              ← COMPLETE
 11A   Strategy filter simulator (report-only)               ← COMPLETE
+11A.1 Usability fix + stricter verdicts                    ← COMPLETE
 10D   Setup scoring agent
 10E   Multi-TF confirmation
 10F   Support/resistance agent

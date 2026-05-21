@@ -1,4 +1,4 @@
-"""Strategy Filter Simulator — Milestone 11A.
+"""Strategy Filter Simulator — Milestone 11A / 11A.1.
 
 Read-only retrospective simulation of candidate filter rules against
 historical dry-run signal_features + signal_observations data.
@@ -21,6 +21,19 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
+# -----------------------------------------------------------------------
+# sys.path bootstrap — ensures this script works when invoked as:
+#   PYTHONPATH=src python scripts/simulate_strategy_filters.py
+# or via create_apex_snapshot.py (which adds repo root + src/ itself).
+# Mirrors the same pattern used in create_apex_snapshot.py.
+# -----------------------------------------------------------------------
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_DIR.parent
+_SRC_DIR = _REPO_ROOT / "src"
+for _p in (str(_REPO_ROOT), str(_SRC_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from apex.config import get_settings
 from apex.db.connection import close_db, init_db
 
@@ -35,6 +48,13 @@ from scripts.report_signal_learning import (
 )
 
 _DEFAULT_MIN_N = 10
+
+# Names of filter groups that use retrospective group labels
+_RETROSPECTIVE_PREFIXES = (
+    "KEEP_PROMISING", "KEEP_NOT_WEAK", "EXCLUDE_WEAK", "EXCLUDE_INSUFFICIENT",
+    "KEEP_ATR_0_25_TO_0_50_AND_NOT_WEAK", "KEEP_ATR_GTE_0_10_AND_EXCLUDE_WEAK",
+    "KEEP_NOT_WEAK_AND_NOT_INSUFFICIENT", "KEEP_PROMISING_OR_WATCHLIST_AND_ATR_GTE_0_10",
+)
 
 
 # ======================================================================
@@ -153,8 +173,7 @@ def _build_group_labels(
     for r in closed_rows:
         sd_closed[(r["symbol"], r["direction"])].append(r)
 
-    n_total = len(closed_rows)
-    if n_total == 0:
+    if not closed_rows:
         return {}
 
     overall_st = _outcome_stats(closed_rows)
@@ -197,6 +216,41 @@ def _make_label_filter(allowed_labels: set[str], group_labels: dict[tuple[str, s
 
 
 # ======================================================================
+# Warning flags
+# ======================================================================
+
+def _compute_flags(
+    res: dict,
+    n_baseline: int,
+    baseline_tp2_rate: float,
+    baseline_avg_r: Optional[float],
+    is_retrospective: bool,
+) -> list[str]:
+    """Return a list of warning flag strings for a filter result."""
+    flags: list[str] = []
+    if res["exp_rate"] >= 0.80:
+        flags.append("HIGH_EXPIRY")
+    if n_baseline > 0 and res["n_kept"] / n_baseline < 0.10:
+        flags.append("THIN_SAMPLE")
+    if is_retrospective:
+        flags.append("RETROSPECTIVE_LABEL")
+    # Stop materially worse: > 3pp above baseline
+    if res["d_stop"] is not None and res["d_stop"] > 0.03:
+        flags.append("STOP_WORSE")
+    # TP2 materially worse: > 2pp below baseline
+    if res["d_tp2"] is not None and res["d_tp2"] < -0.02:
+        flags.append("TP2_WORSE")
+    # avg R worse
+    if res["d_r"] is not None and res["d_r"] < -0.05:
+        flags.append("AVG_R_WORSE")
+    return flags
+
+
+def _is_retrospective(name: str) -> bool:
+    return any(name.startswith(p) for p in _RETROSPECTIVE_PREFIXES)
+
+
+# ======================================================================
 # Simulation core
 # ======================================================================
 
@@ -210,11 +264,20 @@ def _verdict(
     kept_tp1_rate: float,
     kept_stop_rate: float,
     kept_avg_r: Optional[float],
+    kept_exp_rate: float,
 ) -> str:
-    """Assign a verdict label for a simulated filter."""
+    """Assign a verdict label for a simulated filter.
+
+    Verdict labels (checked in order):
+      INSUFFICIENT_SAMPLE       — kept < min_n
+      REDUCES_SAMPLE_TOO_MUCH   — kept < 10% of baseline
+      WORSE_THAN_BASELINE       — TP1 and avgR both worse, or stop materially worse
+      IMPROVES_BUT_EXPIRY_HIGH  — improves TP1/avgR but expiry >= 80%
+      IMPROVES_SIGNAL_QUALITY   — improves TP1/avgR, stop not materially worse, expiry < 80%
+      MIXED_NEEDS_REVIEW        — otherwise
+    """
     if n_kept < min_n:
         return "INSUFFICIENT_SAMPLE"
-    # Very thin sample relative to baseline
     if n_baseline > 0 and n_kept / n_baseline < 0.10:
         return "REDUCES_SAMPLE_TOO_MUCH"
 
@@ -228,13 +291,42 @@ def _verdict(
     if d_tp1 <= -0.03 and d_stop >= 0.03:
         return "WORSE_THAN_BASELINE"
 
-    # Positive improvement
-    if d_r >= 0.05 and d_tp1 >= 0:
-        return "IMPROVES_SIGNAL_QUALITY"
-    if d_tp1 >= 0.02 and d_stop <= 0:
+    # Positive improvement candidate — check expiry before awarding IMPROVES
+    is_improving = (d_r >= 0.05 and d_tp1 >= 0) or (d_tp1 >= 0.02 and d_stop <= 0)
+    if is_improving:
+        if kept_exp_rate >= 0.80:
+            return "IMPROVES_BUT_EXPIRY_HIGH"
         return "IMPROVES_SIGNAL_QUALITY"
 
     return "MIXED_NEEDS_REVIEW"
+
+
+def _balanced_score(
+    res: dict,
+    b_tp1_r: float,
+    b_avg_r: Optional[float],
+    is_retro: bool,
+) -> float:
+    """Compute a balanced score for ranking.
+
+    Higher is better. Penalizes high expiry, thin sample, retrospective labels.
+    """
+    d_tp1 = res["d_tp1"] or 0.0
+    d_stop = -(res["d_stop"] or 0.0)
+    d_r = res["d_r"] or 0.0
+    d_exp_no_tp1 = -(res["exp_no_tp1_rate"] - (res.get("b_exp_no_tp1_rate") or res["exp_no_tp1_rate"]))
+
+    score = d_tp1 * 0.40 + d_stop * 0.30 + d_r * 0.20 + d_exp_no_tp1 * 0.10
+
+    # Penalties
+    if res["exp_rate"] >= 0.80:
+        score -= 0.20
+    if res["verdict"] == "REDUCES_SAMPLE_TOO_MUCH":
+        score -= 0.10
+    if is_retro:
+        score -= 0.05
+
+    return score
 
 
 def _run_filter(
@@ -244,6 +336,7 @@ def _run_filter(
     closed_rows: list[Any],
     baseline_st: dict,
     min_n: int,
+    b_exp_no_tp1_rate: float,
 ) -> dict:
     """Run a single filter simulation and return a result dict."""
     kept = [r for r in closed_rows if pred(r)]
@@ -271,7 +364,9 @@ def _run_filter(
             "d_stop": 0.0,
             "d_exp": 0.0,
             "d_r": None,
+            "b_exp_no_tp1_rate": b_exp_no_tp1_rate,
             "verdict": "INSUFFICIENT_SAMPLE",
+            "flags": [],
         }
 
     st = _outcome_stats(kept)
@@ -298,6 +393,7 @@ def _run_filter(
         n_kept, min_n, n_base,
         b_tp1_r, b_stop_r, b_avg_r,
         tp1_r, stop_r, avg_r,
+        exp_r,
     )
 
     return {
@@ -319,7 +415,9 @@ def _run_filter(
         "d_stop": stop_r - b_stop_r,
         "d_exp": exp_r - b_exp_r,
         "d_r": d_r,
+        "b_exp_no_tp1_rate": b_exp_no_tp1_rate,
         "verdict": verdict,
+        "flags": [],  # populated separately
     }
 
 
@@ -361,6 +459,9 @@ def _print_result(res: dict) -> None:
             f"EXP={_delta(res['d_exp'])}  "
             f"avgR={_delta_r(res['d_r'])}"
         )
+    flags = res.get("flags", [])
+    if flags:
+        print(f"  Flags     : {', '.join(flags)}")
     print(f"  Verdict   : {verdict}")
 
 
@@ -467,6 +568,7 @@ def main(argv: list[str] | None = None) -> None:
     b_tp2_r = baseline_st["tp2"] / b_n if b_n else 0.0
     b_stop_r = baseline_st["stopped"] / b_n if b_n else 0.0
     b_exp_r = baseline_st["expired"] / b_n if b_n else 0.0
+    b_exp_no_tp1_r = baseline_st["exp_no_tp1"] / b_n if b_n else 0.0
     b_avg_r = sum(baseline_st["out_r_vals"]) / len(baseline_st["out_r_vals"]) if baseline_st["out_r_vals"] else None
     b_avg_mfe = sum(baseline_st["mfe_vals"]) / len(baseline_st["mfe_vals"]) if baseline_st["mfe_vals"] else None
     b_avg_mae = sum(baseline_st["mae_vals"]) / len(baseline_st["mae_vals"]) if baseline_st["mae_vals"] else None
@@ -506,7 +608,6 @@ def main(argv: list[str] | None = None) -> None:
     PROMISING = {"PROMISING_OBSERVE"}
     PROMISING_OR_WATCHLIST = {"PROMISING_OBSERVE", "WATCHLIST_NEEDS_EXPIRY_FIX"}
     NOT_WEAK = {"PROMISING_OBSERVE", "WATCHLIST_NEEDS_EXPIRY_FIX", "NEEDS_FILTERING"}
-    NOT_WEAK_NOT_INSUF = {"PROMISING_OBSERVE", "WATCHLIST_NEEDS_EXPIRY_FIX", "NEEDS_FILTERING"}
 
     filter_defs = [
         # ---- A: ATR filters
@@ -596,7 +697,7 @@ def main(argv: list[str] | None = None) -> None:
          _make_label_filter(NOT_WEAK, group_labels)),
         ("EXCLUDE_INSUFFICIENT_SAMPLE_GROUPS",
          "RETROSPECTIVE: group label != INSUFFICIENT_SAMPLE",
-         _make_label_filter(NOT_WEAK_NOT_INSUF | {"INSUFFICIENT_SAMPLE"} - {"INSUFFICIENT_SAMPLE"},
+         _make_label_filter(NOT_WEAK | {"INSUFFICIENT_SAMPLE"} - {"INSUFFICIENT_SAMPLE"},
                             group_labels)),
 
         # ---- H: Combined filters
@@ -649,14 +750,17 @@ def main(argv: list[str] | None = None) -> None:
                 break
             name, rule, pred = filter_defs[idx]
             idx += 1
-            res = _run_filter(name, rule, pred, closed_confirmed, baseline_st, args.min_n)
+            res = _run_filter(name, rule, pred, closed_confirmed, baseline_st, args.min_n, b_exp_no_tp1_r)
+            # Compute and attach flags
+            is_retro = _is_retrospective(name)
+            res["flags"] = _compute_flags(res, b_n, b_tp2_r, b_avg_r, is_retro)
             results.append(res)
             print()
             print(f"  [{name}]")
             _print_result(res)
 
     # ------------------------------------------------------------------
-    # Section 4: Ranking
+    # Section 4: Rankings
     # ------------------------------------------------------------------
     print()
     print("=" * 68)
@@ -710,6 +814,56 @@ def main(argv: list[str] | None = None) -> None:
         print("    None flagged.")
 
     # ------------------------------------------------------------------
+    # Section 4b: Balanced candidates for future review
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 68)
+    print("  Balanced candidates for future review")
+    print("=" * 68)
+    print("  Ranked by balanced score: TP1 improvement (40%), stop reduction (30%),")
+    print("  avgR improvement (20%), expiry-without-TP1 reduction (10%).")
+    print("  Penalties: high expiry (-0.20), thin sample (-0.10), retrospective label (-0.05).")
+    print("  Insufficient-sample filters excluded.")
+
+    eligible = [
+        r for r in results
+        if r["verdict"] != "INSUFFICIENT_SAMPLE" and r["n_kept"] >= args.min_n
+    ]
+
+    for r in eligible:
+        is_retro = _is_retrospective(r["name"])
+        r["balanced_score"] = _balanced_score(r, b_tp1_r, b_avg_r, is_retro)
+
+    balanced_ranked = sorted(eligible, key=lambda r: r["balanced_score"], reverse=True)[:10]
+
+    if balanced_ranked:
+        print()
+        hdr2 = (
+            f"  {'Filter':<48} {'Kept':>5} {'Kpt%':>5} "
+            f"{'TP1Δ':>7} {'STPΔ':>7} {'EXP%':>6} {'EXPnoTP1Δ':>10} {'avgRΔ':>8} "
+            f"{'BScore':>7}  Verdict"
+        )
+        print(hdr2)
+        print("  " + "-" * (len(hdr2) - 2))
+        for r in balanced_ranked:
+            d_tp1_s = f"{r['d_tp1']*100:+.1f}pp"
+            d_stop_s = f"{r['d_stop']*100:+.1f}pp"
+            d_r_s = f"{r['d_r']:+.3f}R" if r["d_r"] is not None else "   n/a"
+            exp_pct = f"{r['exp_rate']*100:.1f}%"
+            d_exp_no_tp1 = r["exp_no_tp1_rate"] - r["b_exp_no_tp1_rate"]
+            d_exp_no_tp1_s = f"{d_exp_no_tp1*100:+.1f}pp"
+            bscore_s = f"{r['balanced_score']:+.3f}"
+            name_trunc = r["name"][:47]
+            print(
+                f"  {name_trunc:<48} {r['n_kept']:>5} {r['kept_pct']:>4.0f}% "
+                f"{d_tp1_s:>7} {d_stop_s:>7} {exp_pct:>6} {d_exp_no_tp1_s:>10} {d_r_s:>8} "
+                f"{bscore_s:>7}  {r['verdict']}"
+            )
+    else:
+        print()
+        print("  No eligible filters to rank.")
+
+    # ------------------------------------------------------------------
     # Section 5: Interpretation
     # ------------------------------------------------------------------
     print()
@@ -719,40 +873,49 @@ def main(argv: list[str] | None = None) -> None:
     print()
 
     improving = [r for r in results if r["verdict"] == "IMPROVES_SIGNAL_QUALITY"]
+    improves_expiry = [r for r in results if r["verdict"] == "IMPROVES_BUT_EXPIRY_HIGH"]
     mixed = [r for r in results if r["verdict"] == "MIXED_NEEDS_REVIEW"]
     worse = [r for r in results if r["verdict"] == "WORSE_THAN_BASELINE"]
     insuf = [r for r in results if r["verdict"] in ("INSUFFICIENT_SAMPLE", "REDUCES_SAMPLE_TOO_MUCH")]
 
     high_expiry_remaining = [
         r for r in results
-        if r["n_kept"] >= args.min_n and r["exp_rate"] > 0.60
+        if r["n_kept"] >= args.min_n and r["exp_rate"] >= 0.80
     ]
 
-    print(f"  {len(improving)} filter(s) labeled IMPROVES_SIGNAL_QUALITY, "
-          f"{len(mixed)} MIXED, {len(worse)} WORSE_THAN_BASELINE, "
-          f"{len(insuf)} insufficient/thin.")
+    print(
+        f"  {len(improving)} IMPROVES_SIGNAL_QUALITY, "
+        f"{len(improves_expiry)} IMPROVES_BUT_EXPIRY_HIGH, "
+        f"{len(mixed)} MIXED, "
+        f"{len(worse)} WORSE_THAN_BASELINE, "
+        f"{len(insuf)} insufficient/thin."
+    )
     print()
     print("  No runtime changes are recommended automatically.")
     print("  Candidate filters must be validated over more data before")
-    print("  becoming real strategy gates. A future milestone (11C) is")
+    print("  becoming real strategy gates. A future milestone (11B) is")
     print("  required before any filter is activated in production.")
     print()
+
+    if improves_expiry:
+        print(f"  {len(improves_expiry)} filter(s) labeled IMPROVES_BUT_EXPIRY_HIGH.")
+        print("  These filters improve TP1 and/or avgR but expiry remains >= 80%.")
+        print("  IMPROVES_BUT_EXPIRY_HIGH is NOT strategy-ready. High expiry at this")
+        print("  level indicates the problem may be timing, expiration window, or")
+        print("  exit logic rather than entry selection. Applying these filters would")
+        print("  concentrate signals in a subset that still expires most of the time.")
+        print()
 
     if high_expiry_remaining:
         names = ", ".join(r["name"] for r in high_expiry_remaining[:3])
         extra = f" (+{len(high_expiry_remaining) - 3} more)" if len(high_expiry_remaining) > 3 else ""
-        print(f"  High expiry remains above 60% even after applying: {names}{extra}.")
-        print("  High expiry is the primary failure mode. A filter that improves")
-        print("  TP1 but keeps extreme expiry should be treated as a")
-        print("  timing/expiration problem, not a solved strategy.")
+        print(f"  Expiry >= 80% even after applying: {names}{extra}.")
+        print("  High expiry is the primary failure mode across most filter subsets.")
         print()
 
-    if any(r["verdict"] == "IMPROVES_SIGNAL_QUALITY" for r in results):
-        best = max(
-            (r for r in results if r["verdict"] == "IMPROVES_SIGNAL_QUALITY"),
-            key=lambda r: (r["d_r"] or -99),
-        )
-        print(f"  Best improving filter by avg outcome R: {best['name']}")
+    if improving:
+        best = max(improving, key=lambda r: (r["d_r"] or -99))
+        print(f"  Best clean-improving filter by avgR: {best['name']}")
         d_r_s = f"{best['d_r']:+.3f}R" if best["d_r"] is not None else "n/a"
         print(f"    Kept: {best['n_kept']} rows ({best['kept_pct']:.1f}% of baseline)  ΔavgR={d_r_s}")
         print()
@@ -762,6 +925,8 @@ def main(argv: list[str] | None = None) -> None:
     print("  These results cannot be used as evidence that the filter generalises")
     print("  to future data. They indicate which historical groups had better")
     print("  outcomes, not which future signals will.")
+    print()
+    print("  No runtime filters should be enabled based on this report alone.")
 
     # ------------------------------------------------------------------
     # Optional CSV export
@@ -772,13 +937,16 @@ def main(argv: list[str] | None = None) -> None:
             "name", "rule", "n_kept", "n_removed", "kept_pct",
             "tp1_rate", "tp2_rate", "stop_rate", "exp_rate", "exp_no_tp1_rate",
             "avg_mfe", "avg_mae", "avg_r",
-            "d_tp1", "d_tp2", "d_stop", "d_exp", "d_r", "verdict",
+            "d_tp1", "d_tp2", "d_stop", "d_exp", "d_r",
+            "balanced_score", "flags", "verdict",
         ]
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for res in results:
-                writer.writerow({k: res.get(k) for k in fieldnames})
+                row = {k: res.get(k) for k in fieldnames}
+                row["flags"] = "|".join(res.get("flags", []))
+                writer.writerow(row)
         print()
         print(f"  CSV written to: {csv_path}")
 
