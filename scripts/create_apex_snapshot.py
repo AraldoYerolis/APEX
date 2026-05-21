@@ -199,6 +199,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  Could not import learning script: {e}")
 
     # ------------------------------------------------------------------
+    # Strategy filter simulation report
+    # ------------------------------------------------------------------
+    _section(lines, "Strategy Filter Simulation Report")
+    try:
+        import scripts.simulate_strategy_filters as _sim
+        sim_argv = []
+        if args.since:
+            sim_argv += ["--since", args.since]
+        sim_out = _capture_script(_sim.main, sim_argv)
+        lines.append(sim_out)
+    except ImportError as e:
+        lines.append(f"  Could not import strategy filter simulator: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running strategy filter simulator: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")

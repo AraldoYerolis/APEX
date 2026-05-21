@@ -112,6 +112,64 @@ PYTHONPATH=src python scripts/report_signal_learning.py --limit 200
 
 ---
 
+## Milestone 11A — Strategy Filter Simulator  ← COMPLETE
+
+**Goal:** Retrospective simulation of candidate filter rules against historical dry-run
+signal_features + signal_observations data. Answer: "If we had applied these rules,
+what would historical outcomes have looked like?"
+
+**What was built:**
+- `scripts/simulate_strategy_filters.py` — read-only report script
+- 28 candidate filter rules across 8 groups (ATR, EMA spread, RSI, VWAP, direction,
+  BTC macro alignment, ETH macro alignment, retrospective label-based, combined)
+- Baseline performance section (all closed CONFIRMED_SETUP rows)
+- Per-filter output: rows kept/removed, TP1/TP2/stop/expiry/expiry-no-TP1 rates,
+  avg MFE/MAE/outcome R, deltas vs baseline, verdict label
+- Verdict labels: IMPROVES_SIGNAL_QUALITY / MIXED_NEEDS_REVIEW / WORSE_THAN_BASELINE /
+  REDUCES_SAMPLE_TOO_MUCH / INSUFFICIENT_SAMPLE
+- Ranked "Top simulated filters" section (by delta avg R, delta TP1, delta stop)
+- "Filters that look dangerous" section
+- Interpretation section with dynamic values, RETROSPECTIVE warnings
+- Integrated into `create_apex_snapshot.py` as "Strategy Filter Simulation Report"
+- 24 tests in `tests/test_strategy_filter_simulator.py` (220 total in suite)
+- Optional `--csv` export
+
+**How to run:**
+```bash
+PYTHONPATH=src python scripts/simulate_strategy_filters.py
+PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10:28:00Z
+PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10:28:00Z --min-n 10
+PYTHONPATH=src python scripts/simulate_strategy_filters.py --since 2026-05-20T10:28:00Z --csv /tmp/sim.csv
+```
+
+**Safety constraints (all maintained):**
+- Read-only: never writes to any DB table
+- Does not change runtime signal generation or scheduler behavior
+- Does not suppress or alter live/dry-run observations
+- Does not enable alerts or trading
+- Retrospective label-based filters use group labels from the same dataset —
+  clearly flagged as RETROSPECTIVE in output. Results may overfit current sample.
+
+**Important limitations / overfitting warnings:**
+- All filters are retrospective: applied to the same data used to compute the baseline.
+  A filter that "improves" signal quality here may not generalise to future data.
+- Label-based filters (group G and H combined) are especially susceptible to overfitting
+  since labels are computed from the filtered dataset itself.
+- Sample sizes for SHORT, rare symbols, and narrow indicator buckets are often < 10,
+  producing INSUFFICIENT_SAMPLE verdicts.
+- High expiry (75%+) remains the dominant failure mode; most filters do not solve it.
+
+**What this milestone does NOT do:**
+- Does not activate any filter in production scanning
+- Does not change ALERTS_ENABLED, DRY_RUN_MODE, or any config value
+- Does not store simulation results in DB (stdout/CSV only)
+- Does not promote candidate filters to runtime gates
+
+**Next step (11B):** Candidate runtime gate design — a separate milestone requiring
+explicit approval before any filter is applied to live/dry-run scanning.
+
+---
+
 ## Milestone 10D — Setup Scoring Agent
 
 **Goal:** Combine available agent outputs (quality scores, plus placeholders for regime/MTF/SR) into a single composite score per open observation.
@@ -416,18 +474,31 @@ PYTHONPATH=src python scripts/report_signal_learning.py --limit 200
 ## Milestone ordering summary
 
 ```
-10A   TP1 non-terminal milestone tracking        ← COMPLETE
-10B   Signal feature snapshot                    ← COMPLETE
-10C   Signal quality agent / learning report v2  ← COMPLETE
-10C.1 Fix diagnostic scoring, labels, git meta   ← COMPLETE
+10A   TP1 non-terminal milestone tracking                   ← COMPLETE
+10B   Signal feature snapshot                               ← COMPLETE
+10C   Signal quality agent / learning report v2             ← COMPLETE
+10C.1 Fix diagnostic scoring, labels, git meta              ← COMPLETE
+11A   Strategy filter simulator (report-only)               ← COMPLETE
 10D   Setup scoring agent
-10E  Multi-TF confirmation
-10F  Support/resistance agent
-10G  Market regime agent
-10H  Relative strength agent
-11A  Paper execution agent
-11B  Trade review agent
-12A  Risk/position sizing agent
-13A  Approval-required alert flow
-14+  Live execution (explicit approval only)
+10E   Multi-TF confirmation
+10F   Support/resistance agent
+10G   Market regime agent
+10H   Relative strength agent
+11B   Candidate runtime gate design (explicit approval req)
+12A   Paper execution agent
+12B   Trade review agent
+13A   Risk/position sizing agent
+14A   Human-approved alert flow
+15+   Live execution (explicit approval only)
 ```
+
+**Milestone intent summary:**
+- 10A–10C.1: Learning/reporting foundation — read-only, no live side effects
+- 11A: Report-only strategy filter simulation — retrospective, no runtime changes
+- 11B: Candidate runtime gate — design and review only; requires explicit approval before implementation
+- 10D–10H: Scoring agents — informational scoring, no alert gating yet
+- 12A: Paper execution agent — virtual P&L simulation only
+- 12B: Trade review agent — post-trade review records
+- 13A: Risk/position sizing — recommendations only, no execution
+- 14A: Human-approved alert flow — alerts require human approval; ALERTS_ENABLED=true set manually
+- 15+: Live execution — only after all prior milestones reviewed and explicitly approved
