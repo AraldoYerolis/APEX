@@ -40,35 +40,63 @@ Each milestone builds on the previous. No milestone skips the safety progression
 
 ---
 
-## Milestone 10C — Signal Quality Agent
+## Milestone 10C — Signal Quality Agent / Learning Report v2  ← COMPLETE
 
-**Goal:** Compute per-symbol, per-direction quality scores from closed `signal_observations` history. This is the first real "agent" — a scheduled analytical job that writes structured scores.
+**Goal:** Deep read-only analysis of `signal_features` + `signal_observations` history.
+Symbol/direction quality scores, macro alignment, feature buckets, expiry quality.
 
-**Implementation notes:**
-- Add a `signal_quality_scores` table: `symbol`, `direction`, `lookback_days`, `n_observations`, `tp1_rate`, `tp2_rate`, `stop_rate`, `expiry_rate`, `avg_mfe`, `avg_mae`, `avg_time_to_1r_minutes`, `score` (0–1), `computed_at`
-- Implement `run_signal_quality_agent()` as a new scheduler job
-- Job runs every 15 minutes (alongside universe refresh)
-- Minimum N=10 observations required to produce a score; below that, score is NULL
-- Score formula: weighted sum of tp2_rate (40%), tp1_rate (30%), negative stop_rate (20%), negative expiry_rate (10%)
+**What was built:**
+- `scripts/report_signal_learning.py` completely rewritten as v2
+- Fixed root bug: `create_apex_snapshot.py` was hardcoding `--limit 500`, causing the
+  learning report to only see ~210 of 288 confirmed observations. Removed the cap.
+- `--limit` now defaults to `None` (unlimited); the SQL `--since` filter is applied
+  in the WHERE clause (not in Python after a capped load)
+- New sections: long vs short breakdown, symbol+direction breakdown with quality
+  scores and recommendation labels, BTC/ETH macro alignment tables, expiry quality
+  (after-TP1 vs without-TP1), feature bucket analysis (RSI, ATR%, VWAP%, EMA spread%)
+- MFE/MAE pulled via SQL LEFT JOIN with `signal_observations` (no schema change)
+- Diagnostic quality score formula: tp1_rate×0.30 + tp2_rate×0.40 − stop_rate×0.20
+  − expiry_no_tp1_rate×0.10 ± MFE/MAE adjustments. Clamped [0, 1].
+- Recommendation labels: PROMISING_OBSERVE / NEEDS_FILTERING / WEAK_OBSERVE_ONLY /
+  INSUFFICIENT_SAMPLE. Min N=10 required for a non-insufficient label.
+- 32 new tests in `tests/test_signal_learning_v2.py`
 
-**Safety constraints:**
-- Read-only with respect to `signal_observations`
-- Never writes to `alerts`, `paper_trades`, `daily_risk`
-- Job only registered when `dry_run_mode=True`
+**How to run:**
+```bash
+# Full dataset (unlimited)
+PYTHONPATH=src python scripts/report_signal_learning.py
 
-**Success criteria:**
-- `signal_quality_scores` table is populated after N>=10 closed confirmed observations per symbol/direction
-- Score is bounded [0, 1]
-- Job runs without error when observations table is empty
+# Filtered since a timestamp
+PYTHONPATH=src python scripts/report_signal_learning.py --since 2026-05-20T00:00:00Z
 
-**Tests required:**
-- Score computed correctly for known tp1_rate/tp2_rate/stop_rate/expiry_rate values
-- NULL score when n < 10
-- Job is not registered in live mode
+# Export raw features to CSV
+PYTHONPATH=src python scripts/report_signal_learning.py --csv /tmp/features.csv
+
+# Manual row cap for debugging
+PYTHONPATH=src python scripts/report_signal_learning.py --limit 200
+```
+
+**Safety constraints (all maintained):**
+- Read-only: never writes to `alerts`, `paper_trades`, `daily_risk`, `signal_observations`
+- Quality scores and recommendation labels are DIAGNOSTIC ONLY
+- Labels are not used for signal generation, filtering, or alert gating
+- No config values are changed at runtime
+- `ALERTS_ENABLED=false`, `DRY_RUN_MODE=true` are not touched
+
+**What the major sections mean:**
+- **Outcome summary**: overall TP1/TP2/stop/expiry rates across all closed confirmed features
+- **Long vs short**: compare outcomes by direction; warns when SHORT N < 10
+- **Symbol + direction breakdown**: per-group metrics, diagnostic score (0–1), recommendation label
+- **Macro alignment**: how BTC/ETH trend bias at capture time correlates with outcomes
+- **Expiry quality**: separates "expired after TP1" (partial win) from "expired without TP1" (full miss)
+- **Feature buckets**: RSI/ATR/VWAP/EMA spread bucket analysis — which indicator conditions correlate with better or worse outcomes
+- **Diagnostic quality scores**: REPORT-ONLY, not stored in DB, not used for trading
 
 **What not to do:**
-- Do not use quality scores to filter or suppress signals yet — informational output only
-- Do not implement lookback windows longer than 90 days initially
+- Do not use quality scores or recommendation labels to filter signals or change config
+- Do not store diagnostic scores in DB until a dedicated `signal_quality_scores` table
+  is designed (planned for a future 10D sub-milestone)
+- Do not re-enable `--limit` cap in snapshot scripts
 
 ---
 
@@ -377,8 +405,8 @@ Each milestone builds on the previous. No milestone skips the safety progression
 
 ```
 10A  TP1 non-terminal milestone tracking       ← COMPLETE
-10B  Signal feature snapshot
-10C  Signal quality agent
+10B  Signal feature snapshot                   ← COMPLETE
+10C  Signal quality agent / learning report v2 ← COMPLETE
 10D  Setup scoring agent
 10E  Multi-TF confirmation
 10F  Support/resistance agent

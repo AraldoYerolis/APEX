@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> None:
     _section(lines, "Signal Learning Report")
     try:
         import scripts.report_signal_learning as _learning
-        learning_argv = ["--limit", "500"]
+        learning_argv = []
         if args.since:
             learning_argv += ["--since", args.since]
         learning_out = _capture_script(_learning.main, learning_argv)
