@@ -231,6 +231,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running filter validation script: {e}")
 
     # ------------------------------------------------------------------
+    # Candidate gate prospective tracking report (Milestone 11C)
+    # ------------------------------------------------------------------
+    _section(lines, "Candidate Gate Report (11C)")
+    try:
+        import scripts.report_candidate_gates as _gates
+        gates_argv = []
+        if args.since:
+            gates_argv += ["--since", args.since]
+        gates_out = _capture_script(_gates.main, gates_argv)
+        lines.append(gates_out)
+    except ImportError as e:
+        lines.append(f"  Could not import candidate gate report: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running candidate gate report: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")

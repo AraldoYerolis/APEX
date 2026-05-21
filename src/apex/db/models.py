@@ -188,6 +188,6 @@ class SignalFeature:
     hit_1r_before_stop: Optional[int] = None
     hit_1r_before_expiry: Optional[int] = None
     # Metadata
-    feature_version: str = "10B_v1"
+    feature_version: str = "11C_v1"
     metadata_json: Optional[str] = None
     id: Optional[int] = None

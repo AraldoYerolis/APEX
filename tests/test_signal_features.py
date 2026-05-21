@@ -104,7 +104,7 @@ def test_insert_signal_feature(tmp_path, monkeypatch):
     assert rows[0]["observation_uid"] == uid
     assert rows[0]["symbol"] == "BTC"
     assert rows[0]["rsi_val"] == pytest.approx(45.0)
-    assert rows[0]["feature_version"] == "10B_v1"
+    assert rows[0]["feature_version"] == "11C_v1"
     close_db()
 
 

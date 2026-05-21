@@ -415,6 +415,21 @@ def _capture_signal_features(
         if df_eth is not None and not df_eth.empty:
             eth_bias = compute_trend_bias(df_eth).bias
 
+        # Milestone 11C: evaluate candidate gates and tag metadata_json.
+        # Failure is isolated — a gate evaluation error must not prevent
+        # the feature row from being recorded.
+        gate_metadata_json: Optional[str] = None
+        try:
+            from apex.strategy.candidate_gates import evaluate_candidate_gates
+            gate_result = evaluate_candidate_gates(
+                atr_pct=atr_pct,
+                ema_spread_pct=ema_spread_pct,
+                rsi_val=rsi,
+            )
+            gate_metadata_json = json.dumps(gate_result)
+        except Exception as gate_err:
+            logger.warning(f"Candidate gate evaluation failed for {obs_uid[:8]}: {gate_err}")
+
         feature = SignalFeature(
             observation_uid=obs_uid,
             captured_at=utcnow_iso(),
@@ -446,6 +461,7 @@ def _capture_signal_features(
             pullback_reason=pullback.reason,
             btc_trend_bias=btc_bias,
             eth_trend_bias=eth_bias,
+            metadata_json=gate_metadata_json,
         )
         repo.insert_signal_feature(conn, feature)
         logger.debug(f"Feature captured for observation {obs_uid[:8]}: {candidate.symbol}")

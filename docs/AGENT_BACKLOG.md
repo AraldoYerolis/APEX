@@ -240,6 +240,81 @@ explicit approval before any filter is applied to live/dry-run scanning.
 
 ---
 
+## Milestone 11C — Dry-Run Candidate Runtime Gate Simulation  ← COMPLETE
+
+**Goal:** Prospectively tag new signal_features rows with candidate gate metadata so future
+observations can be compared across gate cohorts. Answer: "If Gate A/B/C/D had been active,
+which signals would have passed, and did those signals perform better over time?"
+
+This is prospective dry-run tagging only. Gates are evaluated and stored as metadata.
+They do NOT suppress signals, block alerts, or change any runtime behavior.
+
+**What was built (11C):**
+- `src/apex/strategy/candidate_gates.py` — pure gate evaluation module
+  - `evaluate_candidate_gates(atr_pct, ema_spread_pct, rsi_val) -> dict`
+  - Returns `candidate_gate_version`, `candidate_gate_passed`, and per-gate
+    `{passed: bool, reason: str}` for all four gates
+  - Missing/None features fail safely with descriptive reason strings
+  - `GATE_VERSION = "11C_v1"`, `GATE_DEFINITIONS` dict for display
+- `src/apex/db/models.py` — `feature_version` default changed from `"10B_v1"` to `"11C_v1"`
+  so new captures are distinguishable from pre-11C rows. No schema change required
+  (metadata_json and feature_version columns already existed).
+- `src/apex/scheduler/tasks.py` — `_capture_signal_features()` calls
+  `evaluate_candidate_gates()` and stores JSON result in `metadata_json`.
+  Gate evaluation failure is isolated — a crash never prevents the feature row insert.
+- `scripts/report_candidate_gates.py` — read-only prospective gate tracking report
+  - Reads only `feature_version = '11C_v1'` rows (prospective only — no historical backfill)
+  - 5 cohorts: BASELINE_ALL_WITH_GATE_VERSION, GATE_A, GATE_B, GATE_C, GATE_D
+  - Full outcome stats per cohort (TP1, HIT_2R, STOPPED, EXPIRED, MFE/MAE/R, LONG/SHORT)
+  - Summary comparison table (TP1Δ, stopΔ, avgR vs baseline)
+  - Interpretation section with INSUFFICIENT SAMPLE warnings
+- `scripts/create_apex_snapshot.py` — "Candidate Gate Report (11C)" section added
+  after Out-of-Sample Filter Validation Report
+- `tests/test_candidate_gates.py` — 46 new tests
+
+**Gate definitions:**
+```
+Gate A  ATR_0_10_TO_1_00              0.10 <= atr_pct <= 1.00
+Gate B  EMA_SPREAD_NEG_0_25_TO_0      -0.25 <= ema_spread_pct < 0
+Gate C  RSI_50_TO_60                  50 <= rsi_val <= 60
+Gate D  ATR_AND_EMA_COMBINED          Gate A AND Gate B
+```
+
+**How to run:**
+```bash
+PYTHONPATH=src python scripts/report_candidate_gates.py
+PYTHONPATH=src python scripts/report_candidate_gates.py --since 2026-06-01T00:00:00Z
+PYTHONPATH=src python scripts/report_candidate_gates.py --min-n 20
+```
+
+**Safety constraints (all maintained):**
+- Read-only: report never writes to any DB table
+- Does not change runtime signal generation, alert eligibility, or scheduler behavior
+- `ALERTS_ENABLED=false`, `DRY_RUN_MODE=true` are not touched
+- Gate evaluation failure is swallowed — never interrupts observation recording
+- Existing observations (feature_version='10B_v1') are not modified
+- No exchange keys, no Pushover, no port exposure changes
+
+**When results become meaningful:**
+- The report prints "No 11C candidate gate observations found yet" until new observations
+  accumulate with `feature_version='11C_v1'`
+- At least 20 closed rows per cohort are recommended before drawing conclusions
+- A consistent improvement over 50+ rows per cohort is required before any gate is
+  promoted to a runtime filter (requires a dedicated approval milestone)
+
+**What this milestone does NOT do:**
+- Does not activate any filter in production scanning
+- Does not suppress or hide any signals
+- Does not store gate results in a separate table (stored in metadata_json only)
+- Does not promote gates to runtime filters automatically
+- Does not change ALERTS_ENABLED, DRY_RUN_MODE, or any config value
+
+**Next step (11D or 12A):** After sufficient prospective data accumulates (50+ rows per
+gate cohort), a separate approval milestone can evaluate whether any gate warrants
+promotion to a runtime filter. That requires explicit review and approval.
+
+---
+
 ## Milestone 10D — Setup Scoring Agent
 
 **Goal:** Combine available agent outputs (quality scores, plus placeholders for regime/MTF/SR) into a single composite score per open observation.
