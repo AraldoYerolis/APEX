@@ -303,6 +303,61 @@ PYTHONPATH=src python scripts/simulate_exit_policies.py --feature-version 11C_v1
 
 ---
 
+## Milestone 11E — Exit / Timing Cohort Analysis  ← COMPLETE
+
+**Goal:** Read-only cohort analysis report that answers: "Which cohorts produce fast TP1
+and avoid expired-without-TP1?" Eight cohort dimensions provide a comprehensive breakdown
+of the dry-run signal population.
+
+This is a research report only. No runtime changes, no gate enablement, no schema changes.
+
+**What was built (11E):**
+- `scripts/analyze_exit_timing_cohorts.py` — read-only cohort analysis report
+- Eight cohort sections:
+  - **A  Overall baseline** — all closed confirmed rows
+  - **B  Direction** — LONG / SHORT split
+  - **C  Symbol** — top N symbols by count (configurable via `--top-symbols`)
+  - **D  UTC hour** — grouped by `observed_at` hour (00–23)
+  - **E  Session** — ASIA (00–07), LONDON (08–12), US (13–20), LATE_US (21–23)
+  - **F  Candidate gate** — reads `metadata_json` from 11C feature version
+  - **G  Indicator buckets** — RSI, ATR%, EMA spread%, price vs VWAP%
+  - **H  Time-to-TP1** — ≤5m, 5–10m, 10–15m, >15m, NO_TP1
+- Section I: best/worst ranking across all dimensions using named score formula
+- `_cohort_metrics()` — pure function returning all key metrics per cohort
+- Per-cohort metrics: TP1%, HIT_2R%, STOPPED%, EXPIRED%, exp-after-TP1%,
+  exp-without-TP1%, stopped-no-TP1%, Policy B AvgR, Policy E AvgR, Avg MFE,
+  Avg MAE, median/P25/P75 time-to-TP1, LONG/SHORT counts
+- Direction-concentration warnings `[DIR-CONCENTRATED]` (≥90% one direction)
+- Insufficient-N warnings `[INSUFFICIENT n=X < Y]`
+- Ranking score formula (named constants): `policy_b_avg_r * 2.0 + (tp1_rate - baseline_tp1_rate) * 10.0 - exp_no_tp1_rate * 5.0`
+- CLI: `--since`, `--min-n`, `--feature-version`, `--signal-type`, `--top-symbols`
+- Imports pure policy functions from `simulate_exit_policies.py` (no duplication)
+- Integrated into `create_apex_snapshot.py` as "Exit / Timing Cohort Analysis Report (11E)"
+- `tests/test_analyze_exit_timing_cohorts.py` — 67 tests (unit + integration)
+
+**How to run:**
+```bash
+PYTHONPATH=src python scripts/analyze_exit_timing_cohorts.py
+PYTHONPATH=src python scripts/analyze_exit_timing_cohorts.py \
+    --since 2026-05-21T19:47:48Z --feature-version 11C_v1
+PYTHONPATH=src python scripts/analyze_exit_timing_cohorts.py --min-n 5 --top-symbols 10
+```
+
+**Safety constraints (all maintained):**
+- Read-only: never writes to any DB table
+- Does not change signal generation, alert eligibility, or scheduler behavior
+- Does not change candidate gate logic or feature_version
+- Does not enable alerts, trading, or Pushover
+- `ALERTS_ENABLED=false`, `DRY_RUN_MODE=true` are not touched
+- No schema changes
+
+**What not to do:**
+- Do not use cohort ranking to enable runtime filters without an explicit approval milestone
+- Do not treat direction-concentrated cohorts as generally valid signals
+- Do not promote ranking scores to live system configuration
+
+---
+
 ## Milestone 11C.1 — Candidate Gate Report Clarity Fix  ← COMPLETE
 
 **Goal:** Report-only. Prevent misreading of partial outcome_r coverage and

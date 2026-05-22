@@ -263,6 +263,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running exit policy simulator: {e}")
 
     # ------------------------------------------------------------------
+    # Exit / timing cohort analysis report (Milestone 11E)
+    # ------------------------------------------------------------------
+    _section(lines, "Exit / Timing Cohort Analysis Report (11E)")
+    try:
+        import scripts.analyze_exit_timing_cohorts as _cohorts
+        cohorts_argv = []
+        if args.since:
+            cohorts_argv += ["--since", args.since]
+        cohorts_out = _capture_script(_cohorts.main, cohorts_argv)
+        lines.append(cohorts_out)
+    except ImportError as e:
+        lines.append(f"  Could not import exit/timing cohort analysis: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running exit/timing cohort analysis: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")
