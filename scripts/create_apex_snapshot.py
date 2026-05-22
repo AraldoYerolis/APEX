@@ -247,6 +247,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running candidate gate report: {e}")
 
     # ------------------------------------------------------------------
+    # Exit policy simulation report (Milestone 11D)
+    # ------------------------------------------------------------------
+    _section(lines, "Exit Policy Simulation Report (11D)")
+    try:
+        import scripts.simulate_exit_policies as _exit
+        exit_argv = []
+        if args.since:
+            exit_argv += ["--since", args.since]
+        exit_out = _capture_script(_exit.main, exit_argv)
+        lines.append(exit_out)
+    except ImportError as e:
+        lines.append(f"  Could not import exit policy simulator: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running exit policy simulator: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")

@@ -240,6 +240,69 @@ explicit approval before any filter is applied to live/dry-run scanning.
 
 ---
 
+## Milestone 11D — Dry-Run Exit Policy Simulator  ← COMPLETE
+
+**Goal:** Read-only simulator that compares alternate exit / accounting policies against
+existing dry-run signal_features + signal_observations data. Answers: "Given observed
+dry-run behavior, would different exit accounting produce better research outcomes?"
+
+This is not a trading system, not a live exit engine, and not a runtime behavior change.
+It is a report-only simulator.
+
+**What was built (11D):**
+- `scripts/simulate_exit_policies.py` — read-only exit policy simulation report
+- Policies simulated:
+  - **A  CURRENT_RECORDED_OUTCOME**: uses recorded outcome_r (baseline)
+  - **B  TP1_SCALP_ACCOUNTING**: TP1 reached → +1R, stopped-no-TP1 → -1R, expired-no-TP1 → 0R
+  - **C  TP1_THEN_BREAKEVEN_APPROX**: approximate "move stop to BE" after TP1
+  - **D  STRICT_2R_ONLY**: HIT_2R → +2R, STOPPED → -1R, EXPIRED excluded or 0R (two variants)
+  - **E  EXPIRE_PARTIAL_CREDIT**: expired-after-TP1 → +0.5R, expired-no-TP1 → -0.25R (named constants)
+  - **F  EARLY_FAILURE_TIMEOUT_ANALYSIS**: failure timing by bucket (5m/10m/15m/30m)
+  - **G  TP1_TIME_TO_HIT_ANALYSIS**: distribution of time_to_1r_seconds (avg/median/p25/p75/buckets)
+- All policy constants named and auditable at top of script
+- CLI: `--since`, `--min-n`, `--feature-version`, `--signal-type`
+- Report sections: header / baseline / policy assumptions / comparison table / timing analysis /
+  direction breakdown / simulation limitations / interpretation
+- LONG vs SHORT breakdown in all major sections
+- Integrated into `create_apex_snapshot.py` as "Exit Policy Simulation Report (11D)"
+- `tests/test_simulate_exit_policies.py` — 45 tests (24 unit + 21 integration)
+
+**How to run:**
+```bash
+PYTHONPATH=src python scripts/simulate_exit_policies.py
+PYTHONPATH=src python scripts/simulate_exit_policies.py --since 2026-05-21T19:47:48Z
+PYTHONPATH=src python scripts/simulate_exit_policies.py --since 2026-05-21T19:47:48Z --min-n 10
+PYTHONPATH=src python scripts/simulate_exit_policies.py --feature-version 11C_v1
+```
+
+**Safety constraints (all maintained):**
+- Read-only: never writes to any DB table
+- Does not change signal generation, alert eligibility, or scheduler behavior
+- Does not change candidate gate logic or feature_version
+- Does not enable alerts, trading, or Pushover
+- `ALERTS_ENABLED=false`, `DRY_RUN_MODE=true` are not touched
+- No schema changes
+
+**Simulation limitations (explicit in report):**
+- Uses recorded dry-run observations only — no candle-by-candle reconstruction
+- Policies B/C assume TP1 hit = exit regardless of post-TP1 path
+- Policy E constants (+0.5R / -0.25R) are accounting assumptions, not execution outcomes
+- Timing fields reflect evaluation pass frequency, not exact tick-level events
+- Results are research-only; cannot be used to enable any runtime behavior
+
+**Strategic context:**
+- 11C prospective data shows TP1 rate ~22% and expiry rate ~73.5%
+- Candidate gates (A/B/C/D) do not improve TP1 rate prospectively
+- 11D simulation targets: is the expiry rate the primary problem? Is TP1 scalp better?
+- Next investigation: exit/timing behavior before considering entry filter changes
+
+**What not to do:**
+- Do not use simulation results to enable runtime gates without an explicit approval milestone
+- Do not backfill or impute outcome_r values
+- Do not promote any policy assumption to a live exit rule
+
+---
+
 ## Milestone 11C.1 — Candidate Gate Report Clarity Fix  ← COMPLETE
 
 **Goal:** Report-only. Prevent misreading of partial outcome_r coverage and
