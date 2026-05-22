@@ -240,6 +240,36 @@ explicit approval before any filter is applied to live/dry-run scanning.
 
 ---
 
+## Milestone 11C.1 — Candidate Gate Report Clarity Fix  ← COMPLETE
+
+**Goal:** Report-only. Prevent misreading of partial outcome_r coverage and
+direction-concentrated cohorts in the Candidate Gate Prospective Tracking Report.
+
+**What was fixed (11C.1):**
+- **Avg outcome R with n**: Each cohort now shows `Avg outcome R: X R (n=Y / N)` and
+  `Outcome R cov: Y / N rows; Z excluded because outcome_r is null`.
+  Expired rows typically have `outcome_r = NULL` and are excluded from the average —
+  this is now explicit rather than silent.
+- **PARTIAL COVERAGE warning**: When outcome_r coverage < 80%, a per-cohort inline
+  warning tells the reader to compare TP1/STOP/EXPIRED and MFE/MAE alongside Avg outcome R.
+- **Direction-concentration warnings**: If a cohort is >= 90% LONG or >= 90% SHORT, an
+  inline `[DIR-CONCENTRATED]` flag appears in the cohort section and a named warning in
+  the interpretation explains that results reflect a direction/regime effect, not a
+  generally valid gate. Gate B and Gate D (currently 100% SHORT in the prospective window)
+  would be clearly flagged.
+- **Summary table improvements**: New `AvgOutR` column (was `AvgR`), new `R_n` coverage
+  column (shows `r_n/N`), new `L/S` direction column. `[DC]` flag for concentrated cohorts.
+- **Expired-after-TP1 explanation**: Interpretation section now explicitly explains that
+  "expired after TP1" is a partial success (entry correct, exit timing issue) and
+  "expired without TP1" is a full miss — they should not be collapsed.
+- **Label rename**: "Avg R" → "Avg outcome R" throughout cohort sections.
+- 17 new tests (63 total in test_candidate_gates.py, 319 total in suite)
+
+**Safety**: Report-only. No schema changes. No runtime changes. No alerts/trading/env
+changes. No candidate gate logic changes. No feature_version changes. No DB writes.
+
+---
+
 ## Milestone 11C — Dry-Run Candidate Runtime Gate Simulation  ← COMPLETE
 
 **Goal:** Prospectively tag new signal_features rows with candidate gate metadata so future

@@ -519,3 +519,412 @@ def test_report_script_importable_directly():
     spec.loader.exec_module(mod)
     assert hasattr(mod, "main")
     assert hasattr(mod, "evaluate_candidate_gates") or hasattr(mod, "_parse_gate_meta")
+
+
+# ================================================================== Milestone 11C.1: clarity fixes
+
+# ------------------------------------------------------------------ additional helpers
+
+def _close_stopped(conn, uid: str) -> None:
+    now = utcnow_iso()
+    repo.close_signal_observation(
+        conn, uid,
+        status="STOPPED", outcome_r=-1.0, closed_at=now,
+        stopped_at=now, time_to_stop_seconds=90.0,
+        hit_1r_before_stop=0,
+        first_terminal_status="STOPPED", final_status="STOPPED",
+    )
+    repo.update_signal_feature_outcome_from_observation(conn, uid)
+
+
+def _close_expired(conn, uid: str, hit_1r: int = 0) -> None:
+    now = utcnow_iso()
+    repo.close_signal_observation(
+        conn, uid,
+        status="EXPIRED", outcome_r=None, closed_at=now,
+        expired_at=now, time_to_expiry_seconds=900.0,
+        hit_1r_before_expiry=hit_1r,
+        first_terminal_status="EXPIRED", final_status="EXPIRED",
+    )
+    repo.update_signal_feature_outcome_from_observation(conn, uid)
+
+
+def _insert_feature_short(conn, uid: str, atr_pct=0.30, ema_spread_pct=-0.10, rsi_val=55.0):
+    """Insert a SHORT feature with gate metadata."""
+    gate_result = evaluate_candidate_gates(
+        atr_pct=atr_pct,
+        ema_spread_pct=ema_spread_pct,
+        rsi_val=rsi_val,
+    )
+    feat = SignalFeature(
+        observation_uid=uid,
+        captured_at=utcnow_iso(),
+        symbol="BTC",
+        direction="SHORT",
+        signal_type="CONFIRMED_SETUP",
+        observed_at=utcnow_iso(),
+        entry_price=100.0,
+        stop_price=101.0,
+        target_1r=99.0,
+        target_2r=98.0,
+        rsi_val=rsi_val,
+        atr_pct=atr_pct,
+        ema_spread_pct=ema_spread_pct,
+        metadata_json=json.dumps(gate_result),
+    )
+    repo.insert_signal_feature(conn, feat)
+
+
+def _insert_obs_short(conn) -> str:
+    uid = new_uid()
+    obs = SignalObservation(
+        observation_uid=uid,
+        observed_at=utcnow_iso(),
+        symbol="BTC",
+        direction="SHORT",
+        signal_type="CONFIRMED_SETUP",
+        entry_price=100.0,
+        stop_price=101.0,
+        target_1r=99.0,
+        target_2r=98.0,
+        expires_at=minutes_from_now(15),
+    )
+    repo.insert_signal_observation(conn, obs)
+    return uid
+
+
+# ------------------------------------------------------------------ outcome_r coverage tests
+
+def test_avg_outcome_r_excludes_null_outcome_r(tmp_path, monkeypatch):
+    """Avg outcome R only uses non-null outcome_r (expired rows excluded)."""
+    db_path = str(tmp_path / "cov.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # 3 expired (outcome_r=None) + 1 stopped (outcome_r=-1.0) + 1 hit2r (outcome_r=2.0)
+    for _ in range(3):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+        _close_expired(conn, uid)
+
+    uid_s = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_s, atr_pct=0.50)
+    _close_stopped(conn, uid_s)
+
+    uid_h = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_h, atr_pct=0.50)
+    _close_hit2r(conn, uid_h)
+
+    close_db()
+
+    output = _run_gate_report()
+    # Only 2 of 5 rows have non-null outcome_r
+    assert "n=2 / 5" in output or "2 / 5" in output
+
+
+def test_report_shows_outcome_r_coverage_label(tmp_path, monkeypatch):
+    """Report shows 'Outcome R cov' label in cohort section."""
+    db_path = str(tmp_path / "rcov.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    output = _run_gate_report()
+    assert "Outcome R cov" in output
+
+
+def test_report_shows_avg_outcome_r_label(tmp_path, monkeypatch):
+    """Report uses 'Avg outcome R' label instead of 'Avg R'."""
+    db_path = str(tmp_path / "rlabel.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    output = _run_gate_report()
+    assert "Avg outcome R" in output
+    # Old label "Avg R" should not appear as a standalone label
+    assert "    Avg R " not in output
+
+
+def test_null_outcome_r_not_silently_counted(tmp_path, monkeypatch):
+    """An expired row with outcome_r=None must not contribute to Avg outcome R."""
+    db_path = str(tmp_path / "nullr.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # One expired row (outcome_r=None) and one HIT_2R row (outcome_r=2.0)
+    uid_e = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_e, atr_pct=0.50)
+    _close_expired(conn, uid_e)
+
+    uid_h = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_h, atr_pct=0.50)
+    _close_hit2r(conn, uid_h)
+
+    close_db()
+
+    output = _run_gate_report()
+    # Coverage should show 1 contributing row out of 2, not 2 out of 2
+    assert "n=1 / 2" in output or "1 / 2" in output
+
+
+def test_partial_coverage_warning_appears(tmp_path, monkeypatch):
+    """PARTIAL COVERAGE warning appears when outcome_r coverage < 80%."""
+    db_path = str(tmp_path / "partial.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # 9 expired (no outcome_r) + 1 stopped (has outcome_r): 10% coverage
+    for _ in range(9):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+        _close_expired(conn, uid)
+
+    uid_s = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_s, atr_pct=0.50)
+    _close_stopped(conn, uid_s)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "PARTIAL COVERAGE" in output
+
+
+def test_full_coverage_no_partial_warning(tmp_path, monkeypatch):
+    """No PARTIAL COVERAGE warning when all rows have non-null outcome_r."""
+    db_path = str(tmp_path / "full.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # All rows have non-null outcome_r (stopped or hit2r)
+    for _ in range(5):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+        _close_hit2r(conn, uid)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "PARTIAL COVERAGE" not in output
+
+
+def test_outcome_r_coverage_note_in_interpretation(tmp_path, monkeypatch):
+    """Interpretation section shows coverage note for expired rows."""
+    db_path = str(tmp_path / "covnote.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    uid_e = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_e, atr_pct=0.50)
+    _close_expired(conn, uid_e)
+
+    uid_h = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_h, atr_pct=0.50)
+    _close_hit2r(conn, uid_h)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "outcome_r is null" in output.lower() or "outcome_r" in output
+
+
+# ------------------------------------------------------------------ direction concentration tests
+
+def test_direction_concentration_warning_100pct_short(tmp_path, monkeypatch):
+    """Warning appears when a gate cohort is 100% SHORT."""
+    db_path = str(tmp_path / "short.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Gate B passes for ema_spread_pct=-0.10; all are SHORT
+    for _ in range(5):
+        uid = _insert_obs_short(conn)
+        _insert_feature_short(conn, uid, atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
+        _close_hit2r(conn, uid)
+
+    # Add a LONG row that does NOT pass Gate B (ema_spread_pct=0.10)
+    uid_l = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_l, atr_pct=0.50, ema_spread_pct=0.10, rsi_val=55.0)
+    _close_hit2r(conn, uid_l)
+
+    close_db()
+
+    output = _run_gate_report()
+    # Gate B cohort is 5 SHORT, 0 LONG → direction concentrated
+    assert "DIR-CONCENTRATED" in output or "direction-concentrated" in output.lower()
+
+
+def test_direction_concentration_warning_in_interpretation(tmp_path, monkeypatch):
+    """Interpretation section includes direction-concentration warning text."""
+    db_path = str(tmp_path / "dircwarn.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # All SHORT rows passing Gate B
+    for _ in range(5):
+        uid = _insert_obs_short(conn)
+        _insert_feature_short(conn, uid, atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
+        _close_hit2r(conn, uid)
+
+    # 1 LONG not passing Gate B (so Gate B cohort stays all-SHORT)
+    uid_l = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_l, atr_pct=0.50, ema_spread_pct=0.10, rsi_val=55.0)
+    _close_hit2r(conn, uid_l)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "Direction-concentration warnings" in output
+    assert "SHORT" in output
+
+
+def test_direction_concentration_100pct_long(tmp_path, monkeypatch):
+    """Warning appears when gate cohort is 100% LONG."""
+    db_path = str(tmp_path / "long100.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Gate C passes rsi_val=55.0, all LONG
+    for _ in range(5):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.30, ema_spread_pct=0.10, rsi_val=55.0)
+        _close_hit2r(conn, uid)
+
+    # 1 SHORT not passing Gate C (rsi=70)
+    uid_s = _insert_obs_short(conn)
+    _insert_feature_short(conn, uid_s, atr_pct=0.30, ema_spread_pct=0.10, rsi_val=70.0)
+    _close_hit2r(conn, uid_s)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "DIR-CONCENTRATED" in output or "direction-concentrated" in output.lower()
+
+
+def test_no_direction_concentration_warning_mixed(tmp_path, monkeypatch):
+    """No direction warning when cohort is mixed LONG/SHORT."""
+    db_path = str(tmp_path / "mixed.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Mix of LONG and SHORT both passing Gate A (atr_pct=0.50)
+    for _ in range(5):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.50, ema_spread_pct=0.10, rsi_val=70.0)
+        _close_hit2r(conn, uid)
+    for _ in range(5):
+        uid = _insert_obs_short(conn)
+        _insert_feature_short(conn, uid, atr_pct=0.50, ema_spread_pct=0.10, rsi_val=70.0)
+        _close_hit2r(conn, uid)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "DIR-CONCENTRATED" not in output
+    assert "Direction-concentration warnings" not in output
+
+
+# ------------------------------------------------------------------ expired-after-TP1 explanation
+
+def test_expired_after_tp1_still_displayed(tmp_path, monkeypatch):
+    """expired-after-TP1 count still appears in the report output."""
+    db_path = str(tmp_path / "extp1.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # 2 expired-after-TP1, 1 expired-without-TP1
+    for hit in (1, 1, 0):
+        uid = _insert_obs(conn)
+        _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+        _close_expired(conn, uid, hit_1r=hit)
+
+    close_db()
+
+    output = _run_gate_report()
+    assert "after TP1" in output
+    assert "w/o TP1" in output
+
+
+def test_partial_success_explanation_in_report(tmp_path, monkeypatch):
+    """Report includes partial-success interpretation for expired rows."""
+    db_path = str(tmp_path / "partsucc.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_expired(conn, uid, hit_1r=1)
+    close_db()
+
+    output = _run_gate_report()
+    assert "Expired-after-TP1" in output or "expired-after-TP1" in output.lower()
+    assert "partial success" in output.lower() or "Partial success" in output
+
+
+# ------------------------------------------------------------------ summary table
+
+def test_summary_table_shows_avgouter_label(tmp_path, monkeypatch):
+    """Summary table uses AvgOutR or AvgOutcomeR column label."""
+    db_path = str(tmp_path / "sumtbl.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    output = _run_gate_report()
+    assert "AvgOutR" in output or "AvgOutcomeR" in output or "OutR" in output
+
+
+def test_summary_table_shows_r_n_column(tmp_path, monkeypatch):
+    """Summary table includes coverage column (R_n or similar)."""
+    db_path = str(tmp_path / "sumrn.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    output = _run_gate_report()
+    assert "R_n" in output or "Rcov" in output or "OutR_n" in output
+
+
+def test_summary_table_shows_ls_column(tmp_path, monkeypatch):
+    """Summary table includes L/S direction column."""
+    db_path = str(tmp_path / "sumls.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    output = _run_gate_report()
+    assert "L/S" in output
+
+
+# ------------------------------------------------------------------ empty cohort safety
+
+def test_empty_cohort_renders_without_crash(tmp_path, monkeypatch):
+    """A cohort with zero rows renders cleanly."""
+    db_path = str(tmp_path / "empty_cohort.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # Only Gate A passes (atr_pct=0.50); Gate B fails (ema_spread_pct positive)
+    # Gate C fails (rsi=70); Gate D fails
+    uid = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid, atr_pct=0.50, ema_spread_pct=0.10, rsi_val=70.0)
+    _close_hit2r(conn, uid)
+    close_db()
+
+    # Should not crash even though Gate B/C/D cohorts have zero rows
+    output = _run_gate_report()
+    assert "No closed rows in this cohort" in output
