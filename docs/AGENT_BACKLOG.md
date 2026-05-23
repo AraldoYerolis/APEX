@@ -5,6 +5,88 @@ Each milestone builds on the previous. No milestone skips the safety progression
 
 ---
 
+## Milestone 11F — Prospective Research Candidate Tracker  ← COMPLETE
+
+**Goal:** Tag future signal observations with 11F research cohort metadata so future
+reports can answer: "Do the 11E promising/weak cohorts continue to validate prospectively
+after they were identified?"
+
+This is report-only / metadata-only / prospective-tracking-only.
+No runtime filters are applied. No signals are suppressed. No alerts are changed.
+No schema changes. No .env changes. No historical backfill.
+
+**Strategic context:**
+The 11E cohort analysis identified promising cohorts (US session, ATR 0.50–1.00, EMA>0.25,
+WLD, DOGE, BTC) and weak cohorts (LATE_US, Hour 10, Hour 03, Hour 21) based on dry-run
+historical data. 11F tags future observations with these cohort memberships so prospective
+outcomes can be compared against the 11E baseline findings.
+
+**What was built (11F):**
+- `src/apex/strategy/research_candidates.py` — pure evaluator module, no DB access
+  - `RESEARCH_CANDIDATE_VERSION = "11F_v1"`
+  - `evaluate_research_candidates(atr_pct, ema_spread_pct, observed_at, symbol, direction) -> dict`
+  - Positive tags: SESSION_US, ATR_0_50_TO_1_00, EMA_GT_0_25, SYMBOL_WLD, SYMBOL_DOGE, SYMBOL_BTC
+  - Negative tags: SESSION_LATE_US, HOUR_10_AVOID, HOUR_03_AVOID, HOUR_21_AVOID
+  - Neutral tags: DIRECTION_LONG, DIRECTION_SHORT, SESSION_ASIA, SESSION_LONDON
+  - All missing/invalid inputs fail safely with descriptive reasons, never crash
+  - Direction-concentration notes for EMA_GT_0_25 and SYMBOL_WLD (were LONG-concentrated in 11E)
+- `src/apex/scheduler/tasks.py` — modified `_capture_signal_features()` to call
+  `evaluate_research_candidates()` and merge 11F results into metadata_json alongside
+  existing 11C gate fields. Failure is isolated in try/except.
+- `scripts/report_research_candidates.py` — read-only prospective tracking report
+  - Filters to rows with `research_candidate_version = "11F_v1"` in metadata_json
+  - CLI: `--since`, `--min-n`, `--signal-type`, `--research-version`, `--feature-version`
+  - Shows baseline (all post-11F closed rows) and per-tag matched/not-matched breakdown
+  - Summary tables for positive and negative tags
+  - Direction-concentration warnings, INSUFFICIENT sample-size warnings
+  - Safe no-data message if no 11F rows exist yet
+- `scripts/create_apex_snapshot.py` — updated with "Research Candidate Report (11F)" section
+- `tests/test_research_candidates.py` — 83 tests (unit + integration + report)
+
+**How to run:**
+```bash
+# After deploying 11F, replace timestamp with actual deploy time:
+PYTHONPATH=src python scripts/report_research_candidates.py \
+    --since 2026-05-23T00:00:00Z
+
+PYTHONPATH=src python scripts/report_research_candidates.py \
+    --since 2026-05-23T00:00:00Z --min-n 5
+```
+
+**metadata_json merged shape (per row):**
+```json
+{
+  "candidate_gate_version": "11C_v1",
+  "candidate_gate_passed": true,
+  "gates": { ... },
+  "research_candidate_version": "11F_v1",
+  "research_candidate_names": ["SESSION_US", "SYMBOL_BTC", ...],
+  "research_candidate_flags": { "<tag>": { "matched": true, "reason": "..." }, ... },
+  "research_candidate_positive": ["SESSION_US", ...],
+  "research_candidate_negative": [],
+  "research_candidate_notes": ["EMA_GT_0_25: Direction-concentrated LONG in 11E ..."]
+}
+```
+
+**Safety constraints (all maintained):**
+- Read-only report: never writes to any DB table beyond normal feature row insert
+- feature_version remains "11C_v1" — not changed
+- No schema changes (metadata_json TEXT column already existed)
+- Does not change signal generation, alert eligibility, or scheduler behavior
+- Does not change candidate gate logic from 11C
+- Does not enable alerts, trading, or Pushover
+- ALERTS_ENABLED=false, DRY_RUN_MODE=true are not touched
+- No historical backfill — 11F starts prospectively at deploy time
+- Old 11C rows are not rewritten
+
+**What not to do:**
+- Do not use research candidate tags to filter signals at runtime without an explicit
+  approval milestone with dedicated safety review
+- Do not treat direction-concentrated cohorts (EMA_GT_0_25, SYMBOL_WLD) as general signals
+- Do not backfill existing 11C rows with 11F metadata
+
+---
+
 ## Milestone 10B — Signal Feature Snapshot + Learning Memory
 
 **Goal:** Capture a snapshot of indicator values (EMA, RSI, ATR, VWAP, trend bias, pullback state) at the exact moment each signal observation is recorded. This creates the foundational feature store for all downstream scoring agents.

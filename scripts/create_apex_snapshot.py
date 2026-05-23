@@ -279,6 +279,22 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running exit/timing cohort analysis: {e}")
 
     # ------------------------------------------------------------------
+    # Research candidate prospective tracking report (Milestone 11F)
+    # ------------------------------------------------------------------
+    _section(lines, "Research Candidate Report (11F)")
+    try:
+        import scripts.report_research_candidates as _rc
+        rc_argv = []
+        if args.since:
+            rc_argv += ["--since", args.since]
+        rc_out = _capture_script(_rc.main, rc_argv)
+        lines.append(rc_out)
+    except ImportError as e:
+        lines.append(f"  Could not import research candidate report: {e}")
+    except Exception as e:
+        lines.append(f"  ERROR running research candidate report: {e}")
+
+    # ------------------------------------------------------------------
     # Recent ERROR / Traceback logs (journalctl)
     # ------------------------------------------------------------------
     _section(lines, "Recent ERROR / Traceback Logs (journalctl, last 24h)")

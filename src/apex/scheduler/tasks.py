@@ -430,6 +430,30 @@ def _capture_signal_features(
         except Exception as gate_err:
             logger.warning(f"Candidate gate evaluation failed for {obs_uid[:8]}: {gate_err}")
 
+        # Milestone 11F: evaluate research candidates and merge into metadata_json.
+        # The 11C gate fields are preserved; 11F fields are added alongside them.
+        # Failure is isolated — must not prevent the feature row from being recorded.
+        # This is prospective tagging only. It does NOT filter signals or alter alerts.
+        try:
+            from apex.strategy.research_candidates import evaluate_research_candidates
+            rc_result = evaluate_research_candidates(
+                atr_pct=atr_pct,
+                ema_spread_pct=ema_spread_pct,
+                observed_at=obs_at,
+                symbol=candidate.symbol,
+                direction=candidate.direction,
+            )
+            merged: dict = {}
+            if gate_metadata_json:
+                try:
+                    merged = json.loads(gate_metadata_json)
+                except Exception:
+                    merged = {}
+            merged.update(rc_result)
+            gate_metadata_json = json.dumps(merged)
+        except Exception as rc_err:
+            logger.warning(f"Research candidate evaluation failed for {obs_uid[:8]}: {rc_err}")
+
         feature = SignalFeature(
             observation_uid=obs_uid,
             captured_at=utcnow_iso(),
