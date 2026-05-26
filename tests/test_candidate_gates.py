@@ -1,4 +1,4 @@
-"""Tests for Milestone 11C: Candidate Gate Evaluation and Prospective Tracking.
+"""Tests for Milestone 11C / 11G: Candidate Gate Evaluation and Prospective Tracking.
 
 Covers:
 - Gate A (ATR): boundary values, missing feature
@@ -8,9 +8,13 @@ Covers:
 - Missing/null features fail safely without crashing
 - All gates missing → fail safely with reason strings
 - Gate metadata is stored in signal_features.metadata_json
-- feature_version is '11C_v1' for new observations
+- feature_version is '11C_v1' for new observations (row-shape version unchanged)
+- candidate_gate_version is '11G_v1' (11G strict ALL semantics)
+- candidate_gate_passed uses strict ALL semantics; candidate_gate_any_passed
+  preserves legacy 11C ANY semantics
+- research_captured and alert_eligible are recorded as 11G audit metadata
 - Candidate gate result does not suppress observation creation
-- Report script handles empty 11C data gracefully
+- Report script handles empty data gracefully
 - Snapshot includes Candidate Gate Report section
 - Report script is importable via direct file path
 """
@@ -269,15 +273,49 @@ def test_result_has_gate_version():
     assert result["candidate_gate_version"] == GATE_VERSION
 
 
-def test_result_candidate_gate_passed_true_when_any_passes():
-    # All three pass
+def test_result_candidate_gate_passed_true_only_when_all_pass():
+    """11G strict ALL semantics — every gate (A, B, C, D) must pass."""
     result = evaluate_candidate_gates(atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
     assert result["candidate_gate_passed"] is True
+
+
+def test_result_candidate_gate_passed_false_when_only_some_pass():
+    """Only Gate C passes (ATR out of range, EMA non-negative) → ALL=false."""
+    result = evaluate_candidate_gates(atr_pct=1.05, ema_spread_pct=0.07, rsi_val=55.0)
+    # Gate C alone passes; A, B, D all fail → ALL is False
+    assert result["gates"]["GATE_C_RSI_50_TO_60"]["passed"] is True
+    assert result["gates"]["GATE_A_ATR_0_10_TO_1_00"]["passed"] is False
+    assert result["candidate_gate_passed"] is False
 
 
 def test_result_candidate_gate_passed_false_when_none_pass():
     result = evaluate_candidate_gates(atr_pct=None, ema_spread_pct=None, rsi_val=None)
     assert result["candidate_gate_passed"] is False
+
+
+def test_result_candidate_gate_any_passed_legacy_semantics():
+    """`candidate_gate_any_passed` preserves the legacy 11C ANY value."""
+    # Only Gate C passes → ANY is True
+    result = evaluate_candidate_gates(atr_pct=1.05, ema_spread_pct=0.07, rsi_val=55.0)
+    assert result["candidate_gate_any_passed"] is True
+    assert result["candidate_gate_passed"] is False
+
+    # All gates fail → ANY is False
+    result = evaluate_candidate_gates(atr_pct=None, ema_spread_pct=None, rsi_val=None)
+    assert result["candidate_gate_any_passed"] is False
+
+    # All gates pass → both flags True
+    result = evaluate_candidate_gates(atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
+    assert result["candidate_gate_any_passed"] is True
+    assert result["candidate_gate_passed"] is True
+
+
+def test_result_gate_version_is_11g_v1():
+    """Milestone 11G — GATE_VERSION bumped from 11C_v1 to 11G_v1."""
+    from apex.strategy.candidate_gates import GATE_VERSION as gv
+    assert gv == "11G_v1"
+    result = evaluate_candidate_gates(atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
+    assert result["candidate_gate_version"] == "11G_v1"
 
 
 def test_result_has_all_four_gate_keys():
@@ -391,13 +429,13 @@ def test_report_runs_empty_db(tmp_path, monkeypatch):
 
 
 def test_report_no_11c_data_message(tmp_path, monkeypatch):
-    """Report prints 'No 11C candidate gate observations found yet' when no data."""
+    """Report prints a 'no observations yet' message when no data."""
     db_path = str(tmp_path / "no11c.db")
     _make_env(monkeypatch, db_path)
     init_db(db_path)
     close_db()
     output = _run_gate_report()
-    assert "No 11C candidate gate observations found yet" in output
+    assert "No candidate gate observations found yet" in output
 
 
 def test_report_with_data_shows_cohorts(tmp_path, monkeypatch):
@@ -488,7 +526,7 @@ def test_snapshot_gate_section_no_crash_empty_db(tmp_path, monkeypatch):
     import scripts.create_apex_snapshot as snap
     snap.main(["--out", out_path])
     content = Path(out_path).read_text()
-    assert "No 11C candidate gate observations found yet" in content
+    assert "No candidate gate observations found yet" in content
 
 
 # ================================================================== direct import
@@ -928,3 +966,222 @@ def test_empty_cohort_renders_without_crash(tmp_path, monkeypatch):
     # Should not crash even though Gate B/C/D cohorts have zero rows
     output = _run_gate_report()
     assert "No closed rows in this cohort" in output
+
+
+# ================================================================== Milestone 11G: audit flags
+
+def _capture_features_with_mocks(
+    conn,
+    monkeypatch,
+    *,
+    atr_pct: float = 0.50,
+    ema_spread_pct: float = -0.10,
+    rsi_val: float = 55.0,
+    alert_type: str = "CONFIRMED_SETUP",
+    direction: str = "LONG",
+    suppressed: bool = False,
+    enabled_types: str = "CONFIRMED_SETUP",
+) -> str:
+    """Drive _capture_signal_features end-to-end with mocked candle/trend deps.
+
+    Returns the observation_uid so callers can read back the feature row.
+    """
+    from unittest.mock import MagicMock
+    import pandas as pd
+
+    from apex.config import Settings
+    from apex.scheduler.tasks import _capture_signal_features
+    from apex.strategy.pullback_strategy import PullbackResult
+    from apex.strategy.risk import RiskPlan
+    from apex.strategy.signal_engine import SignalCandidate
+    from apex.strategy.trend_filter import TrendBias
+
+    # Side-step compute_trend_bias for BTC/ETH macro lookup — we only care
+    # that the metadata merge runs and writes the new audit flags.
+    fake_bias = TrendBias(
+        bias=direction,
+        ema_fast=10.0, ema_slow=9.5, vwap_val=10.0, last_close=10.0,
+        reason="mock",
+    )
+    monkeypatch.setattr(
+        "apex.strategy.trend_filter.compute_trend_bias",
+        lambda *a, **kw: fake_bias,
+    )
+
+    rp = RiskPlan(
+        direction=direction,
+        entry_price=100.0, stop_price=99.0,
+        target_1r=101.0, target_2r=102.0,
+        risk_usd=1.0, suggested_notional_usd=100.0,
+        stop_distance_pct=1.0, r_distance=1.0,
+    )
+    # Provide deterministic indicator values so the gate evaluator produces
+    # the requested A/B/C/D pass/fail pattern without depending on candles.
+    pullback = PullbackResult(
+        state="CONFIRMED" if alert_type == "CONFIRMED_SETUP" else "FORMING",
+        direction=direction, reason="mock pullback",
+        current_price=100.0,
+        vwap_val=100.0,
+        atr_val=atr_pct,             # treated as raw ATR; atr_pct recomputed from atr/price*100
+        rsi_val=rsi_val,
+        risk_plan=rp if alert_type == "CONFIRMED_SETUP" else None,
+    )
+    # ema_fast / ema_slow are chosen so (ema_fast - ema_slow) / ema_slow * 100 == ema_spread_pct
+    ema_slow = 100.0
+    ema_fast = ema_slow * (1.0 + ema_spread_pct / 100.0)
+    trend = TrendBias(
+        bias=direction, ema_fast=ema_fast, ema_slow=ema_slow,
+        vwap_val=100.0, last_close=100.0, reason="mock trend",
+    )
+    candidate = SignalCandidate(
+        symbol="GATETEST",
+        direction=direction, alert_type=alert_type,
+        pullback=pullback, trend=trend,
+        suppressed=suppressed,
+    )
+
+    # Candle store mock — single row is enough; trend_bias is monkeypatched.
+    df = pd.DataFrame([{
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+        "volume": 1000.0, "open_time": 0,
+    }])
+    candle_store = MagicMock()
+    candle_store.get_df.return_value = df
+
+    monkeypatch.setenv("ALERT_TYPES_ENABLED", enabled_types)
+    settings = Settings()
+
+    obs_uid = new_uid()
+    obs = SignalObservation(
+        observation_uid=obs_uid,
+        observed_at=utcnow_iso(),
+        symbol="GATETEST",
+        direction=direction,
+        signal_type=alert_type,
+        entry_price=100.0, stop_price=99.0,
+        target_1r=101.0, target_2r=102.0,
+        expires_at=minutes_from_now(15),
+    )
+    repo.insert_signal_observation(conn, obs)
+
+    _capture_signal_features(
+        candidate, obs_uid, obs.observed_at, conn, settings, candle_store,
+    )
+    return obs_uid
+
+
+def _read_metadata(conn, obs_uid: str) -> dict:
+    row = conn.execute(
+        "SELECT metadata_json FROM signal_features WHERE observation_uid=?",
+        (obs_uid,),
+    ).fetchone()
+    assert row is not None, "no feature row written"
+    return json.loads(row["metadata_json"])
+
+
+def test_11g_research_captured_true_when_both_evaluators_succeed(tmp_path, monkeypatch):
+    """research_captured=True when 11C gates + 11F research tags both merged."""
+    db_path = str(tmp_path / "rc.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _capture_features_with_mocks(conn, monkeypatch)
+    meta = _read_metadata(conn, uid)
+    close_db()
+    assert meta["research_captured"] is True
+    # Both 11C and 11F payloads present
+    assert meta["candidate_gate_version"] == "11G_v1"
+    assert meta["research_candidate_version"] == "11F_v1"
+
+
+def test_11g_alert_eligible_true_when_engine_clean_and_type_enabled(tmp_path, monkeypatch):
+    """alert_eligible=True for engine-clean CONFIRMED candidates when type is enabled."""
+    db_path = str(tmp_path / "ae_true.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _capture_features_with_mocks(
+        conn, monkeypatch,
+        alert_type="CONFIRMED_SETUP",
+        suppressed=False,
+        enabled_types="CONFIRMED_SETUP",
+    )
+    meta = _read_metadata(conn, uid)
+    close_db()
+    assert meta["alert_eligible"] is True
+
+
+def test_11g_alert_eligible_false_when_alert_type_not_enabled(tmp_path, monkeypatch):
+    """alert_eligible=False when alert_type is not in ALERT_TYPES_ENABLED."""
+    db_path = str(tmp_path / "ae_type.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    # SETUP_FORMING captured but only CONFIRMED_SETUP is enabled
+    uid = _capture_features_with_mocks(
+        conn, monkeypatch,
+        alert_type="SETUP_FORMING",
+        suppressed=False,
+        enabled_types="CONFIRMED_SETUP",
+    )
+    meta = _read_metadata(conn, uid)
+    close_db()
+    assert meta["alert_eligible"] is False
+
+
+def test_11g_alert_eligible_false_when_suppressed(tmp_path, monkeypatch):
+    """alert_eligible=False when the candidate was engine-suppressed."""
+    db_path = str(tmp_path / "ae_supp.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+    uid = _capture_features_with_mocks(
+        conn, monkeypatch,
+        alert_type="CONFIRMED_SETUP",
+        suppressed=True,
+        enabled_types="CONFIRMED_SETUP",
+    )
+    meta = _read_metadata(conn, uid)
+    close_db()
+    assert meta["alert_eligible"] is False
+
+
+def test_11g_alert_eligible_independent_of_alerts_enabled(tmp_path, monkeypatch):
+    """alert_eligible reflects engine + type only — not the global ALERTS_ENABLED flag.
+
+    This locks the 11G semantics: flipping ALERTS_ENABLED must not retroactively
+    change historical alert_eligible metadata. _capture_signal_features never
+    reads settings.alerts_enabled when computing this flag.
+    """
+    db_path = str(tmp_path / "ae_disabled.db")
+    _make_env(monkeypatch, db_path)
+    # _make_env already sets ALERTS_ENABLED=false; verify the metadata still
+    # reports alert_eligible=True for a clean candidate.
+    conn = init_db(db_path)
+    uid = _capture_features_with_mocks(
+        conn, monkeypatch,
+        alert_type="CONFIRMED_SETUP",
+        suppressed=False,
+        enabled_types="CONFIRMED_SETUP",
+    )
+    meta = _read_metadata(conn, uid)
+    close_db()
+    assert meta["alert_eligible"] is True
+
+
+def test_11g_report_shows_all_and_any_counts(tmp_path, monkeypatch):
+    """Report interpretation section reports ALL and ANY gate counts."""
+    db_path = str(tmp_path / "11g_report.db")
+    _make_env(monkeypatch, db_path)
+    conn = init_db(db_path)
+
+    # One row passes ALL gates → counts toward both ALL and ANY.
+    uid_all = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_all, atr_pct=0.50, ema_spread_pct=-0.10, rsi_val=55.0)
+    _close_hit2r(conn, uid_all)
+
+    # One row passes only Gate C → counts ANY only, not ALL.
+    uid_any = _insert_obs(conn)
+    _insert_feature_with_gates(conn, uid_any, atr_pct=1.05, ema_spread_pct=0.07, rsi_val=55.0)
+    _close_hit2r(conn, uid_any)
+
+    close_db()
+    output = _run_gate_report()
+    assert "pass ALL gates strictly" in output
+    assert "pass at least ONE gate" in output

@@ -434,6 +434,7 @@ def _capture_signal_features(
         # The 11C gate fields are preserved; 11F fields are added alongside them.
         # Failure is isolated — must not prevent the feature row from being recorded.
         # This is prospective tagging only. It does NOT filter signals or alter alerts.
+        rc_succeeded = False
         try:
             from apex.strategy.research_candidates import evaluate_research_candidates
             rc_result = evaluate_research_candidates(
@@ -451,8 +452,37 @@ def _capture_signal_features(
                     merged = {}
             merged.update(rc_result)
             gate_metadata_json = json.dumps(merged)
+            rc_succeeded = True
         except Exception as rc_err:
             logger.warning(f"Research candidate evaluation failed for {obs_uid[:8]}: {rc_err}")
+
+        # Milestone 11G: metadata-only audit flags. These are diagnostic fields
+        # for downstream reports — they do NOT alter signal generation, alert
+        # eligibility, the alert send path, or scheduler behavior.
+        #   research_captured: True when both 11C gates and 11F research tags
+        #                      were merged into metadata_json successfully.
+        #   alert_eligible:    "would this candidate have produced a Pushover
+        #                      send if ALERTS_ENABLED were true?" Computed from
+        #                      (candidate not engine-suppressed) AND
+        #                      (alert_type in ALERT_TYPES_ENABLED). Independent
+        #                      of ALERTS_ENABLED so flipping that flag does not
+        #                      retroactively change historical metadata.
+        try:
+            alert_eligible = (
+                not candidate.suppressed
+                and candidate.alert_type in settings.alert_types_enabled_list
+            )
+            audit_meta: dict = {}
+            if gate_metadata_json:
+                try:
+                    audit_meta = json.loads(gate_metadata_json)
+                except Exception:
+                    audit_meta = {}
+            audit_meta["research_captured"] = bool(rc_succeeded and gate_metadata_json)
+            audit_meta["alert_eligible"] = alert_eligible
+            gate_metadata_json = json.dumps(audit_meta)
+        except Exception as audit_err:
+            logger.warning(f"11G audit metadata merge failed for {obs_uid[:8]}: {audit_err}")
 
         feature = SignalFeature(
             observation_uid=obs_uid,

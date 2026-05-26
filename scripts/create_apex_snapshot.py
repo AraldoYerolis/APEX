@@ -231,7 +231,7 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"  ERROR running filter validation script: {e}")
 
     # ------------------------------------------------------------------
-    # Candidate gate prospective tracking report (Milestone 11C)
+    # Candidate gate prospective tracking report (Milestone 11C / 11G)
     # ------------------------------------------------------------------
     _section(lines, "Candidate Gate Report (11C)")
     try:
