@@ -5,6 +5,96 @@ Each milestone builds on the previous. No milestone skips the safety progression
 
 ---
 
+## Milestone 11G — Candidate Gate Semantics Audit  ← COMPLETE
+
+**Goal:** Disambiguate the misleading `candidate_gate_passed` flag uncovered in
+the 11F research export. Some rows had `candidate_gate_passed=true` while
+individual gates A/B/D were failing, because the flag was set to
+`any(g.passed for g in gates)` despite the name reading as "the candidate
+cleared the gate". 11G separates three orthogonal concerns and locks them with
+explicit tests.
+
+This is metadata/report/test-scoped only. No runtime behavior, no signal
+generation, no alert send path, no Pushover, no `.env` flags, and no DB schema
+were touched.
+
+**What changed:**
+
+- `src/apex/strategy/candidate_gates.py`
+  - `GATE_VERSION` bumped from `11C_v1` to `11G_v1`.
+  - `LEGACY_GATE_VERSION_ANY = "11C_v1"` added so readers can interpret old rows.
+  - `candidate_gate_passed` now uses **strict ALL** semantics — True only when
+    every gate (A AND B AND C AND D) passes.
+  - `candidate_gate_any_passed` added to preserve the legacy 11C ANY value
+    (True if at least one gate passes) for downstream readers.
+- `src/apex/scheduler/tasks.py` `_capture_signal_features`
+  - Adds `research_captured: true` when both 11C gates and 11F research tags
+    were merged into `metadata_json` successfully.
+  - Adds `alert_eligible: <bool>` computed locally from
+    `(not candidate.suppressed) AND (alert_type in ALERT_TYPES_ENABLED)`.
+  - `alert_eligible` is **metadata-only** — never read by `_send_alert`,
+    `signal_engine`, or any runtime suppression path. Independent of
+    `ALERTS_ENABLED` by design so flipping that flag does not retroactively
+    rewrite history.
+- `scripts/report_candidate_gates.py`
+  - Filters rows by metadata-stored `candidate_gate_version`, accepting both
+    `11C_v1` (ANY semantics) and `11G_v1` (ALL semantics).
+  - Interpretation section now reports both ALL and ANY pass counts plus an
+    `alert_eligible` cohort count for 11G rows that recorded the flag.
+- Tests
+  - `tests/test_candidate_gates.py` — updated ANY→ALL semantics assertions,
+    added new tests locking `candidate_gate_any_passed`, gate version bump,
+    `research_captured`, and four `alert_eligible` cases (engine-clean,
+    type-disabled, suppressed, independent of ALERTS_ENABLED).
+  - `tests/test_research_candidates.py:607` — gate version assertion bumped.
+- `scripts/create_apex_snapshot.py` — section comment notes 11G; section
+  title text kept stable to avoid churning the snapshot test.
+
+**metadata_json merged shape (post-11G row):**
+```json
+{
+  "candidate_gate_version":     "11G_v1",
+  "candidate_gate_passed":      false,
+  "candidate_gate_any_passed":  true,
+  "gates": { ... },
+  "research_candidate_version": "11F_v1",
+  "research_candidate_names":   [...],
+  "research_candidate_flags":   { ... },
+  "research_candidate_positive": [...],
+  "research_candidate_negative": [...],
+  "research_candidate_notes":    [...],
+  "research_captured":          true,
+  "alert_eligible":             true
+}
+```
+
+**Audit findings (why 11G):**
+- 11C/11F gates were always **diagnostic only** — no runtime code in
+  `src/apex/` reads `candidate_gate_passed`. The only consumers are the report
+  script and tests. WOULD-BE ALERT volume is driven entirely by
+  `signal_engine.evaluate_symbol` and `_send_alert`'s `ALERTS_ENABLED` branch,
+  not by these gates. The 11F export confusion was a naming/semantics issue,
+  not a runtime bug.
+- `feature_version` (the SQL column) stays `11C_v1` because the row shape is
+  unchanged. The new `candidate_gate_version=11G_v1` inside `metadata_json`
+  is the version tag for the new semantics.
+
+**Safety constraints (all maintained):**
+- ALERTS_ENABLED=false, DRY_RUN_MODE=true — unchanged.
+- No new alert types, Pushover calls, exchange keys, or open ports.
+- No DB schema migration. No historical row rewrites.
+- No change to `_send_alert`, `signal_engine.evaluate_symbol`, or scheduler
+  behavior. `alert_eligible` is purely metadata.
+
+**What not to do:**
+- Do not promote `alert_eligible` from metadata to a runtime filter without a
+  dedicated approval milestone.
+- Do not treat 11C_v1 (ANY) rows and 11G_v1 (ALL) rows as a single cohort when
+  reading `candidate_gate_passed` directly — branch on `candidate_gate_version`
+  or use the report's `_all_gates_passed`/`_any_gate_passed` helpers.
+
+---
+
 ## Milestone 11F — Prospective Research Candidate Tracker  ← COMPLETE
 
 **Goal:** Tag future signal observations with 11F research cohort metadata so future

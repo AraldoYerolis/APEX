@@ -1,4 +1,4 @@
-"""Candidate runtime gate evaluation — Milestone 11C.
+"""Candidate runtime gate evaluation — Milestone 11C / 11G.
 
 DRY-RUN PROSPECTIVE TAGGING ONLY.
 
@@ -11,7 +11,16 @@ signal_features.metadata_json. They do NOT:
   - write to any table other than the metadata_json field already
     captured as part of the normal signal_features insert
 
-Gate version: 11C_v1
+Gate version: 11G_v1
+
+Semantics (11G):
+  - `candidate_gate_passed` is STRICT ALL — True only when every gate
+    (A, B, C, AND D) passes. Older rows tagged `11C_v1` used ANY
+    semantics; readers MUST branch on `candidate_gate_version` to
+    interpret correctly.
+  - `candidate_gate_any_passed` preserves the legacy 11C ANY value
+    (True if at least one gate passes) so downstream readers can
+    reproduce the old metric without reparsing the per-gate map.
 
 How this works:
   1. _capture_signal_features() in tasks.py calls evaluate_candidate_gates()
@@ -25,7 +34,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-GATE_VERSION = "11C_v1"
+GATE_VERSION = "11G_v1"
+LEGACY_GATE_VERSION_ANY = "11C_v1"  # pre-11G rows used `any(...)` semantics
 
 # Gate definitions — documented here so the report can reference them.
 GATE_DEFINITIONS = {
@@ -45,8 +55,9 @@ def evaluate_candidate_gates(
 
     Returns a dict suitable for JSON serialisation:
       {
-        "candidate_gate_version": "11C_v1",
-        "candidate_gate_passed": <bool>,   # True if ANY gate passes
+        "candidate_gate_version": "11G_v1",
+        "candidate_gate_passed":     <bool>,   # True only if ALL gates pass
+        "candidate_gate_any_passed": <bool>,   # True if ANY gate passes (legacy 11C semantics)
         "gates": {
           "<gate_name>": {"passed": <bool>, "reason": "<str>"},
           ...
@@ -148,8 +159,10 @@ def evaluate_candidate_gates(
             "reason": "; ".join(fail_reasons),
         }
 
+    gate_pass_flags = [g["passed"] for g in gates.values()]
     return {
         "candidate_gate_version": GATE_VERSION,
-        "candidate_gate_passed": any(g["passed"] for g in gates.values()),
+        "candidate_gate_passed": all(gate_pass_flags),
+        "candidate_gate_any_passed": any(gate_pass_flags),
         "gates": gates,
     }

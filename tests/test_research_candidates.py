@@ -602,9 +602,9 @@ def test_existing_gate_fields_preserved_in_merge():
     merged = dict(gate_result)
     merged.update(rc_result)
 
-    # Gate fields still present
+    # Gate fields still present — version bumped to 11G_v1 in Milestone 11G
     assert "candidate_gate_version" in merged
-    assert merged["candidate_gate_version"] == "11C_v1"
+    assert merged["candidate_gate_version"] == "11G_v1"
     assert "gates" in merged
     assert "GATE_A_ATR_0_10_TO_1_00" in merged["gates"]
 
