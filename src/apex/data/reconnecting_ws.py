@@ -140,12 +140,14 @@ class ReconnectingWebSocket:
                 break
             except ConnectionClosed as e:
                 logger.warning(
-                    f"WebSocket error: {e} | type={type(e).__name__} | "
+                    f"WebSocket error: {_sanitize_text(e, MAX_EXCEPTION_CHARS)} | "
+                    f"type={type(e).__name__} | "
                     f"{self._describe_close(e)} | {self._describe_connection()}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"WebSocket error: {e} | type={type(e).__name__} | "
+                    f"WebSocket error: {_sanitize_text(e, MAX_EXCEPTION_CHARS)} | "
+                    f"type={type(e).__name__} | "
                     f"{self._describe_connection()}"
                 )
             finally:

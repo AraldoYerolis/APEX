@@ -1355,3 +1355,149 @@ def test_rewarn_boundary_is_exact(monkeypatch, caplog):
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 2
     assert "repeats=2" in warnings[1].getMessage()
+
+
+# ============================================================================
+# H1: _run_loop must not re-emit raw upstream exception text
+# ============================================================================
+
+HOSTILE_CLOSE_REASON = (
+    # Control characters, an ANSI escape, and forged log-like text all sit
+    # within the first 200 chars (MAX_EXCEPTION_CHARS) so truncation cannot
+    # remove them before sanitization runs. The forged text is expected to
+    # survive as inline text — the property under test is that it cannot
+    # become a *separate* log record, not that the substring disappears.
+    "\n2026-09-04T12:00:00 [WARNING] apex.main: FORGED ALERTS_ENABLED=true"
+    "\r\tTAB\x1b[31mANSI\x00NUL\u2028LS"
+    + "R" * 5000  # push the total well past any plausible bound
+)
+
+# Guard threshold for _drive_run_loop_once: comfortably above the number of
+# iterations a correctly-paced (mocked) reconnect loop should ever need, but
+# far below what a broken loop would spin through before a human notices.
+_RUN_LOOP_ITERATION_GUARD = 25
+
+
+def _hostile_closed() -> ConnectionClosedError:
+    return ConnectionClosedError(Close(1008, HOSTILE_CLOSE_REASON), None)
+
+
+async def _drive_run_loop_once(monkeypatch, exc, caplog):
+    """Run exactly one _run_loop iteration that fails with `exc`.
+
+    Termination normally comes from fake_sleep flipping `_running` to False
+    after the first reconnect delay. If a future change removes the sleep
+    call entirely, nothing would ever flip `_running` and the loop would spin
+    forever on the mocked, instant `fake_connect` — hanging the test suite
+    rather than failing it. The iteration guard in fake_connect makes that
+    failure mode a fast, clear assertion instead of a hang.
+    """
+    ws = _make_ws()
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_connect():
+        attempts["n"] += 1
+        if attempts["n"] > _RUN_LOOP_ITERATION_GUARD:
+            ws._running = False
+            raise AssertionError(
+                f"_run_loop did not terminate within {_RUN_LOOP_ITERATION_GUARD} "
+                "iterations — the reconnect sleep/termination mechanism appears "
+                "to be missing or broken."
+            )
+        raise exc
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+        ws._running = False
+
+    monkeypatch.setattr("apex.data.reconnecting_ws.random.uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    ws._connect = fake_connect  # type: ignore[method-assign]
+    ws._running = True
+
+    with caplog.at_level(logging.DEBUG, logger="apex.data.reconnecting_ws"):
+        await ws._run_loop()
+    return sleeps
+
+
+async def test_run_loop_sanitizes_hostile_connection_closed(monkeypatch, caplog):
+    """The ConnectionClosed branch must not leak raw upstream close-reason text.
+
+    Fails against 66a5d3e, which interpolated the exception raw (measured at
+    ~5494 chars with LF/CR/ESC and a forged log record).
+    """
+    sleeps = await _drive_run_loop_once(monkeypatch, _hostile_closed(), caplog)
+
+    records = [r for r in caplog.records if "WebSocket error" in r.getMessage()]
+    assert len(records) == 1
+    line = records[0].getMessage()
+
+    # One bounded logical line.
+    assert len(line) < 800, f"unbounded: {len(line)} chars"
+    assert "\n" not in line
+    assert "\r" not in line
+    assert "\t" not in line
+    assert "\x1b" not in line
+    assert "\x00" not in line
+    assert "\u2028" not in line
+
+    # Diagnostics survive.
+    assert "type=ConnectionClosedError" in line
+    assert "close_code=1008" in line
+    assert "lifetime=" in line
+    assert "subs_sent=" in line
+
+    # Reconnect behaviour is untouched by the sanitization.
+    assert sleeps == [1.0]
+
+
+async def test_run_loop_sanitizes_hostile_generic_exception(monkeypatch, caplog):
+    """The generic-Exception branch needs the same treatment."""
+    exc = OSError(HOSTILE_CLOSE_REASON)
+    sleeps = await _drive_run_loop_once(monkeypatch, exc, caplog)
+
+    line = [r for r in caplog.records if "WebSocket error" in r.getMessage()][0].getMessage()
+    assert len(line) < 800
+    assert "\n" not in line and "\r" not in line and "\t" not in line
+    assert "\x1b" not in line and "\x00" not in line and "\u2028" not in line
+    assert "type=OSError" in line
+    assert sleeps == [1.0]
+
+
+async def test_no_log_record_leaks_hostile_content(monkeypatch, caplog):
+    """Hostile content must never fragment into a second/separate log record.
+
+    The security property is "no injected log record", NOT "the forged
+    substring never appears". Inline survival of forged *text* before
+    truncation is acceptable and expected — logging the reason at all means
+    some of it will be visible. What must never happen is that content
+    becomes indistinguishable from an independent log line: no newline, CR,
+    tab, or ANSI/control separator may survive within any single record, and
+    each record must stay a single bounded logical line.
+    """
+    await _drive_run_loop_once(monkeypatch, _hostile_closed(), caplog)
+
+    assert len(caplog.records) >= 1
+    for record in caplog.records:
+        msg = record.getMessage()
+        # Acceptable: "FORGED ALERTS_ENABLED=true" may appear inline as text.
+        # Unacceptable: any separator that could split or forge a log record.
+        assert "\n" not in msg, f"newline (record-splitting) leaked via {record.name}: {msg[:160]!r}"
+        assert "\r" not in msg, f"CR (line-overwrite) leaked via {record.name}: {msg[:160]!r}"
+        assert "\t" not in msg, f"tab leaked via {record.name}: {msg[:160]!r}"
+        assert "\x1b" not in msg, f"ANSI escape leaked via {record.name}: {msg[:160]!r}"
+        assert "\x00" not in msg, f"NUL leaked via {record.name}: {msg[:160]!r}"
+        assert "\u2028" not in msg, f"Unicode line separator leaked via {record.name}: {msg[:160]!r}"
+        assert len(msg) < 800, f"unbounded line ({len(msg)}): {msg[:120]!r}"
+
+
+async def test_run_loop_close_reason_still_reported_when_benign(monkeypatch, caplog):
+    """Sanitization must not blank out ordinary, useful close reasons."""
+    exc = ConnectionClosedError(Close(1011, "internal error"), None)
+    await _drive_run_loop_once(monkeypatch, exc, caplog)
+
+    line = [r for r in caplog.records if "WebSocket error" in r.getMessage()][0].getMessage()
+    assert "internal error" in line
+    assert "close_code=1011" in line
+    assert "...(truncated)" not in line
