@@ -12,6 +12,54 @@ from apex.db.models import Market
 
 logger = logging.getLogger(__name__)
 
+# APEX's internal symbol identity is uppercase (see refresh_universe below),
+# but Hyperliquid's own asset names are not all uppercase — e.g. the 1000x
+# rebase class uses a lowercase "k" prefix ("kPEPE"). Sending the uppercased
+# internal identity to Hyperliquid on an outbound request produces an asset
+# name that does not exist upstream, which Hyperliquid rejects by closing the
+# socket. This map preserves the exact upstream spelling per internal symbol,
+# so outbound requests can use it while everything internal (DB rows, scans,
+# features, alerts, config matching) keeps using the uppercase identity.
+_upstream_symbol_map: dict[str, str] = {}
+
+
+def get_upstream_symbol(symbol: str) -> str:
+    """Hyperliquid's canonical spelling for an APEX internal symbol.
+
+    Falls back to `symbol` itself when no mapping is known yet (e.g. before
+    the first successful universe refresh, or for a symbol Hyperliquid never
+    reported) — this matches today's behavior for the common case where the
+    internal and upstream spellings are identical (BTC, ETH, TRUMP, ...).
+    """
+    return _upstream_symbol_map.get(symbol, symbol)
+
+
+def _reset_upstream_symbol_map() -> None:
+    """Test-only: the map is process-global, so tests must isolate it."""
+    _upstream_symbol_map.clear()
+
+
+def _record_upstream_symbol(raw_name: str, internal_symbol: str) -> None:
+    """Remember `raw_name` as the canonical upstream spelling for `internal_symbol`.
+
+    Two distinct upstream names could theoretically normalize to the same
+    uppercase internal key (e.g. two differently-cased variants of one
+    ticker). That would be a real identity collision — silently letting the
+    second one overwrite the first could point outbound requests at the
+    wrong asset without any signal. It has never been observed in practice,
+    so this only guards against it: log loudly and keep the first mapping
+    rather than inventing a resolution subsystem for a case that may not
+    exist.
+    """
+    existing = _upstream_symbol_map.get(internal_symbol)
+    if existing is not None and existing != raw_name:
+        logger.warning(
+            f"Upstream symbol collision: internal '{internal_symbol}' already "
+            f"maps to upstream '{existing}', ignoring conflicting '{raw_name}'"
+        )
+        return
+    _upstream_symbol_map[internal_symbol] = raw_name
+
 
 async def refresh_universe(
     conn: sqlite3.Connection,
@@ -30,9 +78,11 @@ async def refresh_universe(
             asset_ctxs = meta_ctx[1]
             universe = meta.get("universe", [])
             for i, asset in enumerate(universe):
-                sym = asset.get("name", "").upper()
+                raw_name = asset.get("name", "")
+                sym = raw_name.upper()
                 if not sym:
                     continue
+                _record_upstream_symbol(raw_name, sym)
                 ctx = asset_ctxs[i] if i < len(asset_ctxs) else {}
                 # dayNtlVlm is approximate 24h notional volume
                 vol = ctx.get("dayNtlVlm")
@@ -50,8 +100,10 @@ async def refresh_universe(
             logger.error("Failed to fetch perp meta — cannot refresh universe")
             return []
         for asset in meta.get("universe", []):
-            sym = asset.get("name", "").upper()
+            raw_name = asset.get("name", "")
+            sym = raw_name.upper()
             if sym:
+                _record_upstream_symbol(raw_name, sym)
                 symbol_volumes[sym] = None  # TODO: fetch volume separately
 
     all_symbols = list(symbol_volumes.keys())

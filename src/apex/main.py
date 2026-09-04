@@ -14,6 +14,7 @@ from apex.app import create_app
 from apex.config import get_settings
 from apex.data.candle_store import CandleStore
 from apex.data.hyperliquid_client import HyperliquidClient
+from apex.data.market_universe import get_upstream_symbol
 from apex.data.reconnecting_ws import (
     SUBSCRIPTION_COUNT_WARN_THRESHOLD,
     ReconnectingWebSocket,
@@ -198,11 +199,12 @@ async def backfill_candles(
     now_ms = int(time.time() * 1000)
 
     for symbol in symbols:
+        upstream = get_upstream_symbol(symbol)
         for tf in timeframes:
             try:
                 lookback = tf_lookback_ms.get(tf, 12 * 60 * 60 * 1000)
                 start = now_ms - lookback
-                candles = await client.get_candle_snapshot(symbol, tf, start)
+                candles = await client.get_candle_snapshot(upstream, tf, start)
                 if not candles:
                     logger.debug(f"No candle snapshot for {symbol}/{tf}")
                     continue
@@ -236,11 +238,19 @@ def warn_if_subscription_count_high(count: int) -> bool:
 
 
 def build_ws_subscriptions(symbols: list[str], timeframes: list[str]) -> list[dict]:
-    """Build Hyperliquid WebSocket subscription objects."""
+    """Build Hyperliquid WebSocket subscription objects.
+
+    `coin` uses Hyperliquid's canonical upstream spelling (e.g. "kPEPE"),
+    not APEX's uppercase internal symbol — see
+    apex.data.market_universe.get_upstream_symbol. Subscription count, order,
+    and timeframe order are unaffected; only the `coin` value can differ from
+    `symbol` for the small class of assets whose casing doesn't match.
+    """
     subs = []
     for symbol in symbols:
+        upstream = get_upstream_symbol(symbol)
         for tf in timeframes:
-            subs.append({"type": "candle", "coin": symbol, "interval": tf})
+            subs.append({"type": "candle", "coin": upstream, "interval": tf})
     return subs
 
 
