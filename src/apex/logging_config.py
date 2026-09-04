@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 
 
-def configure_logging(log_level: str = "INFO", log_dir: str = "./data/logs") -> None:
+def configure_logging(
+    log_level: str = "INFO",
+    log_dir: str = "./data/logs",
+    websockets_log_level: str = "WARNING",
+) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
 
     formatter = logging.Formatter(
@@ -42,5 +46,9 @@ def configure_logging(log_level: str = "INFO", log_dir: str = "./data/logs") -> 
     # Quiet noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+    # websockets stays at WARNING by default; raise it to DEBUG only when
+    # diagnosing feed drops (close frames/handshakes are logged by the library).
+    ws_level = getattr(logging, str(websockets_log_level).upper(), logging.WARNING)
+    logging.getLogger("websockets").setLevel(ws_level)

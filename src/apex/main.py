@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,26 +28,151 @@ from apex.scheduler.tasks import (
 
 logger = logging.getLogger(__name__)
 
+# WebSocket diagnostics: upstream payloads are untrusted free text, so cap what
+# reaches the log, and cap how often, so a reconnect loop cannot flood journald.
+# Per-ACK logging is DEBUG only — the INFO/WARNING signal is the per-connection
+# reconciliation in ReconnectingWebSocket, which cannot develop a blind spot.
+MAX_WS_PAYLOAD_CHARS = 300
+MAX_WS_FIELD_CHARS = 64
+WS_ERROR_LOG_BUDGET = 20
+IGNORED_WS_CHANNELS = frozenset({"pong"})
+# Keys that carry a rejection explanation on a subscriptionResponse.
+WS_REJECTION_KEYS = ("error", "message", "reason")
+
 # Module-level state (accessible by tasks)
 _candle_store: Optional[CandleStore] = None
 _ws_manager: Optional[ReconnectingWebSocket] = None
+_ws_log_budget: dict[str, int] = {}
+
+
+def _sanitize_ws_text(value: Any, limit: int) -> str:
+    """Single-line, printable, length-capped rendering of untrusted text.
+
+    Whitespace is collapsed and non-printable characters are dropped so an
+    upstream payload cannot forge extra journald lines or emit terminal
+    escapes. Every logged fragment of upstream text goes through this.
+    """
+    text = " ".join(str(value).split())
+    text = "".join(ch for ch in text if ch.isprintable())
+    if len(text) > limit:
+        text = text[:limit] + "...(truncated)"
+    return text
+
+
+def _summarize_ws_payload(data: Any) -> str:
+    """Single-line, length-capped rendering of an upstream payload."""
+    if isinstance(data, str):
+        text = data
+    else:
+        try:
+            text = json.dumps(data, separators=(",", ":"), sort_keys=True, default=repr)
+        except RecursionError:
+            # repr() would recurse too — describe the shape instead.
+            text = f"<deeply nested {type(data).__name__}>"
+        except (TypeError, ValueError):
+            try:
+                text = repr(data)
+            except Exception:  # pragma: no cover - defensive
+                text = f"<unrenderable {type(data).__name__}>"
+    return _sanitize_ws_text(text, MAX_WS_PAYLOAD_CHARS)
+
+
+def _describe_subscription_response(data: Any) -> str:
+    """Pull method/type/coin/interval out of a subscriptionResponse payload.
+
+    Every field is individually sanitized and capped, and the assembled line
+    is capped again — the dict path carries the same guarantee as the
+    free-text path rather than trusting the payload's shape.
+    """
+    if not isinstance(data, dict):
+        return _summarize_ws_payload(data)
+
+    sub = data.get("subscription")
+    if not isinstance(sub, dict):
+        return _summarize_ws_payload(data)
+
+    parts = [f"method={_sanitize_ws_text(data.get('method', ''), MAX_WS_FIELD_CHARS)}"]
+    for key in ("type", "coin", "interval"):
+        if key in sub:
+            parts.append(f"{key}={_sanitize_ws_text(sub[key], MAX_WS_FIELD_CHARS)}")
+    for key in WS_REJECTION_KEYS:
+        if key in data:
+            parts.append(f"{key}={_sanitize_ws_text(data[key], MAX_WS_FIELD_CHARS)}")
+    return _sanitize_ws_text(" ".join(parts), MAX_WS_PAYLOAD_CHARS)
+
+
+def _subscription_response_is_rejection(data: Any) -> bool:
+    """True when a subscriptionResponse carries a rejection explanation."""
+    if not isinstance(data, dict):
+        return False
+    return any(data.get(key) for key in WS_REJECTION_KEYS)
+
+
+def _take_ws_log_budget(key: str, limit: int) -> bool:
+    """Return True while `key` has budget left, announcing the last one.
+
+    The subscription list is fixed for the life of the process, so the first
+    connection's responses are enough to diagnose a rejected subscription.
+    Budgets keep a 60s reconnect loop from flooding the journal.
+    """
+    used = _ws_log_budget.get(key, 0)
+    if used >= limit:
+        return False
+    _ws_log_budget[key] = used + 1
+    if used + 1 == limit:
+        logger.info(f"WS {key} log budget reached ({limit}); further ones logged at DEBUG")
+    return True
+
+
+def _reset_ws_log_budget() -> None:
+    """Clear the diagnostic log budgets (used by tests)."""
+    _ws_log_budget.clear()
 
 
 async def on_ws_message(msg: dict) -> None:
     """Handle incoming WebSocket messages."""
     global _candle_store
-    if _candle_store is None:
-        return
 
     channel = msg.get("channel", "")
     data = msg.get("data", {})
 
     if channel == "candle":
+        if _candle_store is None:
+            return
         # Hyperliquid candle message: data = {s: symbol, i: interval, ...candle fields}
         symbol = data.get("s", "").upper()
         interval = data.get("i", "")
         if symbol and interval:
             _candle_store.update(symbol, interval, data)
+        return
+
+    # Non-candle channels are diagnostics only — they never feed the strategy.
+    if channel == "subscriptionResponse":
+        detail = _describe_subscription_response(data)
+        # Individual ACKs stay at DEBUG: the per-connection reconciliation in
+        # ReconnectingWebSocket reports what is *missing*, which is the signal.
+        # An explicit rejection is still surfaced immediately, under a budget.
+        if _subscription_response_is_rejection(data) and _take_ws_log_budget(
+            "subscriptionRejected", WS_ERROR_LOG_BUDGET
+        ):
+            logger.warning(f"WS subscriptionResponse rejected: {detail}")
+        else:
+            logger.debug(f"WS subscriptionResponse: {detail}")
+        return
+
+    if channel == "error":
+        detail = _summarize_ws_payload(data)
+        if _take_ws_log_budget("error", WS_ERROR_LOG_BUDGET):
+            logger.warning(f"WS upstream error: {detail}")
+        else:
+            logger.debug(f"WS upstream error: {detail}")
+        return
+
+    if channel in IGNORED_WS_CHANNELS:
+        logger.debug(f"WS {channel}")
+        return
+
+    logger.debug(f"WS unhandled channel '{channel}': {_summarize_ws_payload(data)}")
 
 
 async def backfill_candles(
@@ -104,7 +229,10 @@ async def run() -> None:
     settings = get_settings()
 
     # Configure logging
-    configure_logging(settings.apex_log_level)
+    configure_logging(
+        settings.apex_log_level,
+        websockets_log_level=settings.apex_ws_log_level,
+    )
 
     logger.info("=" * 60)
     logger.info("APEX starting up")

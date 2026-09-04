@@ -5,7 +5,7 @@ import sys
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Runtime
     apex_env: Literal["development", "production"] = "development"
     apex_log_level: str = "INFO"
+    # Level for the third-party `websockets` logger. WARNING matches historical
+    # behaviour; raise to DEBUG only while diagnosing feed drops.
+    apex_ws_log_level: str = "WARNING"
     apex_db_path: str = "./data/apex.db"
     apex_public_base_url: str = ""
 
@@ -109,12 +112,12 @@ class Settings(BaseSettings):
     def max_daily_loss_usd(self) -> float:
         return self.account_size_usd * self.max_daily_planned_loss_pct / 100
 
-    @field_validator("apex_log_level")
+    @field_validator("apex_log_level", "apex_ws_log_level")
     @classmethod
-    def _validate_log_level(cls, v: str) -> str:
+    def _validate_log_level(cls, v: str, info: ValidationInfo) -> str:
         valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         if v.upper() not in valid:
-            raise ValueError(f"apex_log_level must be one of {valid}")
+            raise ValueError(f"{info.field_name} must be one of {valid}")
         return v.upper()
 
     @model_validator(mode="after")
