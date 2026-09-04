@@ -49,3 +49,6 @@ docs/APEX_VPS_RUNBOOK.local.md
 
 # Local review artifacts
 review_artifacts/
+
+# Local Claude settings (machine-specific, not for version control)
+.claude/settings.local.json
