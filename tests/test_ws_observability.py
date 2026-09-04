@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import pathlib
 
 import pytest
 from websockets.exceptions import ConnectionClosedError
@@ -662,9 +663,11 @@ class _FakeWebsocketsModule:
     def __init__(self, outcomes: list):
         self.outcomes = list(outcomes)
         self.calls = 0
+        self.connect_kwargs: list[dict] = []
 
     def connect(self, url, **kwargs):
         self.calls += 1
+        self.connect_kwargs.append(dict(kwargs))
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             return _FakeConnectCM(enter_exc=outcome)
@@ -821,3 +824,534 @@ async def test_connect_survives_malformed_frames(monkeypatch):
     await ws._connect()
 
     assert ws.messages_received == 3
+
+
+# ============================================================================
+# Tier 2A: paced subscription sending
+# ============================================================================
+
+def _subs(n: int) -> list[dict]:
+    """n candle subscriptions with distinguishable, ordered identities."""
+    return [{"type": "candle", "coin": f"C{i:03d}", "interval": "1m"} for i in range(n)]
+
+
+class _RecordingWS(_FakeWS):
+    """Fake socket that records send order; optionally fails at an index."""
+
+    def __init__(self, incoming=(), fail_at: int | None = None):
+        super().__init__(list(incoming))
+        self.fail_at = fail_at
+
+    async def send(self, payload: str) -> None:
+        if self.fail_at is not None and len(self.sent) == self.fail_at:
+            raise ConnectionResetError("upstream went away mid-subscribe")
+        self.sent.append(payload)
+
+
+def _sent_subs(ws: _RecordingWS) -> list[dict]:
+    return [json.loads(p)["subscription"] for p in ws.sent]
+
+
+async def _run_send(monkeypatch, subs, chunk_size=16, chunk_delay=0.25, fail_at=None):
+    """Drive the real _send_subscriptions with a captured sleep."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    ws = ReconnectingWebSocket(
+        "wss://x.invalid", _noop_on_message, subs,
+        chunk_size=chunk_size, chunk_delay=chunk_delay,
+    )
+    fake = _RecordingWS(fail_at=fail_at)
+    return ws, fake, sleeps
+
+
+async def test_paced_send_preserves_order_and_membership(monkeypatch):
+    """Pacing must change timing only — never which subs are sent, or their order."""
+    subs = _subs(80)
+    ws, fake, _ = await _run_send(monkeypatch, subs)
+    await ws._send_subscriptions(fake)
+
+    assert _sent_subs(fake) == subs            # identical list, identical order
+    assert len(fake.sent) == 80
+    assert ws._subscriptions_sent is True
+    assert ws._subscriptions_sent_count == 80
+
+
+async def test_paced_send_payload_shape_unchanged(monkeypatch):
+    """The wire payload must be byte-identical to the Tier 1 burst."""
+    subs = _subs(3)
+    ws, fake, _ = await _run_send(monkeypatch, subs)
+    await ws._send_subscriptions(fake)
+
+    expected = [json.dumps({"method": "subscribe", "subscription": s}) for s in subs]
+    assert fake.sent == expected
+
+
+async def test_eighty_subs_produce_four_sleeps(monkeypatch):
+    """80 subs / chunk 16 -> 16,sleep,16,sleep,16,sleep,16,sleep,16 (no trailing)."""
+    ws, fake, sleeps = await _run_send(monkeypatch, _subs(80))
+    await ws._send_subscriptions(fake)
+
+    assert len(fake.sent) == 80
+    assert sleeps == [0.25, 0.25, 0.25, 0.25]   # 4, not 5 — none after the last chunk
+    assert sum(sleeps) == pytest.approx(1.0)
+
+
+async def test_no_sleep_when_set_fits_in_one_chunk(monkeypatch):
+    for n in (1, 8, 15, 16):
+        ws, fake, sleeps = await _run_send(monkeypatch, _subs(n))
+        await ws._send_subscriptions(fake)
+        assert len(fake.sent) == n
+        assert sleeps == [], f"{n} subs should not pace"
+
+
+async def test_partial_final_chunk_has_no_trailing_sleep(monkeypatch):
+    """40 subs -> 16,sleep,16,sleep,8. Two sleeps, none after the short chunk."""
+    ws, fake, sleeps = await _run_send(monkeypatch, _subs(40))
+    await ws._send_subscriptions(fake)
+
+    assert len(fake.sent) == 40
+    assert sleeps == [0.25, 0.25]
+
+
+async def test_chunk_size_zero_disables_pacing(monkeypatch):
+    ws, fake, sleeps = await _run_send(monkeypatch, _subs(80), chunk_size=0)
+    await ws._send_subscriptions(fake)
+    assert len(fake.sent) == 80
+    assert sleeps == []
+
+
+# ------------------------------------------------- send-failure diagnostics
+
+async def test_send_failure_reports_progress(monkeypatch, caplog):
+    """A mid-subscribe failure must say how far it got and on which sub."""
+    subs = _subs(80)
+    ws, fake, _ = await _run_send(monkeypatch, subs, fail_at=37)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        with pytest.raises(ConnectionResetError):
+            await ws._send_subscriptions(fake)
+
+    line = caplog.records[0].getMessage()
+    assert "WebSocket subscribe failed" in line
+    assert "type=ConnectionResetError" not in line      # type is rendered inline
+    assert "ConnectionResetError" in line
+    assert "sent=37/80" in line
+    assert "failed_sub_number=38/80" in line            # 1-based: the 38th subscription
+    assert "failed_sub=C037:1m" in line                 # the sub that did NOT go out
+    assert ws._subscriptions_sent is False              # never claims success
+    assert ws._subscriptions_sent_count == 37
+
+
+async def test_send_failure_line_is_bounded(monkeypatch, caplog):
+    """Failure diagnostics stay bounded like every other upstream-derived line."""
+    subs = [{"type": "candle", "coin": "Z" * 5000, "interval": "1m"}] * 3
+    ws, fake, _ = await _run_send(monkeypatch, subs, fail_at=0)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        with pytest.raises(ConnectionResetError):
+            await ws._send_subscriptions(fake)
+
+    line = caplog.records[0].getMessage()
+    assert len(line) < 400
+    assert "\n" not in line
+
+
+async def test_send_failure_propagates_to_run_loop(monkeypatch, caplog):
+    """The exception must still reach _run_loop so reconnect logic is unchanged."""
+    ws, fake, _ = await _run_send(monkeypatch, _subs(80), fail_at=5)
+    _install_fake_ws(monkeypatch, [fake])
+    ws._running = True
+
+    async def stop_after(_d):
+        ws._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        await ws._run_loop()
+
+    text = caplog.text
+    assert "WebSocket subscribe failed" in text
+    assert "sent=5/80" in text
+    assert "WebSocket error:" in text                   # generic handler still fired
+    # A partial send must not be reported as a reconciliation gap.
+    assert "reconciliation" not in text
+
+
+# ------------------------------------------- reconciliation re-warning policy
+
+def _gap_ws(subs):
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)
+    ws._subscriptions_sent = True
+    return ws
+
+
+def test_identical_gap_rewarns_after_15_minutes(monkeypatch, caplog):
+    """A persistent gap must never fall silent for the life of the process."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("apex.data.reconnecting_ws.time.monotonic", lambda: clock["t"])
+    ws = _gap_ws(_universe_subs())
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()                 # t=1000 -> WARNING (first)
+        clock["t"] += 60
+        ws._log_subscription_gap()                 # +1min  -> DEBUG
+        clock["t"] += 60
+        ws._log_subscription_gap()                 # +2min  -> DEBUG
+        clock["t"] += rws.RECONCILIATION_REWARN_SECONDS
+        ws._log_subscription_gap()                 # >15min -> WARNING again
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "missing_subs=ALL" in warnings[0]
+    assert "repeats=3" in warnings[1]              # the suppressed occurrences
+
+
+def test_identical_gap_does_not_spam_before_15_minutes(monkeypatch, caplog):
+    clock = {"t": 0.0}
+    monkeypatch.setattr("apex.data.reconnecting_ws.time.monotonic", lambda: clock["t"])
+    ws = _gap_ws(_universe_subs())
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        for _ in range(60):                        # 60 reconnects over 14 minutes
+            ws._log_subscription_gap()
+            clock["t"] += 14
+
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_changed_gap_warns_immediately_without_waiting(monkeypatch, caplog):
+    """A changed gap must not be delayed by the re-warn timer."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr("apex.data.reconnecting_ws.time.monotonic", lambda: clock["t"])
+    subs = _universe_subs()
+    ws = _gap_ws(subs)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()                 # ALL missing -> WARNING
+        clock["t"] += 5                            # far inside the 15-min window
+        for sub in subs:
+            if sub["coin"] != "KPEPE":
+                ws._record_ack(_ack(sub))
+        ws._log_subscription_gap()                 # gap changed -> WARNING now
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "missing_subs=ALL" in warnings[0]
+    assert "KPEPE(4)" in warnings[1]
+    assert "repeats=" not in warnings[1]           # a change is not a repeat
+
+
+def test_recovery_to_zero_missing_is_reported(monkeypatch, caplog):
+    """Going from a gap to none must surface, not stay hidden as a 'repeat'."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr("apex.data.reconnecting_ws.time.monotonic", lambda: clock["t"])
+    subs = _universe_subs()
+    ws = _gap_ws(subs)
+
+    with caplog.at_level(logging.INFO, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()
+        clock["t"] += 5
+        for sub in subs:
+            ws._record_ack(_ack(sub))
+        ws._log_subscription_gap()
+
+    assert any(
+        r.levelno == logging.INFO and "missing=0" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# --------------------------------------------------- >64 observability guard
+
+def test_warn_helper_fires_above_threshold(caplog):
+    """Behavioural: the real production branch must emit a WARNING."""
+    with caplog.at_level(logging.DEBUG, logger="apex.main"):
+        emitted = main.warn_if_subscription_count_high(80)
+
+    assert emitted is True
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1                      # kills "demoted to DEBUG"
+    assert "80 subscriptions exceeds 64" in warnings[0].getMessage()
+
+
+def test_warn_helper_silent_at_and_below_threshold(caplog):
+    with caplog.at_level(logging.DEBUG, logger="apex.main"):
+        for count in (0, 1, 40, 63, 64):
+            assert main.warn_if_subscription_count_high(count) is False
+    assert caplog.records == []                    # kills "branch disabled"
+
+
+def test_warn_helper_fires_at_sixty_five(caplog):
+    """65 is the first count that warns — the boundary must be exact."""
+    with caplog.at_level(logging.WARNING, logger="apex.main"):
+        assert main.warn_if_subscription_count_high(65) is True
+    assert "65 subscriptions exceeds 64" in caplog.text
+
+
+def test_warn_helper_wording_is_honest(caplog):
+    """The threshold is empirical; the log must never claim otherwise."""
+    with caplog.at_level(logging.WARNING, logger="apex.main"):
+        main.warn_if_subscription_count_high(80)
+    msg = caplog.records[0].getMessage()
+    assert "NOT a documented Hyperliquid limit" in msg
+    assert "observed threshold" in msg
+
+
+def test_warn_helper_does_not_touch_the_subscription_list(caplog):
+    """Observability only: the guard must not truncate or reorder anything."""
+    subs = main.build_ws_subscriptions([f"S{i}" for i in range(20)], ["15m", "5m", "3m", "1m"])
+    before = [dict(s) for s in subs]
+    with caplog.at_level(logging.WARNING, logger="apex.main"):
+        main.warn_if_subscription_count_high(len(subs))
+    assert subs == before
+    assert len(subs) == 80
+
+
+def test_warn_fires_once_per_startup(caplog):
+    """It lives on the startup path, not per-reconnect."""
+    src = pathlib.Path(main.__file__).read_text()
+    assert src.count("warn_if_subscription_count_high(") == 2   # def + one call site
+    run_body = src[src.index("async def run()"):]
+    assert run_body.count("warn_if_subscription_count_high(") == 1
+
+
+# ------------------------------------- pacing must not disturb reconciliation
+
+async def test_reconciliation_still_identifies_missing_after_paced_send(monkeypatch):
+    """End-to-end: paced send, partial ACKs, gap still named correctly."""
+    subs = _universe_subs()
+    frames = [json.dumps(_ack(s)) for s in subs if s["coin"] != "KPEPE"]
+    frames.append(ConnectionClosedError(None, None))
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    _install_fake_ws(monkeypatch, [_FakeWS(frames)])
+
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)
+    ws._running = True
+    with pytest.raises(ConnectionClosedError):
+        await ws._connect()
+
+    assert ws._subscriptions_sent is True
+    assert ws._subscriptions_sent_count == 80
+    assert sleeps == [0.25, 0.25, 0.25, 0.25]
+    expected = ws._expected_identities()
+    assert sorted(expected - ws._acked_subs) == [
+        "KPEPE:15m", "KPEPE:1m", "KPEPE:3m", "KPEPE:5m",
+    ]
+
+
+# ============================================================================
+# Tier 2A corrections
+# ============================================================================
+
+# ------------------------------------------- F3: receive-queue confound removed
+
+async def test_connect_raises_receive_queue_limit(monkeypatch):
+    """The paced send window must not starve the socket reader.
+
+    websockets defaults to max_queue=16, which would pause TCP reading part-way
+    through the ~1s pacing window and apply backpressure upstream — a
+    slow-consumer disconnect indistinguishable from the ceiling under test.
+    """
+    fake = _install_fake_ws(monkeypatch, [_FakeWS([])])
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, _subs(80))
+    ws._running = True
+
+    async def no_sleep(_d):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    await ws._connect()
+
+    assert fake.calls == 1
+    kwargs = fake.connect_kwargs[0]
+    assert kwargs["max_queue"] == rws.WS_RECEIVE_QUEUE_SIZE
+    assert kwargs["max_queue"] == 512
+    # Headroom for ~160 startup frames (a response + a candle per subscription).
+    assert kwargs["max_queue"] > 2 * len(ws.subscriptions)
+
+
+async def test_connect_leaves_other_connect_params_untouched(monkeypatch):
+    """Only max_queue is added — ping/size behaviour must be unchanged."""
+    fake = _install_fake_ws(monkeypatch, [_FakeWS([])])
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, [])
+    ws._running = True
+    await ws._connect()
+
+    kwargs = fake.connect_kwargs[0]
+    assert kwargs["ping_interval"] == 20
+    assert kwargs["ping_timeout"] == 10
+    assert "max_size" not in kwargs
+    assert set(kwargs) == {"ping_interval", "ping_timeout", "max_queue"}
+
+
+# ------------------------------------ F1: hostile exception text stays bounded
+
+async def test_subscribe_failure_bounds_hostile_exception_text(monkeypatch, caplog):
+    """A ConnectionClosed renders the peer's close reason — bound it.
+
+    This fails against the pre-correction implementation, which interpolated
+    the exception raw (measured: 5149 chars with an embedded newline).
+    """
+    hostile = ConnectionClosedError(
+        Close(1008, "R" * 5000 + "\nWARNING apex.main: FORGED LINE\r\t\x1b[31m"), None
+    )
+
+    class _HostileWS(_FakeWS):
+        async def send(self, payload):
+            raise hostile
+
+    monkeypatch.setattr(asyncio, "sleep", lambda _d: asyncio.sleep(0))
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, _subs(80))
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        with pytest.raises(ConnectionClosedError):
+            await ws._send_subscriptions(_HostileWS([]))
+
+    line = caplog.records[0].getMessage()
+    assert len(line) < 500, f"unbounded: {len(line)} chars"
+    assert "\n" not in line
+    assert "\r" not in line
+    assert "\t" not in line
+    assert "\x1b" not in line
+    assert "FORGED LINE" not in line.split("|")[0] or "...(truncated)" in line
+    # Diagnostics survive the sanitization.
+    assert "ConnectionClosedError" in line
+    assert "sent=0/80" in line
+    assert "failed_sub_number=1/80" in line
+
+
+def test_sanitize_text_helper_is_bounded_and_single_line():
+    out = rws._sanitize_text("A\nB\r\tC\x00\x1b[31m" + "Z" * 5000, rws.MAX_EXCEPTION_CHARS)
+    assert len(out) <= rws.MAX_EXCEPTION_CHARS + 20
+    assert "\n" not in out and "\r" not in out and "\x1b" not in out
+    assert "...(truncated)" in out
+
+
+# ------------------------- F5: unambiguous failing subscription number
+
+async def test_failure_reports_human_readable_subscription_number(monkeypatch, caplog):
+    """`failed_sub_number=65/80` — the 65th subscription, not a bare index."""
+    subs = _universe_subs()
+    ws, fake, _ = await _run_send(monkeypatch, subs, fail_at=64)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        with pytest.raises(ConnectionResetError):
+            await ws._send_subscriptions(fake)
+
+    line = caplog.records[0].getMessage()
+    assert "sent=64/80" in line
+    assert "failed_sub_number=65/80" in line          # 1-based, unambiguous
+    assert "failed_at_index" not in line              # the ambiguous form is gone
+    assert "failed_sub=KPEPE:15m" in line             # subs[64] is KPEPE:15m
+    assert subs[64] == {"type": "candle", "coin": "KPEPE", "interval": "15m"}
+
+
+# ---------------------------- F4: send progress on the close diagnostic
+
+async def test_close_diagnostic_reports_send_progress(monkeypatch, caplog):
+    """A socket that dies mid-send suppresses reconciliation — subs_sent explains why."""
+    subs = _subs(80)
+    fake = _RecordingWS(fail_at=64)
+    _install_fake_ws(monkeypatch, [fake])
+
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)
+    ws._running = True
+
+    async def stop_after(_d):
+        ws._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after)
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        await ws._run_loop()
+
+    text = caplog.text
+    assert "subs_sent=64/80" in text                  # the number that explains it
+    assert "messages_received=0" in text              # no longer misleading on its own
+    assert "reconciliation" not in text               # correctly suppressed
+
+
+def test_subs_sent_accurate_before_any_send():
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, _subs(80))
+    assert "subs_sent=0/80" in ws._describe_connection()
+
+
+async def test_subs_sent_accurate_after_full_send(monkeypatch):
+    ws, fake, _ = await _run_send(monkeypatch, _subs(80))
+    await ws._send_subscriptions(fake)
+    assert "subs_sent=80/80" in ws._describe_connection()
+
+
+def test_subs_sent_does_not_claim_acknowledgement():
+    """`sent` must never be read as `acked`; they are different lines."""
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, _subs(80))
+    ws._subscriptions_sent_count = 64
+    out = ws._describe_connection()
+    assert "subs_sent=64/80" in out
+    assert "acked" not in out                         # acked belongs to reconciliation
+
+
+# ------------------------------------ F6: backoff success-path reset coverage
+
+async def test_backoff_resets_after_successful_connection(monkeypatch):
+    """Coverage for the existing reset-on-success semantics (unchanged code).
+
+    Fail 3x (1,2,4), then succeed, then fail again: the next sleep must be 1.0,
+    not 8.0 — i.e. the success reset the escalation.
+    """
+    ws = _make_ws(max_backoff=60.0)
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_connect():
+        attempts["n"] += 1
+        if attempts["n"] == 4:
+            return                      # clean return == successful connection
+        raise ConnectionClosedError(None, None)
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+        if len(sleeps) >= 5:
+            ws._running = False
+
+    monkeypatch.setattr("apex.data.reconnecting_ws.random.uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    ws._connect = fake_connect  # type: ignore[method-assign]
+    ws._running = True
+
+    await ws._run_loop()
+
+    assert sleeps == [1.0, 2.0, 4.0, 1.0, 2.0]
+    assert sleeps[3] == 1.0, "a successful connection must reset the backoff"
+
+
+# --------------------------- F7: exact re-warn boundary
+
+def test_rewarn_boundary_is_exact(monkeypatch, caplog):
+    """Just under 900s stays quiet; exactly 900s re-warns."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr("apex.data.reconnecting_ws.time.monotonic", lambda: clock["t"])
+    ws = _gap_ws(_universe_subs())
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()                                   # t=0 -> WARNING
+        clock["t"] = rws.RECONCILIATION_REWARN_SECONDS - 0.001
+        ws._log_subscription_gap()                                   # 899.999 -> quiet
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+        clock["t"] = rws.RECONCILIATION_REWARN_SECONDS
+        ws._log_subscription_gap()                                   # exactly 900 -> WARNING
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "repeats=2" in warnings[1].getMessage()

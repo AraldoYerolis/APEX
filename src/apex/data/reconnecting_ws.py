@@ -23,14 +23,53 @@ MAX_CLOSE_REASON_CHARS = 200
 MAX_MISSING_REPORT_CHARS = 600
 MAX_IDENTITY_CHARS = 48
 
+# Subscription pacing. Hyperliquid documents no per-connection subscription cap
+# (its documented limit is 1000 per IP), but production has shown an unpaced
+# burst of 72-80 subscribes gets the socket killed ~1.3s in, after exactly 64
+# ACKs — while every session at <=64 has been healthy. Chunking spreads 80
+# subscribes over ~1s to test whether the burst, rather than the count, is what
+# upstream objects to. Membership and order are unchanged.
+SUBSCRIPTION_CHUNK_SIZE = 16
+SUBSCRIPTION_CHUNK_DELAY_SECONDS = 0.25
+
+# The receive loop does not start until every subscription has been sent, so
+# with pacing that is a ~1s window during which inbound frames only buffer.
+# The websockets default max_queue=16 would pause TCP reading well inside that
+# window and apply backpressure upstream — a slow-consumer disconnect that
+# would be indistinguishable from the subscription ceiling under test. 512
+# comfortably covers the ~160 startup frames (a response plus an initial candle
+# per subscription) plus normal traffic.
+WS_RECEIVE_QUEUE_SIZE = 512
+
+# Exception text is upstream-influenced (a ConnectionClosed renders the peer's
+# close reason), so it is bounded before it reaches a log line.
+MAX_EXCEPTION_CHARS = 200
+
+# Above this many subscriptions on one connection, production has been unstable.
+# Observability only — nothing is truncated or blocked.
+SUBSCRIPTION_COUNT_WARN_THRESHOLD = 64
+
+# An unchanged missing-subscription gap re-warns at most this often, so a
+# persistent gap can never fall silent for the life of the process.
+RECONCILIATION_REWARN_SECONDS = 900.0  # 15 minutes
+
+
+def _sanitize_text(value: Any, limit: int, ellipsis: str = "...(truncated)") -> str:
+    """Single-line, printable, length-capped rendering of untrusted text.
+
+    Whitespace collapses and non-printable characters are dropped, so upstream
+    text can neither forge a second log line nor emit terminal escapes.
+    """
+    text = " ".join(str(value).split())
+    text = "".join(ch for ch in text if ch.isprintable())
+    if len(text) > limit:
+        text = text[:limit] + ellipsis
+    return text
+
 
 def _sanitize_identity(value: Any) -> str:
     """Single-line, printable, bounded rendering of a subscription field."""
-    text = " ".join(str(value).split())
-    text = "".join(ch for ch in text if ch.isprintable())
-    if len(text) > MAX_IDENTITY_CHARS:
-        text = text[:MAX_IDENTITY_CHARS] + "~"
-    return text
+    return _sanitize_text(value, MAX_IDENTITY_CHARS, ellipsis="~")
 
 
 class ReconnectingWebSocket:
@@ -40,11 +79,15 @@ class ReconnectingWebSocket:
         on_message: OnMessageCallback,
         subscriptions: list[dict],
         max_backoff: float = 60.0,
+        chunk_size: int = SUBSCRIPTION_CHUNK_SIZE,
+        chunk_delay: float = SUBSCRIPTION_CHUNK_DELAY_SECONDS,
     ) -> None:
         self.url = url
         self.on_message = on_message
         self.subscriptions = subscriptions
         self.max_backoff = max_backoff
+        self.chunk_size = chunk_size
+        self.chunk_delay = chunk_delay
         self._running = False
         self._connected = False
         self._task: asyncio.Task | None = None
@@ -52,8 +95,11 @@ class ReconnectingWebSocket:
         self._connect_started_at: float | None = None
         self._messages_received = 0
         self._subscriptions_sent = False
+        self._subscriptions_sent_count = 0
         self._acked_subs: set[str] = set()
         self._last_gap_signature: str | None = None
+        self._last_gap_warned_at: float | None = None
+        self._gap_repeats_since_warning = 0
 
     @property
     def is_connected(self) -> bool:
@@ -116,10 +162,20 @@ class ReconnectingWebSocket:
             backoff = min(backoff * 2, self.max_backoff)
 
     def _describe_connection(self) -> str:
-        """Bounded summary of the connection that just ended."""
+        """Bounded summary of the connection that just ended.
+
+        `subs_sent` counts subscribe frames written, NOT acknowledged ones —
+        acknowledgement is what the reconciliation line reports. It matters
+        because a socket that dies mid-send suppresses reconciliation, and
+        without this a low messages_received reads as "upstream said nothing"
+        when the real story is "we never finished asking".
+        """
         age = self.connection_age_seconds
         lifetime = "unknown" if age is None else f"{age:.1f}s"
-        return f"lifetime={lifetime} messages_received={self._messages_received}"
+        return (
+            f"lifetime={lifetime} messages_received={self._messages_received} "
+            f"subs_sent={self._subscriptions_sent_count}/{len(self.subscriptions)}"
+        )
 
     # ------------------------------------------------ subscription reconciliation
 
@@ -204,12 +260,30 @@ class ReconnectingWebSocket:
                 f"acked={len(expected) - len(missing)} missing={len(missing)} {summary}"
             )
             signature = f"{len(expected)}|{len(missing)}|{summary}"
-            repeated = signature == self._last_gap_signature
+            now = time.monotonic()
+            changed = signature != self._last_gap_signature
             self._last_gap_signature = signature
-            if repeated:
-                # Identical gap on a reconnect adds no information; stay quiet.
+
+            if changed:
+                due = True
+            else:
+                # An unchanged gap stays quiet, but never forever: re-state it
+                # periodically so any recent log window carries the diagnosis.
+                self._gap_repeats_since_warning += 1
+                due = (
+                    self._last_gap_warned_at is None
+                    or now - self._last_gap_warned_at >= RECONCILIATION_REWARN_SECONDS
+                )
+                if due:
+                    line += f" (repeats={self._gap_repeats_since_warning})"
+
+            if not due:
                 logger.debug(line)
-            elif missing:
+                return
+
+            self._last_gap_warned_at = now
+            self._gap_repeats_since_warning = 0
+            if missing:
                 logger.warning(line)
             else:
                 logger.info(line)
@@ -244,19 +318,55 @@ class ReconnectingWebSocket:
             reason = reason[:MAX_CLOSE_REASON_CHARS] + "...(truncated)"
         return f"close_code={code} close_reason={reason!r} close_frame={source}"
 
+    async def _send_subscriptions(self, ws: Any) -> None:
+        """Send every subscription in order, pausing between chunks.
+
+        Membership, order and payloads are identical to sending them in one
+        burst — only the timing differs. The pause goes *between* chunks, never
+        after the last message, so a set that fits in one chunk is unpaced.
+        """
+        total = len(self.subscriptions)
+        sent = 0
+        try:
+            for sub in self.subscriptions:
+                await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
+                sent += 1
+                if self.chunk_size > 0 and sent % self.chunk_size == 0 and sent < total:
+                    await asyncio.sleep(self.chunk_delay)
+        except Exception as e:
+            # `sent` messages succeeded, so the failure is on the next one —
+            # index `sent` (0-based), which is subscription number sent+1.
+            failed = self.subscriptions[sent] if sent < total else None
+            identity = self._subscription_identity(failed) if isinstance(failed, dict) else "?"
+            logger.warning(
+                f"WebSocket subscribe failed: {type(e).__name__}: "
+                f"{_sanitize_text(e, MAX_EXCEPTION_CHARS)} | "
+                f"sent={sent}/{total} failed_sub_number={sent + 1}/{total} "
+                f"failed_sub={identity}"
+            )
+            raise
+        finally:
+            self._subscriptions_sent_count = sent
+        self._subscriptions_sent = True
+        logger.info(f"Subscribed to {total} feeds in chunks of {self.chunk_size}")
+
     async def _connect(self) -> None:
         logger.info(f"Connecting to WebSocket: {self.url}")
         self._connect_started_at = time.monotonic()
         self._messages_received = 0
         self._subscriptions_sent = False
+        self._subscriptions_sent_count = 0
         self._acked_subs = set()
-        async with websockets.connect(self.url, ping_interval=20, ping_timeout=10) as ws:
+        async with websockets.connect(
+            self.url,
+            ping_interval=20,
+            ping_timeout=10,
+            max_queue=WS_RECEIVE_QUEUE_SIZE,
+        ) as ws:
             self._connected = True
             logger.info("WebSocket connected — subscribing to feeds")
 
-            for sub in self.subscriptions:
-                await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
-            self._subscriptions_sent = True
+            await self._send_subscriptions(ws)
 
             async for raw in ws:
                 if not self._running:

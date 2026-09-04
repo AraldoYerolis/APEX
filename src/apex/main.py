@@ -14,7 +14,10 @@ from apex.app import create_app
 from apex.config import get_settings
 from apex.data.candle_store import CandleStore
 from apex.data.hyperliquid_client import HyperliquidClient
-from apex.data.reconnecting_ws import ReconnectingWebSocket
+from apex.data.reconnecting_ws import (
+    SUBSCRIPTION_COUNT_WARN_THRESHOLD,
+    ReconnectingWebSocket,
+)
 from apex.db.connection import init_db
 from apex.db import repository as repo
 from apex.logging_config import configure_logging
@@ -214,6 +217,24 @@ async def backfill_candles(
         await asyncio.sleep(0.1)  # Gentle rate limiting
 
 
+def warn_if_subscription_count_high(count: int) -> bool:
+    """Warn once at startup when the subscription count is empirically risky.
+
+    Observability only: nothing is truncated, blocked, or reordered. Returns
+    whether a warning was emitted so the branch is directly testable.
+    """
+    if count <= SUBSCRIPTION_COUNT_WARN_THRESHOLD:
+        return False
+    logger.warning(
+        f"  *** {count} subscriptions exceeds {SUBSCRIPTION_COUNT_WARN_THRESHOLD}: "
+        "production has been unstable above this count on a single Hyperliquid "
+        "connection (sockets closed early having ACKed only part of the set). "
+        "This is an observed threshold, NOT a documented Hyperliquid limit. "
+        "Watch the WS subscription reconciliation lines. ***"
+    )
+    return True
+
+
 def build_ws_subscriptions(symbols: list[str], timeframes: list[str]) -> list[dict]:
     """Build Hyperliquid WebSocket subscription objects."""
     subs = []
@@ -319,6 +340,7 @@ async def run() -> None:
         )
         _ws_manager.start()
         logger.info(f"WebSocket started with {len(subs)} subscriptions")
+        warn_if_subscription_count_high(len(subs))
 
     # Set up scheduler
     scheduler = AsyncIOScheduler()
