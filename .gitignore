@@ -49,3 +49,6 @@ docs/APEX_VPS_RUNBOOK.local.md
 
 # Local review artifacts
 review_artifacts/
+
+# Claude Code machine-local settings (personal permission overrides)
+**/.claude/settings.local.json
