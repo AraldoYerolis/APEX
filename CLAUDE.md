@@ -91,6 +91,14 @@ the two. They now live at
 - If either agent fails to load or fails to run, tell Aaron explicitly
   rather than proceeding as if independent review occurred.
 
+Two project skills support this workflow:
+[`/apex-rebaseline`](.claude/skills/apex-rebaseline/SKILL.md) establishes
+a local repository baseline before non-trivial Builder work.
+[`/apex-vps-health`](.claude/skills/apex-vps-health/SKILL.md) is a
+user-invoked production health checklist — invoking it never itself
+authorizes SSH or any production access; that still requires Aaron's
+separate, explicit approval.
+
 ## 6. Approval Boundaries
 
 Aaron alone approves:
