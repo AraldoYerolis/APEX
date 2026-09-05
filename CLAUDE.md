@@ -67,11 +67,29 @@ The intended workflow is **Researcher → Builder → Validator**, with the
 Researcher and Validator roles read-only. These are Claude Code development
 roles — distinct from APEX's own in-application analytic agents described in
 [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md); do not conflate
-the two. **Researcher and Validator have not yet been integrated into this
-branch.** Once they are, their definitions will live in `.claude/agents/`.
-Until then, if a task calls for independent Researcher or Validator review
-and no such agent is actually available, say so explicitly to Aaron rather
-than proceeding as if independent review occurred.
+the two. They now live at
+[`.claude/agents/apex-researcher.md`](.claude/agents/apex-researcher.md) and
+[`.claude/agents/apex-validator.md`](.claude/agents/apex-validator.md):
+
+- **apex-researcher** performs unattended local static repository
+  investigation only (`Read`/`Grep`/`Glob` on the working tree, no shell,
+  no web, no git history) before planning or coding on any non-trivial
+  change.
+- **Builder** is this main Claude Code session: it makes approved edits,
+  and it is the one that does web research, git diagnostics/history,
+  `pytest`/Ruff/test execution, runtime/external checks, and anything
+  else that may require approval, under normal project permissions.
+- **apex-validator** performs unattended local static validation only
+  (`Read`/`Grep`/`Glob` on the working tree plus whatever the Builder
+  supplies it, no shell, no web, no execution) after the Builder's
+  change, before testing, commit, push, or deploy. It does not repair
+  its own findings — it reports them for the Builder or Aaron to
+  address. If current external documentation is needed to validate
+  behavior, the Builder obtains it and supplies the relevant facts to
+  the Validator. When the Validator needs execution or git evidence, it
+  reports that gap and names the exact check; the Builder runs it.
+- If either agent fails to load or fails to run, tell Aaron explicitly
+  rather than proceeding as if independent review occurred.
 
 ## 6. Approval Boundaries
 
