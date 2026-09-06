@@ -54,6 +54,19 @@ closer to live trading or live alerting.
 - Never install a package on the production host without explicit approval.
 - No automatic rollback — if something on production looks wrong, report it
   and propose next steps; do not attempt to revert it unilaterally.
+- These are two separate controls, not one: `.claude/settings.json`
+  denies direct `Bash(systemctl *)` outright as a project permission
+  baseline (it blocks the shell command from running at all, on any
+  host), while this rule separately prohibits a production systemd
+  lifecycle action without Aaron's explicit approval (it governs intent
+  and scope, including any path that isn't a bare local `systemctl`
+  invocation). Removing or narrowing one control must not be read as
+  loosening the other.
+- [`apex-vps-health`](../skills/apex-vps-health/SKILL.md) remains a
+  separately approved, read-only production checklist: invoking it, or
+  Aaron approving SSH access under it, is not itself approval for any
+  systemd lifecycle action, deploy, or other production mutation — that
+  still requires its own explicit approval per this section.
 
 ## Agents
 

@@ -266,9 +266,13 @@ MATCHES / PARTIAL MATCH / DOES NOT MATCH, with why.
 Address each explicitly: `ALERTS_ENABLED` unchanged, `DRY_RUN_MODE`
 unchanged, no live trading added, no exchange keys added, no secrets
 printed, no `.env` modification, no production DB mutation risk, no
-systemd/deploy/runtime change unless approved, no live alerts enabled, no
-service restart/deploy/commit/push performed by the Builder without
-approval.
+systemd/deploy/runtime change unless approved, no live alerts enabled.
+For whether the Builder performed a service restart/deploy/commit/push
+without approval: confirm this only if the main session explicitly
+supplied that fact in your invocation; you cannot observe Builder
+shell/git/runtime actions yourself. Otherwise mark it **INCOMPLETE
+EVIDENCE** — never infer it from working-tree content (e.g. a clean
+working tree is not evidence a commit did or didn't happen).
 
 ## 6. High-Risk Areas Touched
 List any from the High-Risk Change Categories above.

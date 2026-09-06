@@ -32,7 +32,10 @@
       "Bash(python3 -m pip install *)",
       "Bash(.venv/bin/pip install *)",
       "Bash(.venv/bin/python -m pip install *)",
-      "Bash(.venv/bin/python3 -m pip install *)"
+      "Bash(.venv/bin/python3 -m pip install *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh repo sync *)",
+      "Bash(gh api *)"
     ]
   }
 }
