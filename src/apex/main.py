@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import sys
 from typing import Any, Optional
 
@@ -11,7 +12,7 @@ import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from apex.app import create_app
-from apex.config import get_settings
+from apex.config import Settings, get_settings
 from apex.data.candle_store import CandleStore
 from apex.data.hyperliquid_client import HyperliquidClient
 from apex.data.market_universe import get_upstream_symbol
@@ -46,6 +47,19 @@ WS_REJECTION_KEYS = ("error", "message", "reason")
 # Module-level state (accessible by tasks)
 _candle_store: Optional[CandleStore] = None
 _ws_manager: Optional[ReconnectingWebSocket] = None
+# The symbols (order-preserving snapshot not required) actually represented
+# in _ws_manager's current subscription set — i.e. the last desired_ws_symbols
+# a rebuild was applied for. Empty when no manager has been built yet.
+_ws_symbols: list[str] = []
+# Lazily created so the Lock binds to whichever event loop is actually
+# running when it's first acquired (run(), or a test driving these functions
+# directly), instead of binding at import time to whatever loop happens to be
+# current then. See _get_ws_lifecycle_lock.
+_ws_lifecycle_lock: Optional[asyncio.Lock] = None
+# Set once shutdown begins, so an in-flight or subsequent universe/WS sync
+# job can never start (or finish starting) a replacement WS connection
+# after the process has committed to tearing down.
+_shutdown_started: bool = False
 _ws_log_budget: dict[str, int] = {}
 
 
@@ -115,9 +129,11 @@ def _subscription_response_is_rejection(data: Any) -> bool:
 def _take_ws_log_budget(key: str, limit: int) -> bool:
     """Return True while `key` has budget left, announcing the last one.
 
-    The subscription list is fixed for the life of the process, so the first
-    connection's responses are enough to diagnose a rejected subscription.
-    Budgets keep a 60s reconnect loop from flooding the journal.
+    The subscription list can change over the life of the process — a
+    universe-triggered WS rebuild (see run_universe_ws_sync) resets this
+    budget when that happens, so a budget already exhausted against the old
+    list can never hide a rejection introduced by the new one. Absent a
+    rebuild, budgets keep a 60s reconnect loop from flooding the journal.
     """
     used = _ws_log_budget.get(key, 0)
     if used >= limit:
@@ -131,6 +147,21 @@ def _take_ws_log_budget(key: str, limit: int) -> bool:
 def _reset_ws_log_budget() -> None:
     """Clear the diagnostic log budgets (used by tests)."""
     _ws_log_budget.clear()
+
+
+def _get_ws_lifecycle_lock() -> asyncio.Lock:
+    """Return the module's WS lifecycle lock, creating it on first use.
+
+    Created lazily (rather than at module import time) so it always binds to
+    whatever event loop is actually running when a rebuild or shutdown first
+    acquires it. Guards the WS-manager-touching critical section shared by
+    run_universe_ws_sync and shutdown — nothing else (signal scans, other
+    scheduler jobs) is affected.
+    """
+    global _ws_lifecycle_lock
+    if _ws_lifecycle_lock is None:
+        _ws_lifecycle_lock = asyncio.Lock()
+    return _ws_lifecycle_lock
 
 
 async def on_ws_message(msg: dict) -> None:
@@ -220,10 +251,13 @@ async def backfill_candles(
 
 
 def warn_if_subscription_count_high(count: int) -> bool:
-    """Warn once at startup when the subscription count is empirically risky.
+    """Warn when the subscription count is empirically risky.
 
-    Observability only: nothing is truncated, blocked, or reordered. Returns
-    whether a warning was emitted so the branch is directly testable.
+    Called for every WS manager (re)build — startup and any later
+    universe-triggered rebuild — via _activate_ws_manager, not only at
+    startup. Observability only: nothing is truncated, blocked, or
+    reordered. Returns whether a warning was emitted so the branch is
+    directly testable.
     """
     if count <= SUBSCRIPTION_COUNT_WARN_THRESHOLD:
         return False
@@ -254,8 +288,19 @@ def build_ws_subscriptions(symbols: list[str], timeframes: list[str]) -> list[di
     return subs
 
 
+def _build_timeframes(settings: Settings) -> list[str]:
+    """Configured candle timeframes, deduplicated, in a stable order."""
+    timeframes = [
+        settings.trend_timeframe,
+        settings.setup_timeframe,
+        settings.entry_timeframe,
+        "1m",
+    ]
+    return list(dict.fromkeys(timeframes))
+
+
 async def run() -> None:
-    global _candle_store, _ws_manager
+    global _candle_store, _ws_manager, _ws_symbols, _shutdown_started
 
     settings = get_settings()
 
@@ -320,14 +365,7 @@ async def run() -> None:
         logger.info(f"Scan-enabled symbols ({len(scan_symbols)}): {', '.join(scan_symbols[:15])}"
                     + (f" ... +{len(scan_symbols)-15} more" if len(scan_symbols) > 15 else ""))
 
-    timeframes = [
-        settings.trend_timeframe,
-        settings.setup_timeframe,
-        settings.entry_timeframe,
-        "1m",
-    ]
-    # Deduplicate
-    timeframes = list(dict.fromkeys(timeframes))
+    timeframes = _build_timeframes(settings)
 
     # Preload candles from DB
     logger.info("Preloading candles from DB...")
@@ -342,25 +380,27 @@ async def run() -> None:
 
     # Start WebSocket
     if scan_symbols:
-        subs = build_ws_subscriptions(scan_symbols[:30], timeframes)
-        _ws_manager = ReconnectingWebSocket(
-            url=settings.hyperliquid_ws_url,
-            on_message=on_ws_message,
-            subscriptions=subs,
-        )
-        _ws_manager.start()
-        logger.info(f"WebSocket started with {len(subs)} subscriptions")
-        warn_if_subscription_count_high(len(subs))
+        desired_ws_symbols = scan_symbols[:30]
+        subs = build_ws_subscriptions(desired_ws_symbols, timeframes)
+        _ws_manager = _build_ws_manager(subs, settings)
+        _start_ws_manager(_ws_manager)
+        _ws_symbols = desired_ws_symbols
+
+    # Create FastAPI app now so the scheduled universe/WS sync job below can
+    # update app.state.scan_symbols as the universe changes, not just at
+    # startup.
+    app = create_app(settings=settings, conn=conn)
+    app.state.scan_symbols = scan_symbols
 
     # Set up scheduler
     scheduler = AsyncIOScheduler()
 
-    # Universe refresh every 15 minutes
+    # Universe refresh + WS membership sync every 15 minutes
     scheduler.add_job(
-        run_universe_refresh,
+        run_universe_ws_sync,
         "interval",
         minutes=15,
-        args=[conn, client, settings],
+        args=[conn, client, settings, app],
         id="universe_refresh",
     )
 
@@ -399,10 +439,7 @@ async def run() -> None:
 
     repo.log_event(conn, "STARTUP", "APEX started successfully")
 
-    # Create and run FastAPI app
-    app = create_app(settings=settings, conn=conn)
     app.state.scheduler = scheduler
-    app.state.scan_symbols = scan_symbols
 
     config = uvicorn.Config(
         app=app,
@@ -417,20 +454,29 @@ async def run() -> None:
         await server.serve()
     finally:
         # Shutdown order matters:
-        #   1. Stop the scheduler first so no new jobs fire against a closing conn.
-        #   2. Stop the WebSocket manager.
-        #   3. Log SHUTDOWN while the connection is still open.
-        #   4. Close the DB last.
+        #   1. Mark shutdown as begun *before* anything else, so an in-flight
+        #      or subsequently-invoked run_universe_ws_sync can never start
+        #      (or finish starting) a replacement WS connection afterward.
+        #   2. Stop the scheduler so no new jobs fire against a closing conn.
+        #   3. Stop the WebSocket manager, holding the same lifecycle lock a
+        #      sync rebuild holds — so an in-flight rebuild's DB/WS-touching
+        #      critical section finishes (or aborts via the shutdown flag)
+        #      before the WS manager is torn down here.
+        #   4. Log SHUTDOWN while the connection is still open.
+        #   5. Close the DB last.
         # Each step is wrapped individually so a failure in one never prevents
         # the rest from running (and never produces an unhandled traceback on exit).
+        _shutdown_started = True
+
         try:
             scheduler.shutdown(wait=False)
         except Exception as e:
             logger.warning(f"Scheduler shutdown error: {e}")
 
         try:
-            if _ws_manager:
-                await _ws_manager.stop()
+            async with _get_ws_lifecycle_lock():
+                if _ws_manager:
+                    await _ws_manager.stop()
         except Exception as e:
             logger.warning(f"WebSocket shutdown error: {e}")
 
@@ -446,6 +492,184 @@ async def run() -> None:
             logger.warning(f"DB close error: {e}")
 
         logger.info("APEX shutdown complete")
+
+
+def _build_ws_manager(subs: list[dict], settings: Settings) -> ReconnectingWebSocket:
+    """Construct (but do not start) a new WS manager for `subs`.
+
+    Construction has no observable side effect — no task, no network — so a
+    rebuild can safely prepare the replacement with this *before* stopping
+    the old manager, and only stop the old one once the replacement is
+    ready to start. See _start_ws_manager and run_universe_ws_sync.
+    """
+    return ReconnectingWebSocket(
+        url=settings.hyperliquid_ws_url,
+        on_message=on_ws_message,
+        subscriptions=subs,
+    )
+
+
+def _start_ws_manager(manager: ReconnectingWebSocket) -> None:
+    """Start an already-constructed WS manager and run its diagnostics.
+
+    Shared by the initial startup path, every later universe-triggered
+    rebuild, and old-manager recovery after a failed rebuild, so
+    warn_if_subscription_count_high fires from exactly one call site
+    regardless of how many times a WS manager is (re)started over the
+    process's life.
+    """
+    manager.start()
+    logger.info(f"WebSocket started with {len(manager.subscriptions)} subscriptions")
+    warn_if_subscription_count_high(len(manager.subscriptions))
+
+
+async def run_universe_ws_sync(
+    conn: sqlite3.Connection,
+    client: HyperliquidClient,
+    settings: Settings,
+    app: Any,
+) -> None:
+    """Refresh the market universe and reconcile the WS manager's membership.
+
+    Registered as the scheduled universe-refresh job in place of calling
+    run_universe_refresh() directly. run_universe_refresh's return contract
+    is unchanged and untouched here: this only consumes the symbol list it
+    already returns and keeps the live WS subscription set — and
+    app.state.scan_symbols — in sync with it, instead of both only ever
+    reflecting the symbols seen at process startup.
+
+    An empty return from run_universe_refresh() means a refresh failure, not
+    "scan nothing" — it must never tear down a healthy WS manager or replace
+    a previously-remembered good membership. See run_universe_refresh's
+    docstring in apex.scheduler.tasks.
+    """
+    global _ws_manager, _ws_symbols
+
+    scan_symbols = await run_universe_refresh(conn, client, settings)
+
+    if not scan_symbols:
+        logger.warning(
+            f"Universe refresh returned no symbols; preserving existing WS "
+            f"subscriptions ({len(_ws_symbols)} symbols) in degraded mode"
+        )
+        return
+
+    app.state.scan_symbols = scan_symbols
+
+    timeframes = _build_timeframes(settings)
+    desired_ws_symbols = scan_symbols[:30]
+    desired_set = set(desired_ws_symbols)
+    current_set = set(_ws_symbols)
+
+    if desired_set == current_set:
+        logger.debug(
+            f"Universe refresh: WS membership unchanged ({len(desired_set)} symbols)"
+        )
+        return
+
+    if _shutdown_started:
+        logger.info("Shutdown in progress; skipping WS membership rebuild")
+        return
+
+    added = sorted(desired_set - current_set)
+    removed = sorted(current_set - desired_set)
+    logger.info(
+        f"WS membership changing: +{len(added)} -{len(removed)} symbols "
+        f"(old={len(current_set)} new={len(desired_set)})"
+    )
+
+    async with _get_ws_lifecycle_lock():
+        if _shutdown_started:
+            logger.info("Shutdown started before WS rebuild could proceed; aborting")
+            return
+
+        # Preload/backfill newly-added symbols while the OLD manager (if any)
+        # is still running, so existing feeds stay live during this work.
+        if added and _candle_store is not None:
+            for sym in added:
+                for tf in timeframes:
+                    _candle_store.load_from_db(sym, tf)
+            await backfill_candles(client, _candle_store, added, timeframes)
+
+        if _shutdown_started:
+            logger.info("Shutdown started during WS resync backfill; aborting rebuild")
+            return
+
+        # Prepare the replacement before touching the old manager at all —
+        # construction is side-effect-free, so a failure here (or anything
+        # above) leaves the old feed completely undisturbed.
+        old_manager = _ws_manager
+        subs = build_ws_subscriptions(desired_ws_symbols, timeframes)
+        replacement = _build_ws_manager(subs, settings)
+
+        if old_manager is not None:
+            await old_manager.stop()
+
+        try:
+            _start_ws_manager(replacement)
+        except Exception as replacement_err:
+            logger.error(
+                f"WS replacement failed to start "
+                f"({len(desired_ws_symbols)} symbols desired): {replacement_err}"
+            )
+            try:
+                await replacement.stop()
+            except Exception as cleanup_err:
+                logger.debug(f"Replacement cleanup after failed start: {cleanup_err}")
+
+            if old_manager is None:
+                # No prior manager and no replacement — explicitly degraded,
+                # never falsely "healthy". _ws_symbols must not go on
+                # claiming a membership nothing is actually subscribed to.
+                _ws_manager = None
+                _ws_symbols = []
+                logger.error(
+                    "WS replacement failed with no prior manager to recover; "
+                    "WS feed is DOWN (degraded, no active manager)"
+                )
+                raise replacement_err
+
+            try:
+                # Safe: old_manager.stop() above already completed, so this
+                # starts a fresh task on a fully-stopped instance — not a
+                # concurrent double-start.
+                _start_ws_manager(old_manager)
+            except Exception as recovery_err:
+                _ws_manager = None
+                _ws_symbols = []
+                logger.error(
+                    "WS old-feed recovery also failed after replacement failure; "
+                    f"WS feed is DOWN (degraded, no active manager): "
+                    f"replacement_error={replacement_err} recovery_error={recovery_err}"
+                )
+                raise recovery_err from replacement_err
+
+            # Recovered the old feed: membership stays at the old, still-
+            # actually-subscribed set. Do not claim the refresh succeeded —
+            # no diagnostics reset, no success log, and the failure still
+            # propagates so the scheduler's own error handling sees it.
+            _ws_manager = old_manager
+            logger.warning(
+                f"WS replacement failed; recovered old feed "
+                f"({len(_ws_symbols)} symbols) — refresh to "
+                f"{len(desired_ws_symbols)} symbols was NOT applied"
+            )
+            raise replacement_err
+        else:
+            _ws_manager = replacement
+            _ws_symbols = desired_ws_symbols
+            _reset_ws_log_budget()
+
+    if not current_set:
+        logger.info(
+            f"WS manager recovered from degraded/startup state: "
+            f"{len(subs)} subscriptions across {len(desired_ws_symbols)} symbols"
+        )
+    else:
+        logger.info(
+            f"WS rebuilt: {len(subs)} subscriptions across {len(desired_ws_symbols)} "
+            f"symbols (+{len(added)} -{len(removed)})"
+        )
 
 
 def main() -> None:

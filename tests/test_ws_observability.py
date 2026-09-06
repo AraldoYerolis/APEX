@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import time
 
 import pytest
 from websockets.exceptions import ConnectionClosedError
@@ -1501,3 +1502,61 @@ async def test_run_loop_close_reason_still_reported_when_benign(monkeypatch, cap
     assert "internal error" in line
     assert "close_code=1011" in line
     assert "...(truncated)" not in line
+
+
+# ============================================================================
+# Lifecycle regression: stop() during reconnect/backoff
+#
+# apex.main's universe-triggered WS rebuild (run_universe_ws_sync) depends on
+# stop() cleanly cancelling a manager that is currently *waiting* to
+# reconnect (asleep in the backoff `await asyncio.sleep(...)` between
+# `_run_loop` iterations), not just one that is mid-`_connect()`. That sleep
+# sits outside `_run_loop`'s try/except, so cancellation there takes a
+# different path through the code than the one the existing close-metadata
+# tests exercise (those replace asyncio.sleep with a fake that never really
+# suspends). This is a regression test of that existing, unmodified class
+# behaviour — reconnecting_ws.py is not touched by the rebuild-sync change.
+# ============================================================================
+
+async def test_stop_cancels_task_during_backoff_sleep():
+    """stop() must promptly cancel _run_loop even while asleep in backoff."""
+    ws = _make_ws(max_backoff=60.0)
+
+    async def fake_connect():
+        raise ConnectionClosedError(None, None)
+
+    ws._connect = fake_connect  # type: ignore[method-assign]
+    ws.start()
+
+    # Let the loop fail once and settle into its real (unmocked) backoff
+    # sleep — several no-op yields are enough since fake_connect raises
+    # synchronously and only the trailing `await asyncio.sleep(...)` suspends.
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert ws._task is not None
+    assert not ws._task.done()
+
+    started = time.monotonic()
+    await asyncio.wait_for(ws.stop(), timeout=2.0)
+    elapsed = time.monotonic() - started
+
+    assert ws._task.done()
+    assert ws._running is False
+    # The backoff sleep after one failure is ~1s (+jitter); a clean
+    # cancellation interrupts it immediately rather than waiting it out.
+    assert elapsed < 1.0
+
+    # The replacement pattern (apex.main._activate_ws_manager) always
+    # constructs a brand-new instance rather than restarting this one, so
+    # confirm a fresh instance's task is distinct and starting it never
+    # revives the stopped instance's task — no second active task sharing
+    # this one's identity.
+    replacement = _make_ws()
+    replacement.start()
+    try:
+        await asyncio.sleep(0)
+        assert replacement._task is not ws._task
+        assert ws._task.done()
+    finally:
+        await replacement.stop()
