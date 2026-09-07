@@ -265,3 +265,46 @@ CREATE INDEX IF NOT EXISTS idx_signal_features_uid
     ON signal_features(observation_uid);
 CREATE INDEX IF NOT EXISTS idx_signal_features_symbol
     ON signal_features(symbol, signal_type, captured_at);
+
+-- ---------------------------------------------------------------
+-- opportunity_observations
+-- TA Opportunity Engine v0.1 — additive, research-only.
+-- Completely separate from alerts, paper_trades, daily_risk,
+-- signal_observations, and signal_features. Never consumed by the
+-- existing signal/alert path, cooldown logic, or Pushover.
+-- contract_version documents the shape of evidence_json/warnings_json/
+-- measurements_json for a given row (see src/apex/opportunity/contract.py).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS opportunity_observations (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_uid          TEXT NOT NULL UNIQUE,
+    fingerprint              TEXT NOT NULL,          -- dedupe identity; NOT unique (see engine.py)
+    symbol                   TEXT NOT NULL,
+    direction                TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+    setup_family             TEXT NOT NULL CHECK(setup_family IN ('VOLATILITY_COMPRESSION','SWEEP_RECLAIM')),
+    detector_version         TEXT NOT NULL,
+    contract_version         TEXT NOT NULL,
+    primary_timeframe        TEXT NOT NULL CHECK(primary_timeframe IN ('3m','5m')),
+    status                   TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','EXPIRED')),
+    research_only            INTEGER NOT NULL DEFAULT 1,
+    first_detected_at        TEXT NOT NULL,           -- ISO8601 UTC
+    last_seen_at             TEXT NOT NULL,           -- ISO8601 UTC
+    occurrence_count         INTEGER NOT NULL DEFAULT 1,
+    source_candle_open_time  INTEGER NOT NULL,        -- Unix ms
+    source_candle_close_time INTEGER NOT NULL,        -- Unix ms
+    anchor_price             REAL,
+    anchor_open_time         INTEGER,                 -- Unix ms
+    evidence_json            TEXT,                    -- supporting evidence
+    warnings_json            TEXT,                    -- conflicting evidence / warnings
+    measurements_json        TEXT,                    -- raw detector measurements
+    closed_at                TEXT,                    -- ISO8601 UTC when EXPIRED
+    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_opportunity_observations_fingerprint
+    ON opportunity_observations(fingerprint, status);
+CREATE INDEX IF NOT EXISTS idx_opportunity_observations_lookup
+    ON opportunity_observations(symbol, setup_family, primary_timeframe, status);
+CREATE INDEX IF NOT EXISTS idx_opportunity_observations_uid
+    ON opportunity_observations(opportunity_uid);

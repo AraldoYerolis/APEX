@@ -296,15 +296,27 @@ class TestDbAndSchemaCompatibility:
         assert len(df) == 1
 
     def test_no_schema_migration_files_added(self):
-        """This fix is in-memory only (module-level map); it must not touch
-        schema.sql or introduce a migration.
+        """Pinned-scope regression: verifies that the historical casing-fix
+        commit 74e5da4 (Hyperliquid canonical symbol casing) touched neither
+        schema.sql nor a migration file, since that fix was in-memory only
+        (module-level map).
+
+        The diff range is pinned to the fix's own commit range
+        (f671f8d5..74e5da4), not open-ended against the current tree/HEAD —
+        an earlier version of this test diffed against the working tree,
+        which meant every future commit that ever touched schema.sql would
+        fail this test, regardless of relevance to the casing fix.
         """
         import pathlib
         import subprocess
 
         repo_root = pathlib.Path(__file__).resolve().parent.parent
         diff = subprocess.run(
-            ["git", "diff", "--name-only", "f671f8d5acbbc6771d761ec87b8badc05b381e7a"],
+            [
+                "git", "diff", "--name-only",
+                "f671f8d5acbbc6771d761ec87b8badc05b381e7a",
+                "74e5da443de09e77637f4075424d827434ba2287",
+            ],
             cwd=repo_root, capture_output=True, text=True, check=True,
         ).stdout
         changed = set(diff.splitlines())

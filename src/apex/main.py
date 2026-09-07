@@ -24,6 +24,7 @@ from apex.db.connection import init_db
 from apex.db import repository as repo
 from apex.logging_config import configure_logging
 from apex.notifications.pushover_client import PushoverClient
+from apex.opportunity.engine import run_opportunity_scan
 from apex.scheduler.tasks import (
     run_followup_check,
     run_observation_evaluation,
@@ -432,6 +433,20 @@ async def run() -> None:
             seconds=60,
             args=[conn, _candle_store, settings],
             id="observation_evaluation",
+        )
+
+    # TA Opportunity Engine v0.1 — additive, research-only (src/apex/opportunity/).
+    # Gated here AND inside run_opportunity_scan itself (defense in depth, same
+    # pattern as run_observation_evaluation above): never registered unless
+    # explicitly enabled AND dry_run_mode is true. Never touches the existing
+    # signal/alert path or Pushover.
+    if settings.opportunity_engine_enabled and settings.dry_run_mode:
+        scheduler.add_job(
+            run_opportunity_scan,
+            "interval",
+            seconds=60,
+            args=[conn, _candle_store, settings],
+            id="opportunity_scan",
         )
 
     scheduler.start()
