@@ -93,7 +93,9 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from apex.config import Settings
 from apex.data.candle_store import CandleStore
@@ -108,7 +110,7 @@ from apex.opportunity.contract import (
 from apex.opportunity.detectors.sweep_reclaim import detect_sweep_reclaim
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
 from apex.utils.ids import new_uid
-from apex.utils.time import minutes_ago_iso, utcnow_iso
+from apex.utils.time import minutes_ago_iso
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,19 @@ class OpportunityScanSummary:
             f"{self.findings} findings ({self.new_opportunities} new, {self.re_confirmed} re-confirmed), "
             f"{self.expired} expired, {self.no_data} no data, {self.stale} stale"
         )
+
+
+def _ms_to_iso(ms: int) -> str:
+    """ISO UTC string (utcnow_iso's whole-second format) for a millisecond
+    epoch value. `run_opportunity_scan` always passes an already
+    whole-second-floored `now_ms` (see below), so this is an exact
+    round-trip of that instant, not a truncation of a more precise one —
+    first_detected_at/last_seen_at and every candle-eligibility now_ms for
+    the scan are therefore derived from the same single clock read AND the
+    same whole-second value, rather than an independent, later
+    time.time()/datetime.now() call.
+    """
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def compute_fingerprint(finding: DetectorFinding) -> str:
@@ -195,7 +210,29 @@ async def run_opportunity_scan(
         return summary
     summary.markets_scanned = len(markets)
 
-    now = utcnow_iso()
+    # Read the wall clock exactly once for the whole scan, then derive both
+    # the ISO first_detected_at/last_seen_at stamp and every candle-
+    # eligibility now_ms from that single instant (never a second,
+    # independent clock read) — so every candle-eligibility check for this
+    # entire scan (see candle_store.get_df's now_ms) is judged against the
+    # same instant as first_detected_at/last_seen_at below. Without this, a
+    # bar that only crosses its own close boundary partway through a
+    # multi-symbol scan (get_df is called once per symbol, and a scan can
+    # take several seconds) could be exposed as closed with a close time
+    # later than `now`, reproducing the exact violation this fix targets.
+    #
+    # Deliberately floored to the whole second (never a finer-grained
+    # millisecond cutoff): first_detected_at/last_seen_at are persisted as
+    # whole-second ISO strings, so a sub-second-precise cutoff could still
+    # expose a candle whose close boundary falls later within that same
+    # second than the second-only timestamp that gets recorded for it. Using
+    # the floored value as the candle-eligibility cutoff too (not just for
+    # the ISO stamp) means the recorded timestamp is never later than the
+    # boundary actually used to judge eligibility — a conservative choice
+    # that can only delay a bar's first appearance by up to ~1s, never
+    # expose one early.
+    now_ms = int(time.time()) * 1000
+    now = _ms_to_iso(now_ms)
     for timeframe, expiry_minutes in OPPORTUNITY_EXPIRY_MINUTES.items():
         cutoff = minutes_ago_iso(expiry_minutes)
         summary.expired += repo.expire_stale_opportunities(
@@ -205,10 +242,10 @@ async def run_opportunity_scan(
     for market in markets:
         symbol = market.symbol
         try:
-            context_df_15m = candle_store.get_df(symbol, "15m")
+            context_df_15m = candle_store.get_df(symbol, "15m", now_ms=now_ms)
 
             for timeframe in OPPORTUNITY_TIMEFRAMES:
-                df = candle_store.get_df(symbol, timeframe)
+                df = candle_store.get_df(symbol, timeframe, now_ms=now_ms)
                 if df is None or len(df) < MIN_CANDLES_REQUIRED:
                     summary.no_data += 1
                     continue
