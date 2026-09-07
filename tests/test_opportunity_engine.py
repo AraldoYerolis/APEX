@@ -21,8 +21,10 @@ from apex.db.models import Market
 from apex.notifications.pushover_client import PushoverClient
 from apex.opportunity.contract import DetectorFinding, Opportunity
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
+import apex.opportunity.engine as opportunity_engine
 from apex.opportunity.engine import _record_finding, compute_fingerprint, run_opportunity_scan
 from apex.scheduler.tasks import run_signal_scan
+from apex.utils.time import utc_from_iso
 
 
 # ------------------------------------------------------------------ helpers
@@ -696,10 +698,10 @@ class _RaisingOn15mCandleStore:
         self._inner = inner
         self._bad_symbol = bad_symbol
 
-    def get_df(self, symbol: str, timeframe: str):
+    def get_df(self, symbol: str, timeframe: str, now_ms=None):
         if symbol == self._bad_symbol and timeframe == "15m":
             raise RuntimeError(f"simulated 15m context fetch failure for {symbol}")
-        return self._inner.get_df(symbol, timeframe)
+        return self._inner.get_df(symbol, timeframe, now_ms=now_ms)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -741,6 +743,209 @@ def test_one_symbols_15m_context_failure_does_not_abort_remaining_symbols(monkey
         pushover = PushoverClient(app_token="fake", user_key="fake")
         signal_summary = asyncio.run(run_signal_scan(conn, store, settings, pushover))
         assert signal_summary.markets_scanned == 2
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ single timestamp authority
+
+class _CapturingCandleStore:
+    """Wraps a real CandleStore, recording every get_df() call's
+    (symbol, timeframe, now_ms) so a test can assert the scan threads one
+    consistent cutoff through every 3m/5m primary + 15m context read.
+    """
+
+    def __init__(self, inner: CandleStore):
+        self._inner = inner
+        self.calls: list[tuple[str, str, object]] = []
+
+    def get_df(self, symbol: str, timeframe: str, now_ms=None):
+        self.calls.append((symbol, timeframe, now_ms))
+        return self._inner.get_df(symbol, timeframe, now_ms=now_ms)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _AdvancingClock:
+    """A fake time.time() returning a strictly increasing sequence that
+    crosses a whole-second boundary between any two successive calls — so a
+    regression that re-reads the wall clock more than once per scan would
+    observe a later second on its second read than its first.
+    """
+
+    def __init__(self, start: float, step: float):
+        self._next = start
+        self._step = step
+        self.call_count = 0
+
+    def __call__(self) -> float:
+        self.call_count += 1
+        t = self._next
+        self._next += self._step
+        return t
+
+
+def test_single_clock_read_drives_every_cutoff_across_a_second_boundary(monkeypatch, tmp_path):
+    """Correction 1: the scan must read the wall clock exactly once and
+    derive both first_detected_at/last_seen_at and every candle-eligibility
+    now_ms from that single instant, never a second/later independent read —
+    even across a whole-second boundary. Every get_df call (3m, 5m primary +
+    15m context) must use the identical now_ms, and no persisted
+    opportunity's first_detected_at may be derived from an instant that
+    postdates the one that gated the candles it is based on.
+    """
+    db_path = str(tmp_path / "single_clock.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+        _load_into_store(store, "BTC", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "3m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "15m", _sweep_reclaim_df())
+        capturing = _CapturingCandleStore(store)
+
+        # Crosses a whole-second boundary between any two successive reads.
+        clock = _AdvancingClock(start=1_700_000_000.900, step=0.300)
+        monkeypatch.setattr(opportunity_engine.time, "time", clock)
+
+        summary = asyncio.run(run_opportunity_scan(conn, capturing, settings))
+        assert summary.findings > 0  # sanity: a real finding was recorded
+
+        # The patched clock was actually exercised (proves the patch took
+        # effect; is_stale() legitimately reads it too and is out of scope
+        # for this correction, so this is a floor, not an exact count).
+        assert clock.call_count >= 1
+
+        # Every get_df call (3m, 5m primary + 15m context) used the identical
+        # now_ms — not independently re-derived per symbol/timeframe.
+        now_ms_values = {c[2] for c in capturing.calls}
+        assert len(now_ms_values) == 1
+        (now_ms,) = now_ms_values
+        assert {(c[0], c[1]) for c in capturing.calls} == {
+            ("BTC", "15m"), ("BTC", "3m"), ("BTC", "5m"),
+        }
+
+        # first_detected_at is derived from that same now_ms — which is
+        # itself already whole-second-floored before being used as any
+        # candle-eligibility cutoff (see run_opportunity_scan) — not an
+        # independent later read (e.g. a reintroduced separate
+        # datetime.now()-based utcnow_iso() call would diverge wildly from
+        # the patched clock here, since it draws from the real system clock
+        # instead).
+        rows = repo.get_opportunities(conn)
+        assert len(rows) >= 1
+        for row in rows:
+            observed_ms = int(utc_from_iso(row["first_detected_at"]).timestamp() * 1000)
+            assert observed_ms == now_ms
+            # The source candle this finding is based on cannot postdate the
+            # persisted first-detection timestamp.
+            assert row["source_candle_close_time"] <= observed_ms
+    finally:
+        close_db()
+
+
+def test_whole_second_floor_withholds_fractional_second_boundary_candle(monkeypatch, tmp_path):
+    """Correction A: now_ms is deliberately floored to the whole second
+    BEFORE being used as the candle-eligibility cutoff (not just for the
+    persisted ISO stamp). Without that floor, a candle whose close boundary
+    falls at h:m:s.500 would already be visible to a scan whose real wall
+    clock reads h:m:s.900 within the same second — even though the
+    persisted whole-second first_detected_at (h:m:s.000) cannot represent an
+    instant later than itself. This uses a real CandleStore with >= 60
+    synthetic eligible history candles plus one extra, non-second-aligned
+    boundary candle, and patched (not real) detectors so the assertion is
+    about exactly which candles reached the detector, not about detector
+    internals.
+    """
+    THREE_MIN_MS = 3 * 60_000
+    db_path = str(tmp_path / "fractional_boundary.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+
+        second_start_s = 1_700_000_000
+        SECOND_MS = second_start_s * 1000
+
+        # >= MIN_CANDLES_REQUIRED history of closed, non-second-aligned 3m
+        # candles, all comfortably closed before the second boundary.
+        n_history = opportunity_engine.MIN_CANDLES_REQUIRED
+        base_open = SECOND_MS - (n_history + 1) * THREE_MIN_MS + 137
+        for i in range(n_history):
+            open_time = base_open + i * THREE_MIN_MS
+            store.update(
+                "BTC", "3m",
+                {
+                    "t": open_time, "T": open_time + THREE_MIN_MS - 1,
+                    "o": "100", "h": "101", "l": "99", "c": "100.5", "v": "10",
+                },
+                persist=False,
+                now_ms=SECOND_MS,
+            )
+
+        # One extra candle whose duration-derived close boundary lands at
+        # SECOND_MS + 500 — after the floored cutoff (SECOND_MS) but before
+        # the real wall clock this test patches below (SECOND_MS + 900).
+        boundary_open_time = SECOND_MS - THREE_MIN_MS + 500
+        store.update(
+            "BTC", "3m",
+            {
+                "t": boundary_open_time, "T": boundary_open_time + THREE_MIN_MS - 1,
+                "o": "100", "h": "101", "l": "99", "c": "999", "v": "10",
+            },
+            persist=False,
+            now_ms=SECOND_MS + 900,  # already past its own boundary in real time
+        )
+
+        captured_dfs: dict[str, pd.DataFrame] = {}
+
+        def fake_compression(symbol, timeframe, df, context_df_15m=None):
+            captured_dfs[timeframe] = df
+            last_open_time = int(df.iloc[-1]["open_time"])
+            return [_make_compression_finding(
+                symbol=symbol,
+                primary_timeframe=timeframe,
+                source_candle_open_time=last_open_time,
+                source_candle_close_time=last_open_time + THREE_MIN_MS,
+                fingerprint_key=f"boundary-{last_open_time}",
+            )]
+
+        def fake_sweep(symbol, timeframe, df, context_df_15m=None):
+            return []
+
+        monkeypatch.setattr(opportunity_engine, "detect_volatility_compression", fake_compression)
+        monkeypatch.setattr(opportunity_engine, "detect_sweep_reclaim", fake_sweep)
+
+        # Real wall clock reads second_start_s + 0.900; the whole-second
+        # cutoff must therefore be SECOND_MS, not SECOND_MS + 900.
+        monkeypatch.setattr(opportunity_engine.time, "time", lambda: second_start_s + 0.900)
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        # Detector calls actually happened with real, non-trivial input —
+        # not a swallowed engine exception silently producing zero findings.
+        assert summary.findings > 0
+        assert "3m" in captured_dfs
+        df_3m = captured_dfs["3m"]
+        assert len(df_3m) >= opportunity_engine.MIN_CANDLES_REQUIRED
+
+        # The fractional-second boundary candle must be absent: its close
+        # boundary (SECOND_MS + 500) is later than the floored cutoff
+        # (SECOND_MS) even though it is earlier than the real wall clock
+        # (SECOND_MS + 900).
+        assert boundary_open_time not in set(df_3m["open_time"])
+
+        rows = repo.get_opportunities(conn)
+        assert len(rows) >= 1
+        for row in rows:
+            observed_ms = int(utc_from_iso(row["first_detected_at"]).timestamp() * 1000)
+            assert observed_ms == SECOND_MS
+            assert row["source_candle_close_time"] <= observed_ms
     finally:
         close_db()
 
