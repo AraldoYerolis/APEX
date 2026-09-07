@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalFeature, SignalObservation, Snooze
+from apex.opportunity.contract import Opportunity
 
 
 def _now_utc() -> str:
@@ -646,3 +647,145 @@ def log_event(
         (level, event_type, message, json.dumps(metadata) if metadata else None),
     )
     conn.commit()
+
+
+# ------------------------------------------------------------------ opportunity_observations
+# TA Opportunity Engine v0.1 — additive, research-only. See
+# src/apex/opportunity/engine.py for the only caller of these functions.
+
+def insert_opportunity(conn: sqlite3.Connection, opportunity: Opportunity) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO opportunity_observations (
+            opportunity_uid, fingerprint, symbol, direction, setup_family,
+            detector_version, contract_version, primary_timeframe, status,
+            research_only, first_detected_at, last_seen_at, occurrence_count,
+            source_candle_open_time, source_candle_close_time,
+            anchor_price, anchor_open_time,
+            evidence_json, warnings_json, measurements_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            opportunity.opportunity_uid,
+            opportunity.fingerprint,
+            opportunity.symbol,
+            opportunity.direction,
+            opportunity.setup_family,
+            opportunity.detector_version,
+            opportunity.contract_version,
+            opportunity.primary_timeframe,
+            opportunity.status,
+            int(opportunity.research_only),
+            opportunity.first_detected_at,
+            opportunity.last_seen_at,
+            opportunity.occurrence_count,
+            opportunity.source_candle_open_time,
+            opportunity.source_candle_close_time,
+            opportunity.anchor_price,
+            opportunity.anchor_open_time,
+            opportunity.evidence_json,
+            opportunity.warnings_json,
+            opportunity.measurements_json,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_active_opportunity_by_fingerprint(
+    conn: sqlite3.Connection, fingerprint: str
+) -> Optional[sqlite3.Row]:
+    """Return the current ACTIVE row for this fingerprint, if any.
+
+    Deliberately does not consider EXPIRED rows a match — see engine.py's
+    fingerprint/dedupe semantics docstring for why fingerprint is not a
+    DB-level unique constraint.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM opportunity_observations
+        WHERE fingerprint=? AND status='ACTIVE'
+        ORDER BY last_seen_at DESC LIMIT 1
+        """,
+        (fingerprint,),
+    ).fetchone()
+
+
+def touch_opportunity(
+    conn: sqlite3.Connection,
+    opportunity_uid: str,
+    *,
+    last_seen_at: str,
+    occurrence_count: int,
+    measurements_json: Optional[str],
+) -> None:
+    """Refresh an existing ACTIVE opportunity on re-detection (dedupe hit)."""
+    conn.execute(
+        """
+        UPDATE opportunity_observations
+        SET last_seen_at=?, occurrence_count=?, measurements_json=?, updated_at=?
+        WHERE opportunity_uid=?
+        """,
+        (last_seen_at, occurrence_count, measurements_json, _now_utc(), opportunity_uid),
+    )
+    conn.commit()
+
+
+def expire_stale_opportunities(
+    conn: sqlite3.Connection, primary_timeframe: str, cutoff_iso: str
+) -> int:
+    """Mark ACTIVE opportunities on this timeframe EXPIRED if not re-confirmed since cutoff_iso.
+
+    Returns the number of rows expired.
+    """
+    now = _now_utc()
+    cur = conn.execute(
+        """
+        UPDATE opportunity_observations
+        SET status='EXPIRED', closed_at=?, updated_at=?
+        WHERE status='ACTIVE' AND primary_timeframe=? AND last_seen_at<?
+        """,
+        (now, now, primary_timeframe, cutoff_iso),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def get_opportunities(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[str] = None,
+    setup_family: Optional[str] = None,
+    symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    primary_timeframe: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 500,
+) -> list[sqlite3.Row]:
+    """Read-only query for reporting. Never used by the engine itself."""
+    conditions = []
+    params: list = []
+    if since:
+        conditions.append("last_seen_at >= ?")
+        params.append(since)
+    if setup_family:
+        conditions.append("setup_family = ?")
+        params.append(setup_family)
+    if symbol:
+        conditions.append("symbol = ?")
+        params.append(symbol.upper())
+    if direction:
+        conditions.append("direction = ?")
+        params.append(direction)
+    if primary_timeframe:
+        conditions.append("primary_timeframe = ?")
+        params.append(primary_timeframe)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    return conn.execute(
+        f"SELECT * FROM opportunity_observations {where} ORDER BY last_seen_at DESC LIMIT ?",
+        params,
+    ).fetchall()

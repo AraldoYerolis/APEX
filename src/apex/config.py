@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Comma-separated: SETUP_FORMING, CONFIRMED_SETUP, or both
     alert_types_enabled: str = "CONFIRMED_SETUP"
 
+    # TA Opportunity Engine (research-only, additive — see src/apex/opportunity/).
+    # Must be explicitly enabled AND requires dry_run_mode=true; never routes
+    # to signal generation, alerting, or trade execution. See CLAUDE.md.
+    opportunity_engine_enabled: bool = False
+
     # FastAPI
     apex_host: str = "127.0.0.1"
     apex_port: int = 8000
