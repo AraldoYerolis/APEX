@@ -81,6 +81,7 @@ class ReconnectingWebSocket:
         max_backoff: float = 60.0,
         chunk_size: int = SUBSCRIPTION_CHUNK_SIZE,
         chunk_delay: float = SUBSCRIPTION_CHUNK_DELAY_SECONDS,
+        diagnostics_enabled: bool = False,
     ) -> None:
         self.url = url
         self.on_message = on_message
@@ -88,9 +89,19 @@ class ReconnectingWebSocket:
         self.max_backoff = max_backoff
         self.chunk_size = chunk_size
         self.chunk_delay = chunk_delay
+        # Bounded, opt-in: only changes the missing-subscription summary's
+        # detail level (see _format_missing). Default-off behavior (grouped
+        # by coin only) is completely unchanged.
+        self.diagnostics_enabled = diagnostics_enabled
         self._running = False
         self._connected = False
         self._task: asyncio.Task | None = None
+        # Bumped each time a connection is actually established (handshake
+        # completed, not merely attempted) — a plain `is_connected` boolean
+        # cannot distinguish "still the same long-lived connection" from
+        # "reconnected since you last looked", which a periodic diagnostics
+        # snapshot needs in order to label a connection-change.
+        self._connection_generation = 0
         # Per-connection diagnostics (reset at the start of every _connect).
         self._connect_started_at: float | None = None
         self._messages_received = 0
@@ -104,6 +115,22 @@ class ReconnectingWebSocket:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def connection_generation(self) -> int:
+        """How many times this manager has actually established a
+        connection (handshake completed), not attempts — a diagnostics
+        snapshot can compare this across samples to detect a reconnect that
+        happened between two snapshots even if `is_connected` reads True at
+        both sample times.
+
+        Bounded, opt-in: only incremented when `diagnostics_enabled` is
+        True (default off) — stays at 0 for the life of the process
+        otherwise, matching every other diagnostics-only counter added to
+        this class. Pre-existing, always-on connection bookkeeping
+        (`messages_received`, `connection_age_seconds`, etc.) is unchanged.
+        """
+        return self._connection_generation
 
     @property
     def messages_received(self) -> int:
@@ -214,24 +241,41 @@ class ReconnectingWebSocket:
             self._acked_subs.add(self._subscription_identity(sub))
 
     @staticmethod
-    def _format_missing(missing: set[str], expected: int) -> str:
+    def _format_missing(missing: set[str], expected: int, detailed: bool = False) -> str:
         """Render missing identities compactly, grouped by coin.
 
         Counts are always exact. Enumeration is skipped entirely when nothing
         was ACKed (that is one fact, not N facts), so a dead socket cannot
         crowd out the partial-miss case that actually identifies a bad symbol.
+
+        `detailed` (only ever True when diagnostics are enabled) breaks each
+        coin's count down by interval instead of one aggregate count per
+        coin, so a gap limited to a single timeframe (e.g. one missing 5m ACK
+        on an otherwise healthy symbol) is distinguishable from a fully
+        missing symbol. Default behavior (`detailed=False`) is unchanged.
         """
         if not missing:
             return "missing_subs=none"
         if len(missing) == expected:
             return "missing_subs=ALL"
 
-        by_coin: dict[str, int] = {}
-        for ident in missing:
-            coin = ident.split(":", 1)[0]
-            by_coin[coin] = by_coin.get(coin, 0) + 1
+        if detailed:
+            by_coin_interval: dict[str, dict[str, int]] = {}
+            for ident in missing:
+                coin, _, interval = ident.partition(":")
+                intervals = by_coin_interval.setdefault(coin, {})
+                intervals[interval] = intervals.get(interval, 0) + 1
+            parts = [
+                f"{coin}({','.join(f'{iv}:{n}' for iv, n in sorted(intervals.items()))})"
+                for coin, intervals in sorted(by_coin_interval.items())
+            ]
+        else:
+            by_coin: dict[str, int] = {}
+            for ident in missing:
+                coin = ident.split(":", 1)[0]
+                by_coin[coin] = by_coin.get(coin, 0) + 1
+            parts = [f"{coin}({n})" for coin, n in sorted(by_coin.items())]
 
-        parts = [f"{coin}({n})" for coin, n in sorted(by_coin.items())]
         text = ",".join(parts)
         if len(text) > MAX_MISSING_REPORT_CHARS:
             kept: list[str] = []
@@ -256,7 +300,7 @@ class ReconnectingWebSocket:
                 return
             expected = self._expected_identities()
             missing = expected - self._acked_subs
-            summary = self._format_missing(missing, len(expected))
+            summary = self._format_missing(missing, len(expected), detailed=self.diagnostics_enabled)
             line = (
                 f"WS subscription reconciliation: expected={len(expected)} "
                 f"acked={len(expected) - len(missing)} missing={len(missing)} {summary}"
@@ -366,6 +410,8 @@ class ReconnectingWebSocket:
             max_queue=WS_RECEIVE_QUEUE_SIZE,
         ) as ws:
             self._connected = True
+            if self.diagnostics_enabled:
+                self._connection_generation += 1
             logger.info("WebSocket connected — subscribing to feeds")
 
             await self._send_subscriptions(ws)
