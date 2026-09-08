@@ -204,9 +204,11 @@ async def test_backoff_semantics_unchanged(monkeypatch):
 class _FakeStore:
     def __init__(self):
         self.updates: list[tuple] = []
+        self.sources: list[str] = []
 
-    def update(self, symbol, interval, data, persist=False):
+    def update(self, symbol, interval, data, persist=False, source="unknown"):
         self.updates.append((symbol, interval, data))
+        self.sources.append(source)
 
 
 async def test_candle_message_still_updates_store(monkeypatch):
@@ -216,6 +218,16 @@ async def test_candle_message_still_updates_store(monkeypatch):
     await main.on_ws_message({"channel": "candle", "data": {"s": "btc", "i": "1m", "c": "1"}})
 
     assert store.updates == [("BTC", "1m", {"s": "btc", "i": "1m", "c": "1"})]
+
+
+async def test_candle_message_is_tagged_with_ws_source(monkeypatch):
+    """Live WS candle traffic must be distinguishable from backfill/preload."""
+    store = _FakeStore()
+    monkeypatch.setattr(main, "_candle_store", store)
+
+    await main.on_ws_message({"channel": "candle", "data": {"s": "btc", "i": "1m", "c": "1"}})
+
+    assert store.sources == ["ws"]
 
 
 async def test_candle_message_without_store_is_noop(monkeypatch):
@@ -621,6 +633,73 @@ def test_record_ack_ignores_malformed_messages():
 
 
 # ============================================================================
+# Candle-feed diagnostics: interval-detailed missing-subscription summary
+#
+# Bounded, opt-in (ReconnectingWebSocket(..., diagnostics_enabled=True)) —
+# default behavior (grouped by coin only, one count per coin) must stay
+# byte-identical to before this change.
+# ============================================================================
+
+def test_format_missing_default_detail_unchanged():
+    """Regression: no `detailed` kwarg -> identical to the pre-diagnostics format."""
+    missing = {"BTC:5m", "BTC:15m"}
+    out = ReconnectingWebSocket._format_missing(missing, expected=10)
+    assert out == "missing_subs=BTC(2)"
+
+
+def test_format_missing_detailed_breaks_down_by_interval():
+    missing = {"BTC:5m", "BTC:15m", "ETH:1m"}
+    out = ReconnectingWebSocket._format_missing(missing, expected=10, detailed=True)
+    assert "BTC(15m:1,5m:1)" in out
+    assert "ETH(1m:1)" in out
+
+
+def test_format_missing_detailed_still_reports_all_and_none_specially():
+    assert ReconnectingWebSocket._format_missing(set(), expected=0, detailed=True) == "missing_subs=none"
+    missing = {"BTC:1m", "ETH:1m"}
+    assert ReconnectingWebSocket._format_missing(missing, expected=2, detailed=True) == "missing_subs=ALL"
+
+
+def test_detailed_missing_report_is_still_bounded():
+    missing = {f"COIN{i:04d}LONGNAME:{tf}" for i in range(400) for tf in ("1m", "5m")}
+    out = ReconnectingWebSocket._format_missing(missing, expected=len(missing) + 1, detailed=True)
+    assert len(out) <= rws.MAX_MISSING_REPORT_CHARS + 100
+    assert "more coins" in out
+
+
+def test_gap_log_stays_coin_only_when_diagnostics_disabled(caplog):
+    """Default (diagnostics_enabled unset/False): unchanged coin-only summary."""
+    subs = _universe_subs()
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)
+    ws._subscriptions_sent = True
+    for sub in subs:
+        if sub["coin"] != "KPEPE":
+            ws._record_ack(_ack(sub))
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()
+
+    line = caplog.records[0].getMessage()
+    assert "KPEPE(4)" in line
+    assert "15m:" not in line and "1m:" not in line
+
+
+def test_gap_log_includes_interval_detail_when_diagnostics_enabled(caplog):
+    subs = _universe_subs()
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs, diagnostics_enabled=True)
+    ws._subscriptions_sent = True
+    for sub in subs:
+        if sub["coin"] != "KPEPE":
+            ws._record_ack(_ack(sub))
+
+    with caplog.at_level(logging.WARNING, logger="apex.data.reconnecting_ws"):
+        ws._log_subscription_gap()
+
+    line = caplog.records[0].getMessage()
+    assert "KPEPE(15m:1,1m:1,3m:1,5m:1)" in line
+
+
+# ============================================================================
 # Real _connect() bookkeeping — no faked _connect, no hand-set counters
 # ============================================================================
 
@@ -700,6 +779,66 @@ async def test_connect_sends_every_subscription_and_counts_frames(monkeypatch):
     assert ws.messages_received == 5                   # exactly once per frame
     assert ws._subscriptions_sent is True
     assert ws.connection_age_seconds is not None
+
+
+async def test_connection_generation_increments_on_real_connect(monkeypatch):
+    """A plain is_connected boolean can't tell "still the same connection"
+    from "reconnected since you last looked" — connection_generation can.
+
+    Bounded, opt-in: only tracked when diagnostics_enabled is True (see
+    test_connection_generation_stays_zero_when_diagnostics_disabled for the
+    default-off case).
+    """
+    subs = [{"type": "candle", "coin": "BTC", "interval": "1m"}]
+    first = _FakeWS([json.dumps({"channel": "pong"})])
+    second = _FakeWS([json.dumps({"channel": "pong"})])
+    _install_fake_ws(monkeypatch, [first, second])
+
+    ws = ReconnectingWebSocket(
+        "wss://x.invalid", _noop_on_message, subs, diagnostics_enabled=True
+    )
+    ws._running = True
+    assert ws.connection_generation == 0
+
+    await ws._connect()
+    assert ws.connection_generation == 1
+
+    await ws._connect()
+    assert ws.connection_generation == 2
+
+
+async def test_connection_generation_stays_zero_when_diagnostics_disabled(monkeypatch):
+    """Default-off: connection_generation must never accumulate state unless
+    diagnostics are explicitly enabled — matching every other diagnostics-
+    only counter added to this class (see get_diagnostics/is_diagnostics_tracked
+    in CandleStore for the identical default-off pattern).
+    """
+    subs = [{"type": "candle", "coin": "BTC", "interval": "1m"}]
+    first = _FakeWS([json.dumps({"channel": "pong"})])
+    second = _FakeWS([json.dumps({"channel": "pong"})])
+    _install_fake_ws(monkeypatch, [first, second])
+
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)  # diagnostics_enabled defaults False
+    ws._running = True
+    assert ws.diagnostics_enabled is False
+
+    await ws._connect()
+    await ws._connect()
+
+    assert ws.connection_generation == 0
+
+
+async def test_connection_generation_not_incremented_on_failed_handshake(monkeypatch):
+    subs = [{"type": "candle", "coin": "BTC", "interval": "1m"}]
+    _install_fake_ws(monkeypatch, [OSError("handshake failed")])
+
+    ws = ReconnectingWebSocket("wss://x.invalid", _noop_on_message, subs)
+    ws._running = True
+
+    with pytest.raises(OSError):
+        await ws._connect()
+
+    assert ws.connection_generation == 0
 
 
 async def test_connect_resets_counters_for_each_connection(monkeypatch):

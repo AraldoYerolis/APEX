@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # to signal generation, alerting, or trade execution. See CLAUDE.md.
     opportunity_engine_enabled: bool = False
 
+    # Candle-feed diagnostics (bounded, local, default-off — see
+    # src/apex/data/candle_store.py and src/apex/data/reconnecting_ws.py).
+    # Adds in-memory counters and a periodic local log snapshot only when
+    # explicitly enabled; never changes candle eligibility, persistence
+    # decisions, subscriptions, or detector inputs.
+    candle_diagnostics_enabled: bool = False
+
     # FastAPI
     apex_host: str = "127.0.0.1"
     apex_port: int = 8000
