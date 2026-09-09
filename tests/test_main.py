@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import types
 from unittest.mock import AsyncMock, MagicMock
 
@@ -855,6 +856,15 @@ class _StubManager:
         self.connection_generation = connection_generation
 
 
+def test_logger_identity_is_fixed_apex_main():
+    """Must be a fixed "apex.main" identity, not __name__-derived — production
+    runs this module via `python -m apex.main`, under which __name__ would be
+    "__main__" rather than "apex.main", diverging from every other context
+    (tests, `from apex import main`) that imports it normally.
+    """
+    assert main.logger.name == "apex.main"
+
+
 async def test_snapshot_job_is_noop_when_disabled(caplog):
     with caplog.at_level(logging.INFO, logger="apex.main"):
         await main.run_candle_diagnostics_snapshot(Settings())
@@ -880,6 +890,25 @@ def test_snapshot_header_reports_no_manager_and_zero_pairs(monkeypatch, caplog):
         "selected=0 tracked=0 observed=0 zero_traffic=0 "
         "allocation_overflow=0 emitted=0 output_truncation=0"
     ) in line
+
+
+def test_snapshot_header_uses_apex_main_logger(monkeypatch, caplog):
+    """The header line is emitted under the fixed "apex.main" logger name
+    (matching production execution via `python -m apex.main`), not whatever
+    __name__ happened to resolve to at import time.
+    """
+    monkeypatch.setattr(main, "_ws_manager", None)
+    monkeypatch.setattr(main, "_ws_symbols", [])
+    monkeypatch.setattr(main, "_candle_store", None)
+    settings = Settings(candle_diagnostics_enabled=True)
+
+    with caplog.at_level(logging.INFO, logger="apex.main"):
+        main._log_candle_diagnostics_snapshot(settings)
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.name == "apex.main"
+    assert record.getMessage().startswith("Candle diagnostics snapshot:")
 
 
 def test_snapshot_reports_disconnected_manager(monkeypatch, caplog):
@@ -1087,6 +1116,17 @@ def test_diagnostics_pair_line_stays_within_cap_for_realistic_mixed_source_value
         assert "...(truncated)" in line
 
 
+def test_diagnostics_pair_line_starts_with_exactly_two_spaces():
+    """Requirement: the line must begin with exactly two ASCII spaces
+    followed immediately by the sanitized symbol/timeframe — not swallowed
+    by whitespace-collapsing sanitization applied to the whole line.
+    """
+    line = main._candle_diagnostics_pair_line("BTC", "1m", None)
+    assert line[:2] == "  "
+    assert line[2] != " "
+    assert line == "  BTC/1m: no traffic observed"
+
+
 def test_diagnostics_pair_line_sanitizes_malicious_identifiers():
     line = main._candle_diagnostics_pair_line(
         "BTC\n2026-01-01 [WARNING] apex.main: FORGED\r\tX\x1b[31m", "1m", None
@@ -1095,6 +1135,54 @@ def test_diagnostics_pair_line_sanitizes_malicious_identifiers():
     assert "\r" not in line
     assert "\t" not in line
     assert "\x1b" not in line
+    # Injection cannot escape or shift the fixed two-space prefix either.
+    assert line[:2] == "  "
+    assert line[2] != " "
+    assert len(line) <= main.MAX_DIAGNOSTIC_LINE_CHARS
+
+
+def test_diagnostics_pair_line_prefix_preserved_at_realistic_cap_length(monkeypatch):
+    """The two-space prefix must survive, and truncation must actually be
+    exercised (not just permitted), when the body exceeds
+    MAX_DIAGNOSTIC_LINE_CHARS. A realistic body is well under the real
+    512-char budget, so this forces a small cap to deterministically drive
+    the body over budget rather than merely asserting `len(line) <= cap`.
+    """
+    from apex.data.candle_store import CandleDiagnostics
+
+    monkeypatch.setattr(main, "MAX_DIAGNOSTIC_LINE_CHARS", 50)
+
+    diag = CandleDiagnostics()
+    diag.source_counts = {"ws": 123_456, "backfill": 98_765, "preload": 54_321, "unknown": 12}
+    diag.source_last_at_ms = {
+        "ws": 1_800_123_456_789,
+        "backfill": 1_800_123_456_000,
+        "preload": 1_800_123_450_000,
+        "unknown": 1_800_123_400_000,
+    }
+    diag.latest_received_open_time = 1_800_123_456_789
+    diag.latest_received_boundary_ms = 1_800_123_540_000
+    diag.latest_received_at_ms = 1_800_123_456_800
+    diag.latest_received_source = "ws"
+    diag.received_eligible_count = 999_999
+    diag.received_noneligible_count = 888_888
+    diag.latest_eligible_open_time = 1_800_123_360_000
+    diag.latest_eligible_boundary_ms = 1_800_123_420_000
+    diag.latest_eligible_at_ms = 1_800_123_420_100
+    diag.latest_eligible_source = "backfill"
+    diag.persist_attempts = 999_999
+    diag.persist_successes = 999_998
+    diag.persist_failures = 1
+    diag.persist_construction_failures = 0
+    diag.rollover_observations = 12_345
+    diag.ignored_late_partial_count = 6_789
+
+    line = main._candle_diagnostics_pair_line("VERYLONGSYMBOLNAME12", "15m", diag)
+
+    assert line[:2] == "  "
+    assert line[2] != " "
+    assert len(line) == main.MAX_DIAGNOSTIC_LINE_CHARS
+    assert line.endswith("...(truncated)")
 
 
 async def test_snapshot_job_contains_failures_and_never_raises(monkeypatch, caplog):
@@ -1111,6 +1199,133 @@ async def test_snapshot_job_contains_failures_and_never_raises(monkeypatch, capl
         await main.run_candle_diagnostics_snapshot(settings)  # must not raise
 
     assert "Candle diagnostics snapshot failed" in caplog.text
+
+
+class _TrackedBrokenStore(_FakeCandleStore):
+    """A snapshot store that reports every pair as diagnostics-tracked, so
+    run_candle_diagnostics_snapshot's membership/is_diagnostics_tracked
+    checks (consulted before get_diagnostics) don't short-circuit the
+    snapshot with an unrelated AttributeError, but whose get_diagnostics
+    always raises the given exception — so the snapshot-failure path
+    deterministically observes exactly that exception.
+    """
+
+    def __init__(self, exc: BaseException):
+        super().__init__()
+        self._exc = exc
+        self.diagnostics_membership_generation = 1
+        self.diagnostics_membership_epoch_started_ms = 1
+
+    def is_diagnostics_tracked(self, symbol: str, timeframe: str) -> bool:
+        return True
+
+    def get_diagnostics(self, symbol: str, timeframe: str):
+        raise self._exc
+
+
+async def test_snapshot_failure_is_warning_visible_at_default_info_level(monkeypatch, caplog):
+    """The contained snapshot failure must be visible at the default INFO
+    level (not require DEBUG to be enabled), contain the exception type, and
+    never leak the exception message or any caller/upstream payload text.
+    """
+
+    monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=True))
+    monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+    monkeypatch.setattr(
+        main,
+        "_candle_store",
+        _TrackedBrokenStore(ValueError("SECRET_MARKER_DO_NOT_LEAK upstream_payload=xyz")),
+    )
+    settings = Settings(candle_diagnostics_enabled=True)
+
+    with caplog.at_level(logging.INFO, logger="apex.main"):
+        await main.run_candle_diagnostics_snapshot(settings)  # must not raise
+
+    matching = [r for r in caplog.records if "Candle diagnostics snapshot failed" in r.getMessage()]
+    assert len(matching) == 1
+    record = matching[0]
+    assert record.levelno == logging.WARNING
+    assert "ValueError" in record.getMessage()
+    assert "SECRET_MARKER_DO_NOT_LEAK" not in caplog.text
+    assert "upstream_payload" not in caplog.text
+
+
+async def test_snapshot_failure_sanitizes_hostile_exception_type_name(monkeypatch, caplog):
+    """A hostile custom metaclass can make `type(exc).__name__` an unbounded,
+    multi-line, control-character-laden, attacker-controlled string instead
+    of a normal class name. The WARNING must stay a single line, bounded to
+    the fixed label plus at most 64 safe ASCII characters, and must never
+    let that value escape the log line or leak embedded secret text.
+    """
+
+    class _HostileNameMeta(type):
+        @property
+        def __name__(cls):
+            return (
+                "Hostile\n2026-01-01 [CRITICAL] apex.main: "
+                "SECRET_MARKER_DO_NOT_LEAK\r\x1b[31m" + "A" * 500
+            )
+
+    class _HostileNameError(Exception, metaclass=_HostileNameMeta):
+        pass
+
+    monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=True))
+    monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+    monkeypatch.setattr(main, "_candle_store", _TrackedBrokenStore(_HostileNameError()))
+    settings = Settings(candle_diagnostics_enabled=True)
+
+    with caplog.at_level(logging.INFO, logger="apex.main"):
+        await main.run_candle_diagnostics_snapshot(settings)  # must not raise
+
+    matching = [r for r in caplog.records if "Candle diagnostics snapshot failed" in r.getMessage()]
+    assert len(matching) == 1
+    record = matching[0]
+    assert record.levelno == logging.WARNING
+
+    message = record.getMessage()
+    assert "\n" not in message
+    assert "\r" not in message
+
+    label = "Candle diagnostics snapshot failed: "
+    assert message.startswith(label)
+    payload = message[len(label) :]
+    assert len(payload) <= 64
+    assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", payload)
+    # The hostile __name__ property fails _safe_exc_type_name's fullmatch
+    # check, so the emitted type must be exactly the "unknown" fallback —
+    # anything else means this test passed on an unrelated exception.
+    assert payload == "unknown"
+
+    assert "SECRET_MARKER_DO_NOT_LEAK" not in caplog.text
+    assert "\x1b" not in caplog.text
+
+
+async def test_snapshot_failure_warning_does_not_change_prune_failure_level(monkeypatch, caplog):
+    """Raising the snapshot-failure path to WARNING must not raise the level
+    of the shared `_log_diag_error` helper used by unrelated prune/membership
+    failures — those stay DEBUG-only.
+    """
+    settings = Settings(candle_diagnostics_enabled=True)
+    timeframes = main._build_timeframes(settings)
+    old_symbols = ["BTC", "ETH"]
+    old_manager = _manager(old_symbols, timeframes)
+    monkeypatch.setattr(main, "_ws_manager", old_manager)
+    monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+
+    class _BrokenPruneStore(_FakeCandleStore):
+        def prune_diagnostics(self, keep: set) -> None:
+            raise RuntimeError("prune boom")
+
+    store = _BrokenPruneStore()
+    monkeypatch.setattr(main, "_candle_store", store)
+    monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+    monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+    with caplog.at_level(logging.INFO, logger="apex.main"):
+        await main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+
+    # Still invisible at INFO — the prune failure was never promoted to WARNING.
+    assert "Candle diagnostics prune failed" not in caplog.text
 
 
 class _FakeScheduler:
