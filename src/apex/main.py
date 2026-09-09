@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import sys
 import time
@@ -33,7 +34,12 @@ from apex.scheduler.tasks import (
     run_universe_refresh,
 )
 
-logger = logging.getLogger(__name__)
+# Fixed name, not __name__: production runs this module via
+# `python -m apex.main`, under which __name__ is "__main__" rather than
+# "apex.main" — a dynamic identity would silently diverge between that and
+# every other context (tests, `from apex import main`) that imports it
+# normally.
+logger = logging.getLogger("apex.main")
 
 # WebSocket diagnostics: upstream payloads are untrusted free text, so cap what
 # reaches the log, and cap how often, so a reconnect loop cannot flood journald.
@@ -98,6 +104,57 @@ def _log_diag_error(label: str, exc: BaseException) -> None:
         exc_type = "unknown"
     try:
         logger.debug(f"Candle diagnostics {label} failed: {exc_type}")
+    except Exception:  # pragma: no cover - diagnostics logging must never break the caller
+        pass
+
+
+_SAFE_EXC_TYPE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _safe_exc_type_name(exc: BaseException) -> str:
+    """Bounded, plain-ASCII exception type name, safe to interpolate as-is.
+
+    `type(exc).__name__` looks like a trusted built-in attribute, but a
+    hostile custom metaclass can turn it into a property that raises,
+    returns a non-string object, or returns attacker-controlled text of
+    unbounded length, non-ASCII content, or embedded newlines/control
+    characters. None of that may reach a log line, so the raw value is used
+    only when it already matches a strict single-token identifier pattern
+    (`fullmatch`, so no partial-match/trailing-newline loophole); anything
+    else — including the access itself raising — falls back to a fixed
+    placeholder.
+    """
+    try:
+        name = type(exc).__name__
+    except Exception:
+        return "unknown"
+    if not isinstance(name, str):
+        return "unknown"
+    if not _SAFE_EXC_TYPE_NAME_RE.fullmatch(name):
+        return "unknown"
+    return name
+
+
+def _log_diag_snapshot_failure(exc: BaseException) -> None:
+    """Fixed-text WARNING for a contained run_candle_diagnostics_snapshot failure.
+
+    Deliberately separate from `_log_diag_error` (which stays DEBUG-only, and
+    is unaffected by this function): a failed snapshot means an entire
+    diagnostics interval produced no output at all, which is worth surfacing
+    at the default INFO level, unlike a single prune/membership failure
+    elsewhere that leaves the snapshot itself unaffected. Same non-throwing,
+    `str(exc)`-free rationale as `_log_diag_error` — only a fixed label and
+    the exception's type name are ever rendered, and here the type name is
+    additionally passed through `_safe_exc_type_name` so a hostile exception
+    type can never inject unbounded, non-ASCII, or multi-line content into
+    this WARNING (visible by default, unlike the DEBUG-only paths).
+    """
+    try:
+        exc_type = _safe_exc_type_name(exc)
+    except Exception:  # pragma: no cover - defensive, _safe_exc_type_name never raises
+        exc_type = "unknown"
+    try:
+        logger.warning(f"Candle diagnostics snapshot failed: {exc_type}")
     except Exception:  # pragma: no cover - diagnostics logging must never break the caller
         pass
 
@@ -835,14 +892,14 @@ def _candle_diagnostics_pair_line(
     sym = _sanitize_diag_text(symbol, MAX_WS_FIELD_CHARS)
     tf = _sanitize_diag_text(timeframe, MAX_WS_FIELD_CHARS)
     if diag is None:
-        line = f"  {sym}/{tf}: no traffic observed"
+        body = f"{sym}/{tf}: no traffic observed"
     else:
         sources = " ".join(
             f"{s}={diag.source_counts.get(s, 0)}@{diag.source_last_at_ms.get(s, '-')}"
             for s in KNOWN_SOURCES
         )
-        line = (
-            f"  {sym}/{tf}: "
+        body = (
+            f"{sym}/{tf}: "
             f"received_open={diag.latest_received_open_time} "
             f"received_boundary={diag.latest_received_boundary_ms} "
             f"received_at={diag.latest_received_at_ms} "
@@ -859,7 +916,15 @@ def _candle_diagnostics_pair_line(
             f"ignored_late={diag.ignored_late_partial_count} "
             f"sources=[{sources}]"
         )
-    return _sanitize_diag_text(line, MAX_DIAGNOSTIC_LINE_CHARS)
+    # The 2-space prefix is fixed and applied AFTER sanitizing the body on
+    # its own reduced budget, rather than sanitizing "  " + body as one
+    # string — _sanitize_diag_text's whitespace-collapse
+    # (" ".join(text.split())) would otherwise strip a leading prefix as
+    # leading whitespace. Reserving 2 chars from the budget up front keeps
+    # the fixed MAX_DIAGNOSTIC_LINE_CHARS total cap exact either way.
+    prefix = "  "
+    body_budget = max(MAX_DIAGNOSTIC_LINE_CHARS - len(prefix), 0)
+    return prefix + _sanitize_diag_text(body, body_budget)
 
 
 def _log_candle_diagnostics_snapshot(settings: Settings) -> None:
@@ -976,15 +1041,17 @@ async def run_candle_diagnostics_snapshot(settings: Settings) -> None:
     Disabled-mode-safe: returns immediately (and is never registered as a
     scheduler job in the first place — see run()) unless
     settings.candle_diagnostics_enabled is true. Any failure building or
-    emitting the snapshot is caught and logged at DEBUG so a diagnostics-only
-    bug can never interrupt the scheduler or any other job.
+    emitting the snapshot is caught and logged as a fixed-format WARNING
+    (visible at the default INFO level — see _log_diag_snapshot_failure) so a
+    diagnostics-only bug can never interrupt the scheduler or any other job,
+    while still being visible without raising log verbosity.
     """
     if not settings.candle_diagnostics_enabled:
         return
     try:
         _log_candle_diagnostics_snapshot(settings)
     except Exception as e:  # pragma: no cover - diagnostics must never break the scheduler
-        _log_diag_error("snapshot", e)
+        _log_diag_snapshot_failure(e)
 
 
 def main() -> None:
