@@ -8,6 +8,7 @@ import re
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import uvicorn
@@ -15,7 +16,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from apex.app import create_app
 from apex.config import Settings, get_settings
-from apex.data.candle_store import KNOWN_SOURCES, CandleDiagnostics, CandleStore
+from apex.data.candle_reconciler import CandleReconciler
+from apex.data.candle_store import (
+    KNOWN_SOURCES,
+    SUPPORTED_RECONCILIATION_TIMEFRAMES,
+    CandleDiagnostics,
+    CandleStore,
+)
 from apex.data.hyperliquid_client import HyperliquidClient
 from apex.data.market_universe import get_upstream_symbol
 from apex.data.reconnecting_ws import (
@@ -84,6 +91,31 @@ _ws_lifecycle_lock: Optional[asyncio.Lock] = None
 # after the process has committed to tearing down.
 _shutdown_started: bool = False
 _ws_log_budget: dict[str, int] = {}
+
+# Closed-candle reconciliation (bounded, local, default-off — see
+# settings.candle_reconciliation_enabled and apex.data.candle_reconciler).
+# Only ever constructed/registered when explicitly enabled.
+_candle_reconciler: Optional[CandleReconciler] = None
+# Bumped exactly once at the very start of every WS-membership rebuild
+# attempt (see run_universe_ws_sync), before backfill or touching the old
+# manager, and again on exit — part of what invalidates any lifecycle token
+# captured before vs. after one full rebuild attempt. Never bumped when a
+# refresh concludes membership is unchanged (nothing to suspend), preserving
+# retained gap-window state untouched in that case.
+_ws_membership_epoch: int = 0
+
+# Explicit fail-closed suspension flag, True for the ENTIRE duration of a WS
+# rebuild attempt (set before the first backfill/replace await, cleared in a
+# finally so every exit path — success, degraded, or old-manager recovery —
+# restores it). This is deliberately a separate check from
+# _ws_membership_epoch/connection_attempt_epoch: a tick whose fetch is
+# admitted and completes entirely WHILE still inside an in-progress rebuild
+# can capture an identical before/after token (same still-connected old
+# manager, same not-yet-bumped-again epoch) even though a write during that
+# window is exactly what the original contract forbids — this flag closes
+# that gap by being checked unconditionally, independent of whether any
+# token field actually changed.
+_reconciliation_suspended: bool = False
 
 
 def _log_diag_error(label: str, exc: BaseException) -> None:
@@ -272,6 +304,77 @@ def _reset_ws_log_budget() -> None:
     _ws_log_budget.clear()
 
 
+class _ConnectionEpochWebSocket(ReconnectingWebSocket):
+    """Small private subclass adding an independent connection-attempt
+    epoch, incremented before every actual connection attempt (not merely
+    every reconnect *success*) — a fresh epoch lets reconciliation detect
+    that a reconnect attempt began between two lifecycle-token checks even
+    if `is_connected` happens to read True at both sample times.
+
+    Deliberately separate from `ReconnectingWebSocket.connection_generation`
+    (diagnostics-only, gated by `diagnostics_enabled`, and only bumped on a
+    completed handshake) — this counter is unconditional and bumped before
+    `super()._connect()` even attempts the handshake, so it also captures a
+    connection attempt that never completes. No other connection-loop
+    behavior is duplicated or overridden.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._connection_attempt_epoch = 0
+
+    @property
+    def connection_attempt_epoch(self) -> int:
+        return self._connection_attempt_epoch
+
+    async def _connect(self) -> None:
+        self._connection_attempt_epoch += 1
+        await super()._connect()
+
+
+@dataclass(frozen=True)
+class WsLifecycleToken:
+    """A snapshot identifying exactly one still-valid WS/membership state,
+    for CandleReconciler to capture before an awaited REST fetch and
+    re-check afterward (see _reconciliation_lifecycle_token). Any field
+    changing — including `manager_id`, which prevents ABA confusion across
+    a stop-then-restart of a *different* manager object — means the two
+    tokens compare unequal and any pending write must be discarded.
+    """
+
+    manager_id: int
+    connection_attempt_epoch: int
+    membership_epoch: int
+
+
+def _reconciliation_lifecycle_token(symbol: str) -> Optional[WsLifecycleToken]:
+    """Fresh lifecycle token for `symbol`, or None if reconciliation must
+    not proceed for it right now: shutdown has begun, a WS rebuild is
+    currently in progress (see _reconciliation_suspended — checked
+    unconditionally, not merely inferred from token-field equality), there
+    is no WS manager, the manager is not connected, the symbol is not in
+    the current subscription set, or (fail-closed) the manager is not an
+    epoch-tracking instance — which should never happen for a
+    reconciliation-enabled runtime (see _build_ws_manager), so its absence
+    is treated as invalid rather than silently skipping the check.
+    """
+    if _shutdown_started or _reconciliation_suspended:
+        return None
+    manager = _ws_manager
+    if manager is None or not manager.is_connected:
+        return None
+    if symbol not in _ws_symbols:
+        return None
+    epoch = getattr(manager, "connection_attempt_epoch", None)
+    if epoch is None:
+        return None
+    return WsLifecycleToken(
+        manager_id=id(manager),
+        connection_attempt_epoch=epoch,
+        membership_epoch=_ws_membership_epoch,
+    )
+
+
 def _get_ws_lifecycle_lock() -> asyncio.Lock:
     """Return the module's WS lifecycle lock, creating it on first use.
 
@@ -421,7 +524,7 @@ def _build_timeframes(settings: Settings) -> list[str]:
 
 
 async def run() -> None:
-    global _candle_store, _ws_manager, _ws_symbols, _shutdown_started
+    global _candle_store, _ws_manager, _ws_symbols, _shutdown_started, _candle_reconciler
 
     settings = get_settings()
 
@@ -466,7 +569,16 @@ async def run() -> None:
 
     # Initialize components
     client = HyperliquidClient(settings.hyperliquid_info_url)
-    _candle_store = CandleStore(conn, diagnostics_enabled=settings.candle_diagnostics_enabled)
+    _candle_store = CandleStore(
+        conn,
+        diagnostics_enabled=settings.candle_diagnostics_enabled,
+        reconciliation_enabled=settings.candle_reconciliation_enabled,
+    )
+    _candle_reconciler = (
+        CandleReconciler(_candle_store, client, token_provider=_reconciliation_lifecycle_token)
+        if settings.candle_reconciliation_enabled
+        else None
+    )
     pushover = PushoverClient(
         app_token=settings.pushover_app_token,
         user_key=settings.pushover_user_key,
@@ -495,6 +607,18 @@ async def run() -> None:
     if settings.candle_diagnostics_enabled:
         _candle_store.set_diagnostics_membership(
             (sym, tf) for sym in desired_ws_symbols for tf in timeframes
+        )
+
+    # Same rationale, entirely independent membership/allocation (see
+    # apex.data.candle_store's reconciliation section): established before
+    # preload/backfill so gap-window tracking is capped against the
+    # intended WS membership rather than creation order.
+    if settings.candle_reconciliation_enabled:
+        _candle_store.set_reconciliation_membership(
+            (sym, tf)
+            for sym in desired_ws_symbols
+            for tf in timeframes
+            if tf in SUPPORTED_RECONCILIATION_TIMEFRAMES
         )
 
     # Preload candles from DB
@@ -590,6 +714,22 @@ async def run() -> None:
             id="candle_diagnostics_snapshot",
         )
 
+    # Closed-candle reconciliation tick — bounded, local, default-off. Gated
+    # here AND inside run_candle_reconciliation_tick itself (same
+    # defense-in-depth pattern as the jobs above). max_instances=1 +
+    # coalesce=True + a minimal misfire_grace_time back up CandleReconciler's
+    # own single-flight guard rather than relying on it alone.
+    if settings.candle_reconciliation_enabled and _candle_reconciler is not None:
+        scheduler.add_job(
+            run_candle_reconciliation_tick,
+            "interval",
+            seconds=_candle_reconciler.config.tick_interval_seconds,
+            id="candle_reconciliation",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
+        )
+
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -618,8 +758,11 @@ async def run() -> None:
         #      sync rebuild holds — so an in-flight rebuild's DB/WS-touching
         #      critical section finishes (or aborts via the shutdown flag)
         #      before the WS manager is torn down here.
-        #   4. Log SHUTDOWN while the connection is still open.
-        #   5. Close the DB last.
+        #   4. Stop the candle reconciler (cancels+awaits any in-flight tick)
+        #      before the DB closes, so no reconciliation write can land on
+        #      an already-closed connection.
+        #   5. Log SHUTDOWN while the connection is still open.
+        #   6. Close the DB last.
         # Each step is wrapped individually so a failure in one never prevents
         # the rest from running (and never produces an unhandled traceback on exit).
         _shutdown_started = True
@@ -635,6 +778,12 @@ async def run() -> None:
                     await _ws_manager.stop()
         except Exception as e:
             logger.warning(f"WebSocket shutdown error: {e}")
+
+        try:
+            if _candle_reconciler is not None:
+                await _candle_reconciler.stop()
+        except Exception as e:
+            logger.warning(f"Candle reconciler shutdown error: {e}")
 
         try:
             repo.log_event(conn, "SHUTDOWN", "APEX stopped")
@@ -657,13 +806,37 @@ def _build_ws_manager(subs: list[dict], settings: Settings) -> ReconnectingWebSo
     rebuild can safely prepare the replacement with this *before* stopping
     the old manager, and only stop the old one once the replacement is
     ready to start. See _start_ws_manager and run_universe_ws_sync.
+
+    Constructs the epoch-tracking `_ConnectionEpochWebSocket` subclass only
+    when reconciliation is actually enabled — an ordinary run never carries
+    the extra counter, and reconciliation's own lifecycle-token check fails
+    closed if it is ever missing on an enabled-reconciliation manager.
     """
-    return ReconnectingWebSocket(
+    manager_cls = (
+        _ConnectionEpochWebSocket if settings.candle_reconciliation_enabled else ReconnectingWebSocket
+    )
+    return manager_cls(
         url=settings.hyperliquid_ws_url,
         on_message=on_ws_message,
         subscriptions=subs,
         diagnostics_enabled=settings.candle_diagnostics_enabled,
     )
+
+
+def _feed_down_reconciliation_cleanup(settings: Settings) -> None:
+    """Confirmed total feed-down (no manager could be started or recovered)
+    must also empty the store's reconciliation membership and drop its
+    pending gap-window/persist-retry state, not only clear _ws_manager/
+    _ws_symbols — otherwise stale targets/pending markers for symbols no
+    longer subscribed to anything would keep being reported/retried. A
+    diagnostics-only failure here must never surface as a failed refresh.
+    """
+    if not settings.candle_reconciliation_enabled or _candle_store is None:
+        return
+    try:
+        _candle_store.prune_reconciliation(set())
+    except Exception as e:
+        _log_diag_error("reconciliation_feed_down_prune", e)
 
 
 def _start_ws_manager(manager: ReconnectingWebSocket) -> None:
@@ -700,7 +873,7 @@ async def run_universe_ws_sync(
     a previously-remembered good membership. See run_universe_refresh's
     docstring in apex.scheduler.tasks.
     """
-    global _ws_manager, _ws_symbols
+    global _ws_manager, _ws_symbols, _ws_membership_epoch, _reconciliation_suspended
 
     scan_symbols = await run_universe_refresh(conn, client, settings)
 
@@ -740,104 +913,151 @@ async def run_universe_ws_sync(
             logger.info("Shutdown started before WS rebuild could proceed; aborting")
             return
 
-        # Preload/backfill newly-added symbols while the OLD manager (if any)
-        # is still running, so existing feeds stay live during this work.
-        if added and _candle_store is not None:
-            # Diagnostic membership is intentionally NOT expanded for these
-            # prospective symbols here — only a confirmed-successful swap
-            # (the replace=True prune_diagnostics call below) ever grows
-            # membership to include them. Expanding it beforehand would let
-            # a failed/aborted rebuild permanently occupy capped allocation
-            # slots with candidates that were never actually subscribed;
-            # this preload/backfill therefore runs untracked for a symbol
-            # not yet in membership (is_diagnostics_tracked is False for it
-            # until the swap succeeds) — a known, documented gap, not a bug.
-            for sym in added:
-                for tf in timeframes:
-                    _candle_store.load_from_db(sym, tf)
-            await backfill_candles(client, _candle_store, added, timeframes)
+        # Suspend any in-flight reconciliation lifecycle token for the full
+        # duration of this rebuild attempt, regardless of how it concludes
+        # (success, degraded, or old-manager recovery). Set BEFORE the first
+        # backfill/replace await and restored in a finally below so every
+        # exit path — including a mid-backfill abort and an exception raised
+        # from the replacement-build/swap logic — unsuspends. Bumped/set
+        # unconditionally (cheap, harmless when reconciliation is disabled)
+        # rather than only when reconciliation is enabled, so enabling it
+        # later never has to reason about stale pre-existing state.
+        _ws_membership_epoch += 1
+        _reconciliation_suspended = True
 
-        if _shutdown_started:
-            logger.info("Shutdown started during WS resync backfill; aborting rebuild")
-            return
-
-        # Prepare the replacement before touching the old manager at all —
-        # construction is side-effect-free, so a failure here (or anything
-        # above) leaves the old feed completely undisturbed.
-        old_manager = _ws_manager
-        subs = build_ws_subscriptions(desired_ws_symbols, timeframes)
-        replacement = _build_ws_manager(subs, settings)
-
-        if old_manager is not None:
-            await old_manager.stop()
-
+        # The ENTIRE protected rebuild region — pre-backfill through
+        # failure/recovery/prune — is under one try/finally so that ANY
+        # exit path, including a BaseException/cancellation raised from
+        # deep inside (e.g. during the replacement.stop() cleanup below),
+        # unconditionally releases suspension exactly once. No inner
+        # handler here swallows BaseException/cancellation itself — only
+        # this outer finally guarantees the release; genuine cancellation
+        # still propagates out of this function unchanged.
         try:
-            _start_ws_manager(replacement)
-        except Exception as replacement_err:
-            logger.error(
-                f"WS replacement failed to start "
-                f"({len(desired_ws_symbols)} symbols desired): {replacement_err}"
-            )
-            try:
-                await replacement.stop()
-            except Exception as cleanup_err:
-                logger.debug(f"Replacement cleanup after failed start: {cleanup_err}")
+            # Preload/backfill newly-added symbols while the OLD manager (if
+            # any) is still running, so existing feeds stay live during this
+            # work.
+            if added and _candle_store is not None:
+                # Diagnostic membership is intentionally NOT expanded for
+                # these prospective symbols here — only a
+                # confirmed-successful swap (the replace=True
+                # prune_diagnostics call below) ever grows membership to
+                # include them. Expanding it beforehand would let a
+                # failed/aborted rebuild permanently occupy capped
+                # allocation slots with candidates that were never actually
+                # subscribed; this preload/backfill therefore runs
+                # untracked for a symbol not yet in membership
+                # (is_diagnostics_tracked is False for it until the swap
+                # succeeds) — a known, documented gap, not a bug.
+                for sym in added:
+                    for tf in timeframes:
+                        _candle_store.load_from_db(sym, tf)
+                await backfill_candles(client, _candle_store, added, timeframes)
 
-            if old_manager is None:
-                # No prior manager and no replacement — explicitly degraded,
-                # never falsely "healthy". _ws_symbols must not go on
-                # claiming a membership nothing is actually subscribed to.
-                _ws_manager = None
-                _ws_symbols = []
+            if _shutdown_started:
+                logger.info("Shutdown started during WS resync backfill; aborting rebuild")
+                return
+
+            # Prepare the replacement before touching the old manager at all
+            # — construction is side-effect-free, so a failure here (or
+            # anything above) leaves the old feed completely undisturbed.
+            old_manager = _ws_manager
+            subs = build_ws_subscriptions(desired_ws_symbols, timeframes)
+            replacement = _build_ws_manager(subs, settings)
+
+            if old_manager is not None:
+                await old_manager.stop()
+
+            try:
+                _start_ws_manager(replacement)
+            except Exception as replacement_err:
                 logger.error(
-                    "WS replacement failed with no prior manager to recover; "
-                    "WS feed is DOWN (degraded, no active manager)"
+                    f"WS replacement failed to start "
+                    f"({len(desired_ws_symbols)} symbols desired): {replacement_err}"
+                )
+                try:
+                    await replacement.stop()
+                except Exception as cleanup_err:
+                    logger.debug(f"Replacement cleanup after failed start: {cleanup_err}")
+
+                if old_manager is None:
+                    # No prior manager and no replacement — explicitly
+                    # degraded, never falsely "healthy". _ws_symbols must
+                    # not go on claiming a membership nothing is actually
+                    # subscribed to.
+                    _ws_manager = None
+                    _ws_symbols = []
+                    _feed_down_reconciliation_cleanup(settings)
+                    logger.error(
+                        "WS replacement failed with no prior manager to recover; "
+                        "WS feed is DOWN (degraded, no active manager)"
+                    )
+                    raise replacement_err
+
+                try:
+                    # Safe: old_manager.stop() above already completed, so
+                    # this starts a fresh task on a fully-stopped instance —
+                    # not a concurrent double-start.
+                    _start_ws_manager(old_manager)
+                except Exception as recovery_err:
+                    _ws_manager = None
+                    _ws_symbols = []
+                    _feed_down_reconciliation_cleanup(settings)
+                    logger.error(
+                        "WS old-feed recovery also failed after replacement failure; "
+                        f"WS feed is DOWN (degraded, no active manager): "
+                        f"replacement_error={replacement_err} recovery_error={recovery_err}"
+                    )
+                    raise recovery_err from replacement_err
+
+                # Recovered the old feed: membership stays at the old,
+                # still-actually-subscribed set. Do not claim the refresh
+                # succeeded — no diagnostics reset, no success log, and the
+                # failure still propagates so the scheduler's own error
+                # handling sees it.
+                _ws_manager = old_manager
+                logger.warning(
+                    f"WS replacement failed; recovered old feed "
+                    f"({len(_ws_symbols)} symbols) — refresh to "
+                    f"{len(desired_ws_symbols)} symbols was NOT applied"
                 )
                 raise replacement_err
-
-            try:
-                # Safe: old_manager.stop() above already completed, so this
-                # starts a fresh task on a fully-stopped instance — not a
-                # concurrent double-start.
-                _start_ws_manager(old_manager)
-            except Exception as recovery_err:
-                _ws_manager = None
-                _ws_symbols = []
-                logger.error(
-                    "WS old-feed recovery also failed after replacement failure; "
-                    f"WS feed is DOWN (degraded, no active manager): "
-                    f"replacement_error={replacement_err} recovery_error={recovery_err}"
-                )
-                raise recovery_err from replacement_err
-
-            # Recovered the old feed: membership stays at the old, still-
-            # actually-subscribed set. Do not claim the refresh succeeded —
-            # no diagnostics reset, no success log, and the failure still
-            # propagates so the scheduler's own error handling sees it.
-            _ws_manager = old_manager
-            logger.warning(
-                f"WS replacement failed; recovered old feed "
-                f"({len(_ws_symbols)} symbols) — refresh to "
-                f"{len(desired_ws_symbols)} symbols was NOT applied"
-            )
-            raise replacement_err
-        else:
-            _ws_manager = replacement
-            _ws_symbols = desired_ws_symbols
-            _reset_ws_log_budget()
-            if settings.candle_diagnostics_enabled and _candle_store is not None:
-                # Bound diagnostic memory to the current membership rather
-                # than accumulating forever across refreshes (no-op if
-                # diagnostics are disabled — guarded above regardless). A
-                # diagnostics-only failure here must never surface as a
-                # failed universe/WS refresh — the swap above already
-                # succeeded.
-                try:
-                    _candle_store.prune_diagnostics(
-                        {(sym, tf) for sym in desired_ws_symbols for tf in timeframes}
-                    )
-                except Exception as e:
-                    _log_diag_error("prune", e)
+            else:
+                _ws_manager = replacement
+                _ws_symbols = desired_ws_symbols
+                _reset_ws_log_budget()
+                if settings.candle_diagnostics_enabled and _candle_store is not None:
+                    # Bound diagnostic memory to the current membership
+                    # rather than accumulating forever across refreshes
+                    # (no-op if diagnostics are disabled — guarded above
+                    # regardless). A diagnostics-only failure here must
+                    # never surface as a failed universe/WS refresh — the
+                    # swap above already succeeded.
+                    try:
+                        _candle_store.prune_diagnostics(
+                            {(sym, tf) for sym in desired_ws_symbols for tf in timeframes}
+                        )
+                    except Exception as e:
+                        _log_diag_error("prune", e)
+                if settings.candle_reconciliation_enabled and _candle_store is not None:
+                    # Same rationale as the diagnostics prune above,
+                    # entirely independent bookkeeping: bound reconciliation
+                    # memory to the current membership, dropping (not
+                    # preserving) state for a removed pair so a later
+                    # re-add starts fresh.
+                    try:
+                        _candle_store.prune_reconciliation(
+                            {
+                                (sym, tf)
+                                for sym in desired_ws_symbols
+                                for tf in timeframes
+                                if tf in SUPPORTED_RECONCILIATION_TIMEFRAMES
+                            }
+                        )
+                    except Exception as e:
+                        _log_diag_error("reconciliation_prune", e)
+        finally:
+            _reconciliation_suspended = False
 
     if not current_set:
         logger.info(
@@ -1052,6 +1272,20 @@ async def run_candle_diagnostics_snapshot(settings: Settings) -> None:
         _log_candle_diagnostics_snapshot(settings)
     except Exception as e:  # pragma: no cover - diagnostics must never break the scheduler
         _log_diag_snapshot_failure(e)
+
+
+async def run_candle_reconciliation_tick() -> None:
+    """Scheduled entry point for one bounded reconciliation drain tick.
+
+    Disabled-mode-safe: returns immediately (and is never registered as a
+    scheduler job in the first place — see run()) unless a CandleReconciler
+    was actually constructed. Also stands down once shutdown has begun,
+    ahead of `_candle_reconciler.stop()` being awaited — no new tick may
+    even start once the process has committed to tearing down.
+    """
+    if _candle_reconciler is None or _shutdown_started:
+        return
+    await _candle_reconciler.tick()
 
 
 def main() -> None:

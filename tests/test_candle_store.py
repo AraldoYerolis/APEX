@@ -1563,3 +1563,618 @@ class TestRolloverSourceRestriction:
         store.update("BTC", "3m", _candle(t1, THREE_MIN_MS), persist=False, now_ms=t1 + 30_000, source="backfill")
 
         assert store.get_diagnostics("BTC", "3m").rollover_observations == 0
+
+
+# =================================================================
+# Closed-candle reconciliation (bounded, opt-in, default off)
+# =================================================================
+
+class TestReconciliationKnownSources:
+    def test_reconciliation_added_to_known_sources(self):
+        assert "reconciliation" in candle_store_module.KNOWN_SOURCES
+
+    def test_reconciliation_source_tracked_in_diagnostics(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), diagnostics_enabled=True)
+        open_time = BASE_MS
+        store.update(
+            "BTC", "3m", _candle(open_time, THREE_MIN_MS),
+            persist=False, now_ms=open_time + THREE_MIN_MS, source="reconciliation",
+        )
+        diag = store.get_diagnostics("BTC", "3m")
+        assert diag.source_counts == {"reconciliation": 1}
+
+
+class TestReconciliationDisabledByDefault:
+    def test_default_constructor_reconciliation_disabled(self, tmp_path):
+        store = _store(tmp_path)
+        assert store.reconciliation_enabled is False
+
+    def test_disabled_mode_allocates_no_targets_ever(self, tmp_path):
+        store = _store(tmp_path)
+        open_time = BASE_MS
+        # A WS bar, then a rollover skipping bars — would create a gap
+        # window if reconciliation were enabled.
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 3 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 3 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_targets() == []
+        assert store.is_reconciliation_tracked("BTC", "1m") is False
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") is None
+
+    def test_disabled_mode_membership_calls_are_noop(self, tmp_path):
+        store = _store(tmp_path)
+        store.set_reconciliation_membership({("BTC", "1m")})  # must not raise
+        assert store.is_reconciliation_tracked("BTC", "1m") is False
+        store.acknowledge_reconciliation_progress("BTC", "1m", BASE_MS)  # must not raise
+        store.prune_reconciliation(set())  # must not raise
+
+    def test_enabled_and_disabled_modes_produce_identical_functional_output(self, tmp_path):
+        """Reconciliation tracking must be purely additive bookkeeping: the
+        same update sequence must produce identical get_df/candle_count
+        output whether reconciliation is enabled or disabled.
+        """
+        open_time = BASE_MS
+        events = [
+            (_candle(open_time, ONE_MIN_MS), open_time + 5_000, "ws"),
+            (_candle(open_time + 3 * ONE_MIN_MS, ONE_MIN_MS), open_time + 3 * ONE_MIN_MS + 5_000, "ws"),
+        ]
+        store_disabled = CandleStore(init_db(str(tmp_path / "disabled.db")), reconciliation_enabled=False)
+        store_enabled = CandleStore(init_db(str(tmp_path / "enabled.db")), reconciliation_enabled=True)
+        store_enabled.set_reconciliation_membership({("BTC", "1m")})
+
+        for candle, now_ms, source in events:
+            store_disabled.update("BTC", "1m", dict(candle), persist=False, now_ms=now_ms, source=source)
+            store_enabled.update("BTC", "1m", dict(candle), persist=False, now_ms=now_ms, source=source)
+
+        assert store_disabled.candle_count("BTC", "1m") == store_enabled.candle_count("BTC", "1m")
+        df_disabled = store_disabled.get_df("BTC", "1m", now_ms=open_time + 999_000)
+        df_enabled = store_enabled.get_df("BTC", "1m", now_ms=open_time + 999_000)
+        assert df_disabled is None and df_enabled is None  # both still forming
+
+
+class TestReconciliationMembership:
+    def test_unsupported_timeframe_filtered_out(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "7m"), ("BTC", "1m")})
+        assert store.is_reconciliation_tracked("BTC", "7m") is False
+        assert store.is_reconciliation_tracked("BTC", "1m") is True
+
+    def test_default_cap_is_120_pairs(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        keys = [(f"SYM{i:04d}", "1m") for i in range(150)]
+        store.set_reconciliation_membership(keys)
+        tracked = sum(1 for k in keys if store.is_reconciliation_tracked(*k))
+        assert tracked == candle_store_module.MAX_RECONCILIATION_PAIRS == 120
+
+    def test_replace_drops_state_for_removed_pair_stale_work_not_reused(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        open_time = BASE_MS
+        store.set_reconciliation_membership({("BTC", "1m")})
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_targets() != []
+
+        store.set_reconciliation_membership(set())  # BTC/1m removed
+        assert store.is_reconciliation_tracked("BTC", "1m") is False
+        assert store.get_reconciliation_targets() == []
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") is None
+
+        # Re-added: must start genuinely fresh, not resume the stale gap.
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=False)
+        assert store.get_reconciliation_targets() == []
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") is None
+
+    def test_retained_pair_history_preserved_across_replace(self, tmp_path):
+        """Unlike the diagnostics membership epoch, a pair that STAYS in
+        membership across a replace keeps its gap window and WS-max marker
+        untouched.
+        """
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        open_time = BASE_MS
+        store.set_reconciliation_membership({("BTC", "1m"), ("ETH", "1m")})
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        targets_before = store.get_reconciliation_targets()
+        assert len(targets_before) == 1
+
+        # Replace membership, dropping ETH but keeping BTC.
+        store.set_reconciliation_membership({("BTC", "1m")})
+
+        targets_after = store.get_reconciliation_targets()
+        assert len(targets_after) == 1
+        assert targets_after[0].start_open_time == targets_before[0].start_open_time
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == open_time + 2 * ONE_MIN_MS
+
+    def test_expand_membership_does_not_drop_existing_pairs(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        store.set_reconciliation_membership({("ETH", "1m")}, replace=False)
+        assert store.is_reconciliation_tracked("BTC", "1m") is True
+        assert store.is_reconciliation_tracked("ETH", "1m") is True
+
+
+class TestReconciliationWsMaxTracking:
+    def test_only_ws_source_advances_max_open(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + ONE_MIN_MS, source="backfill")
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") is None
+
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + ONE_MIN_MS, source="preload")
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") is None
+
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + ONE_MIN_MS, source="ws")
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == open_time
+
+    def test_ws_max_never_regresses_on_out_of_order_receipt(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        t0, t1 = BASE_MS, BASE_MS + ONE_MIN_MS
+        store.update("BTC", "1m", _candle(t1, ONE_MIN_MS), persist=False, now_ms=t1 + ONE_MIN_MS, source="ws")
+        store.update("BTC", "1m", _candle(t0, ONE_MIN_MS), persist=False, now_ms=t1 + ONE_MIN_MS, source="ws")
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == t1
+
+
+class TestReconciliationCandidateDetection:
+    def test_gap_between_forming_bar_and_later_rollover_registers_candidates(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 3 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 3 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        assert targets[0].symbol == "BTC" and targets[0].timeframe == "1m"
+        assert targets[0].start_open_time == open_time
+        assert targets[0].end_open_time == open_time + 2 * ONE_MIN_MS
+
+    def test_already_closed_bar_is_never_registered_as_a_candidate(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        # This bar is fully closed as of its own receive.
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + ONE_MIN_MS, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS, source="ws",
+        )
+        assert store.get_reconciliation_targets() == []
+
+    def test_candidate_elapsed_time_alone_never_promotes_cached_ohlc(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_targets() != []
+        # No update() call at all — merely asking with a far-future now_ms
+        # must never promote the cached (still-forming-when-cached) sample.
+        assert store.get_df("BTC", "1m", now_ms=open_time + 999 * ONE_MIN_MS) is None
+
+
+class TestReconciliationWindowOverflow:
+    def test_window_bounded_to_300_bars_oldest_dropped(self, tmp_path):
+        """A single rollover is itself bounded to registering at most 300
+        candidates (see _record_reconciliation_ws_observation's own scan
+        cap), so overflow trimming inside a single window is only actually
+        exercised once a *second* rollover extends an already-near-cap
+        window further — this seeds exactly that two-rollover sequence.
+        """
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        # First rollover: 250 bars ahead — under the cap, no trim yet.
+        first_jump = open_time + 250 * ONE_MIN_MS
+        store.update(
+            "BTC", "1m", _candle(first_jump, ONE_MIN_MS),
+            persist=False, now_ms=first_jump + 5_000, source="ws",
+        )
+        assert store.reconciliation_overflow_dropped_total == 0
+        # Second rollover: another 100 bars ahead — now overflows the cap.
+        second_jump = first_jump + 100 * ONE_MIN_MS
+        store.update(
+            "BTC", "1m", _candle(second_jump, ONE_MIN_MS),
+            persist=False, now_ms=second_jump + 5_000, source="ws",
+        )
+
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        span_steps = (targets[0].end_open_time - targets[0].start_open_time) // ONE_MIN_MS + 1
+        assert span_steps == candle_store_module.MAX_RECONCILIATION_WINDOW_BARS
+        assert targets[0].start_open_time > open_time  # oldest candidates dropped
+        assert targets[0].dropped_count > 0
+        assert store.reconciliation_overflow_dropped_total == targets[0].dropped_count
+
+
+class TestReconciliationSingleJumpOverflow:
+    def test_single_jump_over_300_bars_keeps_newest_and_counts_older_overflow(self, tmp_path):
+        """Correction C / confirmed F3: a single WS open_time jump spanning
+        more than MAX_RECONCILIATION_WINDOW_BARS candidate slots must keep
+        the NEWEST 300 (nearest the new max), not the oldest — and the
+        older, un-registered remainder must be explicitly counted, never
+        silently dropped by advancing the max marker past it uncounted.
+        """
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+
+        jump_to = open_time + 1000 * ONE_MIN_MS  # 1000-bar jump, > 300 cap
+        store.update(
+            "BTC", "1m", _candle(jump_to, ONE_MIN_MS),
+            persist=False, now_ms=jump_to + 5_000, source="ws",
+        )
+
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == jump_to
+        # 1000 candidate slots total (open_time .. jump_to - 1 step), only
+        # the newest 300 kept -> 700 older ones dropped/counted.
+        assert store.reconciliation_overflow_dropped_total == 700
+
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        # The retained window is the NEWEST 300 slots, i.e. it ends just
+        # before jump_to and starts 300 bars earlier — not at open_time.
+        assert targets[0].end_open_time == jump_to - ONE_MIN_MS
+        assert targets[0].start_open_time == jump_to - 300 * ONE_MIN_MS
+        assert targets[0].start_open_time > open_time  # oldest slice was NOT kept
+
+    def test_big_jump_with_existing_old_window_does_not_double_count_overflow(self, tmp_path):
+        """Coordinator finding: with an EXISTING old compact window already
+        tracked for this pair, a subsequent single WS jump spanning >300
+        candidate slots must count each dropped slot exactly once — not
+        once via the jump-level skip AND again via the per-candidate
+        window trim as the new candidates are added on top of the old one.
+        """
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        # Build an existing compact 200-bar-old window (under cap, no trim).
+        old_window_end = open_time + 200 * ONE_MIN_MS
+        store.update(
+            "BTC", "1m", _candle(old_window_end, ONE_MIN_MS),
+            persist=False, now_ms=old_window_end + 5_000, source="ws",
+        )
+        assert store.reconciliation_overflow_dropped_total == 0
+        targets_before = store.get_reconciliation_targets()
+        assert len(targets_before) == 1
+        old_span = (
+            targets_before[0].end_open_time - targets_before[0].start_open_time
+        ) // ONE_MIN_MS + 1
+        assert old_span == 200
+
+        # Now a single 1000-bar jump from the existing window's end.
+        jump_to = old_window_end + 1000 * ONE_MIN_MS
+        store.update(
+            "BTC", "1m", _candle(jump_to, ONE_MIN_MS),
+            persist=False, now_ms=jump_to + 5_000, source="ws",
+        )
+
+        # Exactly the old 200-bar window plus the 700-bar gap must be
+        # counted, each slot exactly once: 200 + 700 == 900. NOT
+        # 200 + 700 + 700 (double-counted gap) or any other total.
+        assert store.reconciliation_overflow_dropped_total == 900
+
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        span_steps = (targets[0].end_open_time - targets[0].start_open_time) // ONE_MIN_MS + 1
+        assert span_steps == candle_store_module.MAX_RECONCILIATION_WINDOW_BARS
+        assert targets[0].end_open_time == jump_to - ONE_MIN_MS
+        assert targets[0].start_open_time == jump_to - 300 * ONE_MIN_MS
+
+    def test_off_grid_ws_timestamp_does_not_poison_max_tracking(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+
+        off_grid = open_time + ONE_MIN_MS + 1234  # not aligned to the 1m grid
+        store.update(
+            "BTC", "1m", _candle(off_grid, ONE_MIN_MS),
+            persist=False, now_ms=off_grid + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == open_time  # unchanged
+
+    def test_implausible_future_ws_timestamp_does_not_poison_max_tracking(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+
+        far_future = open_time + 999 * ONE_MIN_MS
+        store.update(
+            "BTC", "1m", _candle(far_future, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 5_000, source="ws",  # now_ms barely past open_time
+        )
+        assert store.get_reconciliation_ws_max_open("BTC", "1m") == open_time  # unchanged
+
+
+class TestReconciliationAcknowledgeAndAdvance:
+    def test_late_ws_resolution_advances_leading_edge_without_network(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_targets()[0].start_open_time == open_time
+
+        # Late, now-eligible WS redelivery of the leading candidate.
+        store.update(
+            "BTC", "1m", _candle(open_time, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 5 * ONE_MIN_MS, source="ws",
+        )
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        assert targets[0].start_open_time == open_time + ONE_MIN_MS
+
+    def test_reconciliation_sourced_write_also_advances_window(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + ONE_MIN_MS + 5_000, source="ws",
+        )
+        assert store.get_reconciliation_targets() != []
+
+        store.update(
+            "BTC", "1m", _candle(open_time, ONE_MIN_MS, c="42"),
+            persist=False, now_ms=open_time + ONE_MIN_MS, source="reconciliation",
+        )
+        assert store.get_reconciliation_targets() == []
+
+    def test_acknowledge_advances_past_resolved_prefix(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 3 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 3 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        store.acknowledge_reconciliation_progress("BTC", "1m", open_time + ONE_MIN_MS)
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        assert targets[0].start_open_time == open_time + 2 * ONE_MIN_MS
+
+    def test_acknowledge_dropped_clears_window_and_counts_exhaustion(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        open_time = BASE_MS
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(open_time + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=open_time + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        store.acknowledge_reconciliation_progress("BTC", "1m", open_time + ONE_MIN_MS, dropped=True)
+        assert store.get_reconciliation_targets() == []
+        assert store.reconciliation_exhausted_count == 1
+
+    def test_is_candle_closed_reflects_actual_stored_state(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        open_time = BASE_MS
+        assert store.is_candle_closed("BTC", "1m", open_time) is False
+        store.update("BTC", "1m", _candle(open_time, ONE_MIN_MS), persist=False, now_ms=open_time + ONE_MIN_MS)
+        assert store.is_candle_closed("BTC", "1m", open_time) is True
+
+
+class TestCandleUpdateResult:
+    def test_update_returns_persisted_true_on_success(self, tmp_path):
+        store = _store(tmp_path)
+        result = store.update(
+            "BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS,
+        )
+        assert result.is_closed is True
+        assert result.persisted is True
+
+    def test_update_returns_persisted_false_on_db_failure(self, tmp_path, monkeypatch):
+        store = _store(tmp_path)
+
+        def _broken_upsert(conn, candle):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", _broken_upsert)
+        result = store.update(
+            "BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS,
+        )
+        assert result.is_closed is True
+        assert result.persisted is False
+
+    def test_update_returns_persisted_none_when_not_closed(self, tmp_path):
+        store = _store(tmp_path)
+        result = store.update(
+            "BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + 5_000,
+        )
+        assert result.is_closed is False
+        assert result.persisted is None
+
+    def test_update_returns_persisted_none_when_persist_false(self, tmp_path):
+        store = _store(tmp_path)
+        result = store.update(
+            "BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=False, now_ms=BASE_MS + ONE_MIN_MS,
+        )
+        assert result.is_closed is True
+        assert result.persisted is None
+
+    def test_update_returns_none_for_unusable_open_time(self, tmp_path):
+        store = _store(tmp_path)
+        result = store.update("BTC", "1m", {"T": BASE_MS}, persist=False, now_ms=BASE_MS)
+        assert result is None
+
+    def test_update_returns_ignored_late_partial_flag(self, tmp_path):
+        store = _store(tmp_path)
+        open_time = BASE_MS
+        final = _candle(open_time, ONE_MIN_MS, c="100.9")
+        late_partial = _candle(open_time, ONE_MIN_MS, c="1", closed=False)
+        store.update("BTC", "1m", final, persist=False, now_ms=open_time + ONE_MIN_MS)
+        result = store.update("BTC", "1m", late_partial, persist=False, now_ms=open_time + ONE_MIN_MS + 1_000)
+        assert result.ignored_late_partial is True
+        assert result.is_closed is False
+
+
+class TestPersistPendingRetryBookkeeping:
+    """Remaining-scope item 3: dedicated CandleStore-level coverage of the
+    persist-only retry bookkeeping (get_persist_retry_candidates/
+    retry_persist/drop_persist_pending) — previously only ever exercised
+    indirectly through CandleReconciler's own tests.
+    """
+
+    def _broken_upsert(self, conn, candle):
+        raise RuntimeError("disk full")
+
+    def test_failed_persist_queues_pending_retry_and_success_clears_it(self, tmp_path, monkeypatch):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+
+        store.update("BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS, source="ws")
+        assert store.get_persist_retry_candidates() == [("BTC", "1m", BASE_MS)]
+
+        monkeypatch.undo()
+        outcome = store.retry_persist("BTC", "1m", BASE_MS)
+        assert outcome is True
+        assert store.get_persist_retry_candidates() == []
+
+    def test_retry_persist_returns_none_for_a_never_pending_open_time(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        assert store.retry_persist("BTC", "1m", BASE_MS) is None
+
+    def test_drop_persist_pending_marks_exhausted_and_retains_in_memory_record(self, tmp_path, monkeypatch):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+        store.update("BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS, source="ws")
+
+        assert store.drop_persist_pending("BTC", "1m", BASE_MS) is True
+        assert store.get_persist_retry_candidates() == []
+        assert store.persist_exhausted_total == 1
+        # A no-op the second time — it is genuinely gone, not re-droppable.
+        assert store.drop_persist_pending("BTC", "1m", BASE_MS) is False
+
+        # The in-memory closed record itself is untouched.
+        monkeypatch.undo()
+        df = store.get_df("BTC", "1m", now_ms=BASE_MS + ONE_MIN_MS)
+        assert df is not None
+
+    def test_per_pair_pending_cap_evicts_oldest_and_counts_overflow(self, tmp_path, monkeypatch):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")})
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+
+        cap = candle_store_module.MAX_PERSIST_PENDING_PER_PAIR
+        for i in range(cap + 2):
+            open_time = BASE_MS + i * ONE_MIN_MS
+            store.update(
+                "BTC", "1m", _candle(open_time, ONE_MIN_MS),
+                persist=True, now_ms=open_time + ONE_MIN_MS, source="ws",
+            )
+
+        pending = store.get_persist_retry_candidates()
+        assert len(pending) == cap
+        assert store.persist_pending_overflow_total == 2
+        # The two oldest open_times were evicted, never persisted.
+        pending_opens = {ot for (_, _, ot) in pending}
+        assert BASE_MS not in pending_opens
+        assert BASE_MS + ONE_MIN_MS not in pending_opens
+
+    def test_unsupported_timeframe_never_allocates_persist_pending(self, tmp_path, monkeypatch):
+        """Remaining-scope item 3: an unsupported timeframe has no fixed
+        duration TIMEFRAME_DURATION_MS/SUPPORTED_RECONCILIATION_TIMEFRAMES
+        knows (the two sets are identical), so such a candle can never even
+        become eligible-closed (see `_close_boundary_ms`) — persistence is
+        never attempted at all, and is_reconciliation_tracked is False
+        regardless. Both facts together mean no persist-retry bookkeeping
+        is ever allocated for it, which this pins.
+        """
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+
+        result = store.update("BTC", "7m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS, source="ws")
+
+        assert result.is_closed is False  # no known duration -> never eligible
+        assert result.persisted is None  # persistence never even attempted
+        assert store.is_reconciliation_tracked("BTC", "7m") is False
+        assert store.get_persist_retry_candidates() == []
+
+    def test_pair_outside_capped_membership_never_allocates_persist_pending(self, tmp_path, monkeypatch):
+        """A pair excluded by the MAX_RECONCILIATION_PAIRS cap (never part
+        of the explicit membership) must never grow persist-pending
+        bookkeeping just because reconciliation is enabled globally."""
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("ETH", "1m")})  # BTC/1m deliberately excluded
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+
+        store.update("BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS, source="ws")
+
+        assert store.is_reconciliation_tracked("BTC", "1m") is False
+        assert store.get_persist_retry_candidates() == []
+
+    def test_disabled_reconciliation_never_allocates_persist_pending(self, tmp_path, monkeypatch):
+        store = _store(tmp_path)  # reconciliation_enabled=False
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", self._broken_upsert)
+
+        store.update("BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=True, now_ms=BASE_MS + ONE_MIN_MS, source="ws")
+
+        assert store.get_persist_retry_candidates() == []
+
+
+class TestReconciliationIncarnation:
+    def test_default_incarnation_is_zero_for_never_joined_pair(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        assert store.get_reconciliation_incarnation("BTC", "1m") == 0
+
+    def test_replace_true_mints_fresh_incarnation_only_for_newly_joining_pairs(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=False)
+        first = store.get_reconciliation_incarnation("BTC", "1m")
+
+        # A retained pair across a replace keeps its incarnation unchanged.
+        store.set_reconciliation_membership({("BTC", "1m"), ("ETH", "1m")}, replace=True)
+        assert store.get_reconciliation_incarnation("BTC", "1m") == first
+        eth_incarnation = store.get_reconciliation_incarnation("ETH", "1m")
+        assert eth_incarnation != first
+
+    def test_removed_and_readded_pair_gets_a_new_incarnation(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=True)
+        first = store.get_reconciliation_incarnation("BTC", "1m")
+
+        store.set_reconciliation_membership(set(), replace=True)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=True)
+        second = store.get_reconciliation_incarnation("BTC", "1m")
+
+        assert second != first
+        assert store.get_reconciliation_targets() == []  # no stale target reused
+
+    def test_reconciliation_target_incarnation_matches_store_accessor(self, tmp_path):
+        store = CandleStore(init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=True)
+        store.update("BTC", "1m", _candle(BASE_MS, ONE_MIN_MS), persist=False, now_ms=BASE_MS + 5_000, source="ws")
+        store.update(
+            "BTC", "1m", _candle(BASE_MS + 2 * ONE_MIN_MS, ONE_MIN_MS),
+            persist=False, now_ms=BASE_MS + 2 * ONE_MIN_MS + 5_000, source="ws",
+        )
+        targets = store.get_reconciliation_targets()
+        assert len(targets) == 1
+        assert targets[0].incarnation == store.get_reconciliation_incarnation("BTC", "1m")

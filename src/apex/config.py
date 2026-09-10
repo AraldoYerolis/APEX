@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # decisions, subscriptions, or detector inputs.
     candle_diagnostics_enabled: bool = False
 
+    # Closed-candle reconciliation (bounded, local, default-off — see
+    # src/apex/data/candle_reconciler.py and the reconciliation section of
+    # src/apex/data/candle_store.py). Fetches fresh authoritative REST data
+    # only for bars a live WS rollover has proven are missing; never
+    # promotes a cached forming candle to closed based on elapsed time. All
+    # other tuning (tick interval, fetch/bar caps, retry/backoff) is a
+    # fixed, code-reviewed default in CandleReconciler — not runtime
+    # configuration — per the approved scope for this flag.
+    candle_reconciliation_enabled: bool = False
+
     # FastAPI
     apex_host: str = "127.0.0.1"
     apex_port: int = 8000
