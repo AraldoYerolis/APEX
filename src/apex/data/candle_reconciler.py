@@ -67,6 +67,50 @@ MAX_ATTEMPTS_PER_WINDOW = 3
 # itself bounded to MAX_RECONCILIATION_PAIRS x MAX_PERSIST_PENDING_PER_PAIR).
 MAX_PERSIST_RETRIES_PER_TICK = 5
 
+# Hard cap on the rendered length of a log-only symbol token (see
+# _sanitize_symbol_for_log) — target.symbol itself originates in upstream
+# universe data with no guaranteed character-class or length validation, so
+# the *logged* form alone must never let a newline, control character, or
+# excessively long value forge/flood a journal line.
+_MAX_LOG_SYMBOL_LENGTH = 64
+_SAFE_LOG_SYMBOL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+_LOG_SYMBOL_TRUNCATION_MARKER = "..."
+
+
+def _sanitize_symbol_for_log(symbol: str) -> str:
+    """Render `symbol` as a deterministic, printable-ASCII, length-capped
+    token safe to interpolate into a single log line. Only for the
+    reconciliation_persisted success-event symbol field below — never
+    changes the internal symbol used for fetching, membership, storage, or
+    any algorithmic behavior. Every character outside a small allowlist
+    (letters, digits, '.', '_', '-') is replaced with a fixed \\xHH/\\uHHHH
+    escape (never a literal newline/control byte), so upstream-sourced data
+    can never add a line or otherwise forge/flood the journal. The rendered
+    result never exceeds _MAX_LOG_SYMBOL_LENGTH characters, regardless of
+    how much escaping expansion the input requires.
+    """
+    budget = _MAX_LOG_SYMBOL_LENGTH - len(_LOG_SYMBOL_TRUNCATION_MARKER)
+    parts: list[str] = []
+    length = 0
+    consumed_all = True
+    for ch in symbol:
+        if ch in _SAFE_LOG_SYMBOL_CHARS:
+            piece = ch
+        else:
+            code = ord(ch)
+            piece = f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+        if length + len(piece) > budget:
+            consumed_all = False
+            break
+        parts.append(piece)
+        length += len(piece)
+    rendered = "".join(parts)
+    if not consumed_all:
+        rendered += _LOG_SYMBOL_TRUNCATION_MARKER
+    return rendered
+
 
 def _positive_finite(name: str, value: float, *, minimum: float, maximum: float) -> float:
     if not math.isfinite(value) or value < minimum or value > maximum:
@@ -277,7 +321,31 @@ class CandleReconciler:
         # twice as many ticks as documented.
         self._advance_round_robin(fetches)
 
+        self._log_tick_summary()
+
         return TickOutcome(skipped=False, fetches_attempted=fetches)
+
+    def _log_tick_summary(self) -> None:
+        """Bounded, fixed-field-order, integers-only proof snapshot emitted
+        once per completed tick — the minimum evidence needed to assess
+        whether reconciliation is actually repairing gaps (see module
+        docstring / RECONCILIATION-EFFECTIVENESS-OBSERVABILITY-PROPOSAL.md).
+        Never includes symbols, timeframes, or any per-row data.
+        """
+        c = self.counters
+        pending_gap_windows = len(self.store.get_reconciliation_targets())
+        logger.info(
+            "reconciliation_tick_summary ticks_run=%d fetches_attempted=%d fetches_succeeded=%d "
+            "fetches_failed=%d fetches_deferred_budget=%d fetches_deferred_lifecycle=%d "
+            "rows_persisted=%d rows_persist_retry_queued=%d rows_persist_retry_succeeded=%d "
+            "rows_persist_retry_exhausted=%d rows_rejected_invalid=%d windows_exhausted=%d "
+            "pending_gap_windows=%d",
+            c.ticks_run, c.fetches_attempted, c.fetches_succeeded, c.fetches_failed,
+            c.fetches_deferred_budget, c.fetches_deferred_lifecycle, c.rows_persisted,
+            c.rows_persist_retry_queued, c.rows_persist_retry_succeeded,
+            c.rows_persist_retry_exhausted, c.rows_rejected_invalid, c.windows_exhausted,
+            pending_gap_windows,
+        )
 
     # ------------------------------------------------------- target selection
 
@@ -513,6 +581,7 @@ class CandleReconciler:
                 request_end_open, duration, cutoff_ms, self.config.post_boundary_grace_ms,
             )
 
+        persisted_open_times: list[int] = []
         for open_time in sorted(accepted):
             if self.store.is_candle_closed(target.symbol, target.timeframe, open_time):
                 # Already resolved (e.g. a late WS receipt) — never
@@ -520,7 +589,23 @@ class CandleReconciler:
                 # in this broad range.
                 self.counters.rows_resolved_in_memory += 1
                 continue
-            self._write_row(target.symbol, target.timeframe, accepted[open_time], cutoff_ms)
+            if self._write_row(target.symbol, target.timeframe, accepted[open_time], cutoff_ms):
+                persisted_open_times.append(open_time)
+
+        if persisted_open_times:
+            # One aggregated event per REST response, not per row — bounded
+            # by max_bars_per_request (<=62 open_times) and containing only
+            # safe evidence (no OHLCV/prices/response bodies) so it can
+            # prove a specific missing candle was actually repaired. The
+            # symbol here is rendered through _sanitize_symbol_for_log
+            # (never the raw target.symbol) since it originates in upstream
+            # universe data with no guaranteed character-class/length
+            # validation — every other use of target.symbol in this module
+            # (fetching, membership, storage) is untouched.
+            logger.info(
+                "reconciliation_persisted symbol=%s timeframe=%s open_times=%s",
+                _sanitize_symbol_for_log(target.symbol), target.timeframe, persisted_open_times,
+            )
 
         # Determine the longest resolved contiguous prefix from
         # target.start_open_time, re-checking actual store state (not just
@@ -542,12 +627,17 @@ class CandleReconciler:
             return True
         return False
 
-    def _write_row(self, symbol: str, timeframe: str, row: dict, cutoff_ms: int) -> None:
+    def _write_row(self, symbol: str, timeframe: str, row: dict, cutoff_ms: int) -> bool:
+        """Returns only whether this exact row was actually persisted to the
+        DB — the caller aggregates this into safe (symbol/timeframe/open_time
+        only) evidence, never the row payload itself.
+        """
         result = self.store.update(symbol, timeframe, row, persist=True, now_ms=cutoff_ms, source="reconciliation")
         if result is None:
-            return
+            return False
         if result.persisted is True:
             self.counters.rows_persisted += 1
+            return True
         elif result.persisted is False:
             # No local queueing/payload cache here: CandleStore itself now
             # tracks this (symbol, timeframe, open_time) as pending a
@@ -555,6 +645,7 @@ class CandleReconciler:
             # _drain_pending_persist_retries below reads that bounded index
             # back, never a cached copy of this row.
             self.counters.rows_persist_retry_queued += 1
+        return False
 
     async def _drain_pending_persist_retries(self, monotonic_now: float) -> None:
         """Retry persisting already-validated, already-in-memory-closed
