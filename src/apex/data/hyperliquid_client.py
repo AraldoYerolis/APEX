@@ -147,7 +147,7 @@ class RestRateLimiter:
         *,
         reconciliation: bool = False,
         wait: bool = False,
-        max_wait_seconds: float = 5.0,
+        max_wait_seconds: float = RATE_WINDOW_SECONDS,
     ) -> bool:
         """Attempt to admit a request of `weight`. Non-blocking by default
         (`wait=False`) — returns immediately, admitting or refusing. With
@@ -155,6 +155,18 @@ class RestRateLimiter:
         outside any lock) and retries exactly once more — deliberately not a
         retry loop, to keep any long-lived waiting bounded (see
         "Limit long-lived waiting tasks" requirement).
+
+        The default `max_wait_seconds` is `RATE_WINDOW_SECONDS`: a
+        window-only refusal's own `wait_hint` (see `_time_until_free`) can
+        never exceed the rolling window's width, so this bound is exactly
+        enough to always observe genuine window-freed capacity — never an
+        arbitrary shorter cutoff that would truncate the wait before
+        capacity that is *about to* become available actually does, which
+        previously caused an ordinary call to be misreported as a failed
+        upstream request purely due to its own temporarily-full budget. A
+        refusal caused instead by an active cooldown (429/oversized-response)
+        that outlasts this same bound is still refused after the wait — a
+        documented, bounded fail-closed outcome, not a retry storm.
         """
         admitted, wait_hint = await self._try_reserve(weight, reconciliation)
         if admitted or not wait:
@@ -266,8 +278,11 @@ class HyperliquidClient:
         ticks) and never waits for budget: an unavailable reservation raises
         RestBudgetUnavailable so the caller can defer without this
         consuming a failed-attempt/backoff cycle. A non-reconciliation call
-        preserves its existing capped-retry behavior, waiting briefly for
-        budget before falling back to this attempt's normal failure path.
+        preserves its existing capped-retry behavior, waiting (bounded to
+        the rolling window's width — see RestRateLimiter.acquire) for
+        budget before falling back to this attempt's normal failure path,
+        so a temporarily-full own budget that frees in time is never
+        reported as a failed upstream request.
         """
         effective_retries = 1 if reconciliation else retries
         delay = 1.0
