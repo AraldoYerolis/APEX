@@ -10,6 +10,7 @@ test_hyperliquid_client.py for that).
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -1613,3 +1614,513 @@ class TestLifecycleTokenGating:
 
         assert store.get_df("BTC", "1m", now_ms=cutoff_ms) is None  # response discarded
         assert reconciler.counters.fetches_deferred_lifecycle == 1
+
+
+# =================================================================
+# Reconciliation effectiveness observability
+# =================================================================
+
+class TestPersistedSuccessEvent:
+    """Requirement 2: one bounded, safe-content-only INFO event per REST
+    response that actually persists rows.
+    """
+
+    async def test_success_event_emitted_with_exact_safe_content(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=3, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0"),
+            _rest_row(BASE_MS + ONE_MIN_MS, c="222.0"),
+            _rest_row(BASE_MS + 2 * ONE_MIN_MS, c="333.0"),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert len(success_records) == 1
+        msg = success_records[0].getMessage()
+        assert msg == (
+            "reconciliation_persisted symbol=BTC timeframe=1m "
+            f"open_times=[{BASE_MS}, {BASE_MS + ONE_MIN_MS}, {BASE_MS + 2 * ONE_MIN_MS}]"
+        )
+
+    async def test_no_success_event_when_no_rows_persisted(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[])  # nothing usable in the response
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert success_records == []
+
+    async def test_no_success_event_on_failed_fetch(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=None)  # fetch fails
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert success_records == []
+
+    async def test_one_aggregated_event_per_response_not_per_row(self, tmp_path, caplog):
+        """Six rows in a single response must produce exactly one success
+        event, never six per-row lines."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=6, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 20 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS + i * ONE_MIN_MS, c=str(i)) for i in range(6)
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert len(success_records) == 1
+
+    async def test_success_event_excludes_already_in_memory_resolved_rows(self, tmp_path, caplog):
+        """A row already closed in memory (e.g. a late WS receipt) is
+        skipped entirely (never written, never counted as persisted) — the
+        success event's open_times must reflect only genuine new writes."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=2, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        # Resolve the first bar via WS before the reconciler ever fetches.
+        store.update(
+            "BTC", "1m", _rest_row(BASE_MS, c="999.0"),
+            persist=True, now_ms=cutoff_ms, source="ws",
+        )
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0"),
+            _rest_row(BASE_MS + ONE_MIN_MS, c="222.0"),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert len(success_records) == 1
+        assert success_records[0].getMessage() == (
+            f"reconciliation_persisted symbol=BTC timeframe=1m open_times=[{BASE_MS + ONE_MIN_MS}]"
+        )
+
+    async def test_success_event_never_contains_ohlcv_values(self, tmp_path, caplog):
+        """Sentinel proof: distinctive OHLCV values from the response must
+        never leak into any emitted log record."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        sentinel_close = "918273.645"
+        sentinel_volume = "5566778.899"
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c=sentinel_close, v=sentinel_volume),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        for record in caplog.records:
+            assert sentinel_close not in record.getMessage()
+            assert sentinel_volume not in record.getMessage()
+
+    async def test_success_event_never_contains_credential_or_config_sentinels(self, tmp_path, caplog):
+        """Sentinel proof: a token/credential value visible to the
+        reconciler via its token_provider must never leak into any log."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        secret_token = "sk-super-secret-token-xyz"
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[_rest_row(BASE_MS, c="111.0")])
+        reconciler = _reconciler(
+            store, client, wall_clock_ms=lambda: cutoff_ms,
+            token_provider=lambda symbol: secret_token,
+        )
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        for record in caplog.records:
+            assert secret_token not in record.getMessage()
+
+
+class TestPersistedSuccessEventSymbolSanitization:
+    """Priority correction: target.symbol originates in upstream universe
+    data with no guaranteed character-class or length validation, so the
+    reconciliation_persisted event's symbol field alone (never the internal
+    symbol used for fetching/membership/storage/all algorithmic behavior)
+    must be rendered through a local sanitizer that cannot forge or flood
+    journal lines.
+    """
+
+    async def _tick_and_get_success_message(self, tmp_path, caplog, symbol: str) -> str:
+        store = _store(tmp_path)
+        _make_gap(store, symbol, "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0", symbol=symbol),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            outcome = await reconciler.tick()
+
+        success_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_persisted ")]
+        assert len(success_records) == 1  # still exactly one bounded event per response
+        assert outcome.fetches_attempted == 1
+        return success_records[0].getMessage()
+
+    async def test_newline_cannot_forge_an_extra_journal_line(self, tmp_path, caplog):
+        sentinel = "INJECTED_LINE"
+        malicious_symbol = f"BTC\n{sentinel}"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        assert "\n" not in msg
+        # The raw sentinel, adjoined to a raw newline, must never appear as
+        # a literal newline-prefixed fragment — only its escaped form.
+        assert f"\n{sentinel}" not in msg
+        assert "\\x0a" in msg  # the newline byte is present only escaped
+
+    async def test_carriage_return_is_escaped_not_literal(self, tmp_path, caplog):
+        malicious_symbol = "BTC\rFORGED"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        assert "\r" not in msg
+        assert "\\x0d" in msg
+
+    async def test_tab_is_escaped_not_literal(self, tmp_path, caplog):
+        malicious_symbol = "BTC\tTABBED"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        assert "\t" not in msg
+        assert "\\x09" in msg
+
+    async def test_other_control_and_non_printable_characters_are_escaped(self, tmp_path, caplog):
+        # NUL, BEL, ESC, and U+2028 (LINE SEPARATOR) — a non-ASCII
+        # newline-equivalent codepoint some log viewers/terminals render as
+        # a genuine line break.
+        malicious_symbol = "BTC" + chr(0) + chr(7) + chr(27) + chr(0x2028) + "END"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        for raw_char in ("\x00", "\x07", "\x1b", " "):
+            assert raw_char not in msg
+        assert "\\x00" in msg
+        assert "\\x07" in msg
+        assert "\\x1b" in msg
+        assert "\\u2028" in msg
+
+    async def test_long_symbol_is_capped_and_cannot_flood(self, tmp_path, caplog):
+        from apex.data.candle_reconciler import _MAX_LOG_SYMBOL_LENGTH
+
+        malicious_symbol = "A" * 10_000
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        # Extract exactly the rendered symbol field (up to the next space
+        # before "timeframe=").
+        rendered = msg.split("symbol=", 1)[1].split(" timeframe=", 1)[0]
+        assert len(rendered) <= _MAX_LOG_SYMBOL_LENGTH
+        assert "A" * 10_000 not in msg  # the raw, un-capped sentinel never appears
+
+    async def test_control_chars_plus_excessive_length_combined_stay_bounded(self, tmp_path, caplog):
+        from apex.data.candle_reconciler import _MAX_LOG_SYMBOL_LENGTH
+
+        malicious_symbol = ("\n\r\t" * 5000) + "TAIL_SENTINEL"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        assert "\n" not in msg
+        assert "\r" not in msg
+        assert "\t" not in msg
+        assert "TAIL_SENTINEL" not in msg  # truncated away before the escaped control run ends
+        rendered = msg.split("symbol=", 1)[1].split(" timeframe=", 1)[0]
+        assert len(rendered) <= _MAX_LOG_SYMBOL_LENGTH
+
+    async def test_normal_symbols_remain_readable(self, tmp_path, caplog):
+        for symbol in ("BTC", "kPEPE", "ETH2", "BTC-USD", "BTC.PERP", "sym_01"):
+            caplog.clear()
+            msg = await self._tick_and_get_success_message(tmp_path, caplog, symbol)
+            assert f"symbol={symbol} timeframe=" in msg
+
+    async def test_success_event_still_identifies_the_persisted_open_time_when_sanitized(self, tmp_path, caplog):
+        malicious_symbol = "BTC\nEVIL"
+        msg = await self._tick_and_get_success_message(tmp_path, caplog, malicious_symbol)
+
+        assert f"open_times=[{BASE_MS}]" in msg
+
+    async def test_internal_symbol_used_for_fetch_and_storage_is_unaffected_by_sanitization(self, tmp_path, caplog):
+        """The sanitizer must only ever change the rendered log field — the
+        real symbol keeps driving the upstream request, membership lookup,
+        and DB write exactly as before.
+        """
+        malicious_symbol = "BTC\nEVIL"
+        store = _store(tmp_path)
+        _make_gap(store, malicious_symbol, "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0", symbol=malicious_symbol),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        await reconciler.tick()
+
+        called_symbol = client.get_candle_snapshot.await_args.args[0]
+        assert called_symbol == malicious_symbol  # fetch driven by the raw, unsanitized symbol
+        assert store.is_candle_closed(malicious_symbol, "1m", BASE_MS) is True
+
+
+class TestWriteRowReturnValue:
+    """Requirement 3: the private write helper returns only whether the
+    row was persisted, used by the caller to aggregate safe evidence.
+    """
+
+    def test_write_row_returns_true_on_successful_persist(self, tmp_path):
+        store = _store(tmp_path)
+        client = AsyncMock()
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: BASE_MS + ONE_MIN_MS)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=False)
+
+        result = reconciler._write_row("BTC", "1m", _rest_row(BASE_MS, c="1.0"), BASE_MS + ONE_MIN_MS)
+
+        assert result is True
+        assert reconciler.counters.rows_persisted == 1
+
+    def test_write_row_returns_false_on_persist_failure(self, tmp_path, monkeypatch):
+        import apex.data.candle_store as candle_store_module
+
+        store = _store(tmp_path)
+        client = AsyncMock()
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: BASE_MS + ONE_MIN_MS)
+        store.set_reconciliation_membership({("BTC", "1m")}, replace=False)
+
+        def _broken_upsert(conn, candle):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", _broken_upsert)
+
+        result = reconciler._write_row("BTC", "1m", _rest_row(BASE_MS, c="1.0"), BASE_MS + ONE_MIN_MS)
+
+        assert result is False
+        assert reconciler.counters.rows_persisted == 0
+        assert reconciler.counters.rows_persist_retry_queued == 1
+
+
+class TestTickSummaryEvent:
+    """Requirement 1: one bounded, fixed-field, integers-only INFO summary
+    emitted after every completed tick.
+    """
+
+    async def test_summary_emitted_with_exact_fixed_field_order_and_accurate_counters(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[_rest_row(BASE_MS, c="1.0")])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        summary_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_tick_summary ")]
+        assert len(summary_records) == 1
+        assert summary_records[0].getMessage() == (
+            "reconciliation_tick_summary ticks_run=1 fetches_attempted=1 fetches_succeeded=1 "
+            "fetches_failed=0 fetches_deferred_budget=0 fetches_deferred_lifecycle=0 "
+            "rows_persisted=1 rows_persist_retry_queued=0 rows_persist_retry_succeeded=0 "
+            "rows_persist_retry_exhausted=0 rows_rejected_invalid=0 windows_exhausted=0 "
+            "pending_gap_windows=0"
+        )
+
+    async def test_summary_reflects_pending_gap_windows_after_processing(self, tmp_path, caplog):
+        """A window whose newest candidate is still within grace must
+        remain pending, and the summary's pending_gap_windows must reflect
+        that count exactly (see TestPerCandidateGraceFullTick)."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=3, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 3 * ONE_MIN_MS + 1_000  # third bar's boundary + 1s: inside its grace
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0"),
+            _rest_row(BASE_MS + ONE_MIN_MS, c="222.0"),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        summary_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_tick_summary ")]
+        assert len(summary_records) == 1
+        assert "pending_gap_windows=1" in summary_records[0].getMessage()
+
+    async def test_summary_counters_are_cumulative_across_ticks(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "AAA", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        _make_gap(store, "BBB", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+
+        async def fetch(symbol, *a, **kw):
+            if symbol == "AAA":
+                return [_rest_row(BASE_MS, c="1.0", symbol="AAA")]
+            return None  # BBB fails every time
+
+        client.get_candle_snapshot = AsyncMock(side_effect=fetch)
+        mono = {"t": 0.0}
+        reconciler = _reconciler(
+            store, client, wall_clock_ms=lambda: cutoff_ms, clock=lambda: mono["t"],
+            config=ReconcilerConfig(max_fetches_per_tick=2),
+        )
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()  # AAA resolves; BBB fails (1st attempt)
+        mono["t"] += BACKOFF_SCHEDULE_SECONDS[0] + 0.001
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()  # BBB backoff has elapsed; retries and fails again (2nd attempt)
+
+        summary_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_tick_summary ")]
+        assert len(summary_records) == 2
+        # Second tick's summary must show cumulative totals, not a per-tick delta.
+        assert "ticks_run=2" in summary_records[1].getMessage()
+        assert "fetches_succeeded=1" in summary_records[1].getMessage()
+        assert "fetches_failed=2" in summary_records[1].getMessage()
+
+    async def test_no_summary_for_overlapping_skipped_tick(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        client = AsyncMock()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_fetch(*a, **kw):
+            started.set()
+            await release.wait()
+            return []
+
+        client.get_candle_snapshot = AsyncMock(side_effect=slow_fetch)
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: BASE_MS + 10 * ONE_MIN_MS)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            task = asyncio.create_task(reconciler.tick())
+            await started.wait()
+            overlapping = await reconciler.tick()
+            assert overlapping.skipped is True
+            release.set()
+            await task
+
+        summary_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_tick_summary ")]
+        assert len(summary_records) == 1  # only the completed tick, not the refused overlap
+
+    async def test_no_summary_for_tick_after_stop(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        client = AsyncMock()
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: BASE_MS)
+        await reconciler.stop()
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            outcome = await reconciler.tick()
+
+        assert outcome.skipped is True
+        summary_records = [r for r in caplog.records if r.getMessage().startswith("reconciliation_tick_summary ")]
+        assert summary_records == []
+
+    async def test_no_per_row_info_line_within_max_bars_per_request(self, tmp_path, caplog):
+        """Deterministic boundedness: a full 60-bar response must still
+        produce exactly one summary line and one success line, never one
+        line per row."""
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=60, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 200 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS + i * ONE_MIN_MS, c=str(i)) for i in range(60)
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(info_records) == 2  # exactly one success event + one tick summary
+
+
+class TestReconciliationOutcomesUnchangedByObservability:
+    """Requirement 3/5: the observability additions must not alter any
+    algorithmic outcome — repeat key positive/negative-path assertions with
+    logging enabled to prove behavior is unchanged.
+    """
+
+    async def test_positive_repair_outcome_unchanged(self, tmp_path, caplog):
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=3, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[
+            _rest_row(BASE_MS, c="111.0"),
+            _rest_row(BASE_MS + ONE_MIN_MS, c="222.0"),
+            _rest_row(BASE_MS + 2 * ONE_MIN_MS, c="333.0"),
+        ])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            outcome = await reconciler.tick()
+
+        assert outcome.skipped is False
+        df = store.get_df("BTC", "1m", now_ms=cutoff_ms)
+        closes = dict(zip(df["open_time"], df["close"]))
+        assert closes[BASE_MS] == 111.0
+        assert closes[BASE_MS + ONE_MIN_MS] == 222.0
+        assert closes[BASE_MS + 2 * ONE_MIN_MS] == 333.0
+        assert store.get_reconciliation_targets() == []
+        assert reconciler.counters.rows_persisted == 3
+        assert reconciler.counters.fetches_succeeded == 1
+
+    async def test_persist_failure_retry_outcome_unchanged(self, tmp_path, monkeypatch, caplog):
+        import apex.data.candle_store as candle_store_module
+
+        store = _store(tmp_path)
+        _make_gap(store, "BTC", "1m", BASE_MS, skip_bars=1, base_now_ms=BASE_MS)
+        cutoff_ms = BASE_MS + 10 * ONE_MIN_MS
+        client = AsyncMock()
+        client.get_candle_snapshot = AsyncMock(return_value=[_rest_row(BASE_MS, c="111.0")])
+        reconciler = _reconciler(store, client, wall_clock_ms=lambda: cutoff_ms)
+
+        def _broken_upsert(conn, candle):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(candle_store_module.repo, "upsert_candle", _broken_upsert)
+
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        df = store.get_df("BTC", "1m", now_ms=cutoff_ms)
+        assert df is not None and df.iloc[0]["close"] == 111.0
+        assert reconciler.counters.rows_persisted == 0
+        assert store.get_persist_retry_candidates() == [("BTC", "1m", BASE_MS)]
+
+        monkeypatch.undo()
+        with caplog.at_level(logging.INFO, logger="apex.data.candle_reconciler"):
+            await reconciler.tick()
+
+        assert reconciler.counters.rows_persist_retry_succeeded == 1
+        assert store.get_persist_retry_candidates() == []
