@@ -37,6 +37,9 @@ def _reset_state(monkeypatch):
     monkeypatch.setattr(main, "_shutdown_started", False)
     monkeypatch.setattr(main, "_ws_lifecycle_lock", None)
     monkeypatch.setattr(main, "_candle_store", None)
+    monkeypatch.setattr(main, "_candle_reconciler", None)
+    monkeypatch.setattr(main, "_ws_membership_epoch", 0)
+    monkeypatch.setattr(main, "_reconciliation_suspended", False)
     main._ws_log_budget.clear()
     yield
     main._ws_log_budget.clear()
@@ -1355,7 +1358,9 @@ class _FakeUvicornServer:
 
 
 async def _run_startup_with_mocks(
-    monkeypatch, tmp_path, *, candle_diagnostics_enabled: bool
+    monkeypatch, tmp_path, *,
+    candle_diagnostics_enabled: bool,
+    candle_reconciliation_enabled: bool = False,
 ) -> "_FakeScheduler":
     """Drive the real run() startup path with every external-I/O boundary
     mocked (network refresh/backfill, uvicorn serve, log file setup) so the
@@ -1371,6 +1376,7 @@ async def _run_startup_with_mocks(
         lambda: Settings(
             apex_db_path=str(tmp_path / "apex.db"),
             candle_diagnostics_enabled=candle_diagnostics_enabled,
+            candle_reconciliation_enabled=candle_reconciliation_enabled,
         ),
     )
     monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC"]))
@@ -1415,3 +1421,610 @@ async def test_startup_does_not_set_membership_when_disabled(monkeypatch, tmp_pa
     await _run_startup_with_mocks(monkeypatch, tmp_path, candle_diagnostics_enabled=False)
     assert main._candle_store.diagnostics_enabled is False
     assert main._candle_store.diagnostics_membership_generation == 0
+
+
+# ============================================================================
+# Closed-candle reconciliation: lifecycle token, connection-epoch subclass,
+# scheduler wiring, shutdown (diagnostics off throughout — reconciliation is
+# an entirely independent feature flag).
+# ============================================================================
+
+class _FakeSuperConnect:
+    """Stands in for ReconnectingWebSocket._connect: an awaitable coroutine
+    function with no socket I/O at all, so _ConnectionEpochWebSocket's own
+    override can be tested in isolation.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, *_self_and_args, **kwargs):
+        self.calls += 1
+
+
+class TestConnectionEpochWebSocket:
+    async def test_epoch_increments_before_each_connect_attempt(self, monkeypatch):
+        fake_connect = _FakeSuperConnect()
+        monkeypatch.setattr(ReconnectingWebSocket, "_connect", fake_connect)
+
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        assert manager.connection_attempt_epoch == 0
+
+        await manager._connect()
+        assert manager.connection_attempt_epoch == 1
+        assert fake_connect.calls == 1
+
+        await manager._connect()
+        assert manager.connection_attempt_epoch == 2
+        assert fake_connect.calls == 2
+
+    async def test_epoch_increments_even_if_connect_raises(self, monkeypatch):
+        async def _raising_connect(*a, **kw):
+            raise RuntimeError("handshake failed")
+
+        monkeypatch.setattr(ReconnectingWebSocket, "_connect", _raising_connect)
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        with pytest.raises(RuntimeError):
+            await manager._connect()
+        assert manager.connection_attempt_epoch == 1  # bumped before the attempt, not after success
+
+    def test_plain_reconnecting_websocket_has_no_connection_attempt_epoch_attribute(self):
+        manager = ReconnectingWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        assert not hasattr(manager, "connection_attempt_epoch")
+
+    def test_diagnostics_connection_generation_semantics_unaffected(self, monkeypatch):
+        """The pre-existing diagnostics-only connection_generation counter
+        (gated by diagnostics_enabled, bumped only inside _connect's real
+        handshake path) must be completely untouched by this subclass.
+        """
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+            diagnostics_enabled=True,
+        )
+        assert manager.connection_generation == 0
+        assert manager.connection_attempt_epoch == 0
+
+
+class TestBuildWsManagerReconciliationClass:
+    def test_uses_epoch_tracking_subclass_when_reconciliation_enabled(self):
+        manager = main._build_ws_manager([], Settings(candle_reconciliation_enabled=True))
+        assert isinstance(manager, main._ConnectionEpochWebSocket)
+
+    def test_uses_plain_class_when_reconciliation_disabled(self):
+        manager = main._build_ws_manager([], Settings(candle_reconciliation_enabled=False))
+        assert type(manager) is ReconnectingWebSocket
+
+
+class TestReconciliationLifecycleToken:
+    def test_none_when_shutdown_started(self, monkeypatch):
+        monkeypatch.setattr(main, "_shutdown_started", True)
+        monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=True))
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+    def test_none_when_no_manager(self, monkeypatch):
+        monkeypatch.setattr(main, "_ws_manager", None)
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+    def test_none_when_disconnected(self, monkeypatch):
+        monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=False))
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+    def test_none_when_symbol_not_subscribed(self, monkeypatch):
+        monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=True))
+        monkeypatch.setattr(main, "_ws_symbols", ["ETH"])
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+    def test_fails_closed_when_manager_lacks_connection_attempt_epoch(self, monkeypatch):
+        """A plain ReconnectingWebSocket (no epoch tracking) must never be
+        silently treated as valid — this should never happen in practice
+        for a reconciliation-enabled runtime (see _build_ws_manager), but
+        the check fails closed regardless.
+        """
+        monkeypatch.setattr(main, "_ws_manager", _StubManager(connected=True))
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+    def test_valid_token_for_connected_subscribed_symbol(self, monkeypatch):
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        manager._connected = True
+        monkeypatch.setattr(main, "_ws_manager", manager)
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        monkeypatch.setattr(main, "_ws_membership_epoch", 5)
+
+        token = main._reconciliation_lifecycle_token("BTC")
+
+        assert token is not None
+        assert token.manager_id == id(manager)
+        assert token.connection_attempt_epoch == 0
+        assert token.membership_epoch == 5
+
+    async def test_token_changes_across_a_reconnect(self, monkeypatch):
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        manager._connected = True
+        monkeypatch.setattr(main, "_ws_manager", manager)
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+
+        token_before = main._reconciliation_lifecycle_token("BTC")
+        monkeypatch.setattr(ReconnectingWebSocket, "_connect", _FakeSuperConnect())
+        await manager._connect()  # simulates a reconnect attempt
+        token_after = main._reconciliation_lifecycle_token("BTC")
+
+        assert token_before != token_after
+
+    def test_token_changes_across_manager_replacement_same_membership(self, monkeypatch):
+        """Manager identity alone must invalidate a token across a
+        stop-then-replace with a brand-new instance (ABA protection), even
+        if every other field happened to coincide.
+        """
+        manager_a = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        manager_a._connected = True
+        monkeypatch.setattr(main, "_ws_manager", manager_a)
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        token_a = main._reconciliation_lifecycle_token("BTC")
+
+        manager_b = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        manager_b._connected = True
+        monkeypatch.setattr(main, "_ws_manager", manager_b)
+        token_b = main._reconciliation_lifecycle_token("BTC")
+
+        assert token_a != token_b
+
+
+class TestMembershipEpochBumpOnRebuild:
+    async def test_unchanged_membership_does_not_bump_epoch(self, monkeypatch):
+        settings = Settings()
+        timeframes = main._build_timeframes(settings)
+        symbols = ["BTC", "ETH"]
+        monkeypatch.setattr(main, "_ws_manager", _manager(symbols, timeframes))
+        monkeypatch.setattr(main, "_ws_symbols", symbols)
+        monkeypatch.setattr(main, "_ws_membership_epoch", 3)
+
+        await _sync(monkeypatch, list(symbols))  # identical membership
+
+        assert main._ws_membership_epoch == 3
+
+    async def test_successful_rebuild_bumps_epoch(self, monkeypatch):
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, _timeframes(_settings()))
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+        monkeypatch.setattr(main, "_candle_store", _FakeCandleStore())
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+        monkeypatch.setattr(main, "_ws_membership_epoch", 3)
+
+        await _sync(monkeypatch, ["BTC", "ETH", "SOL"])
+
+        assert main._ws_membership_epoch == 4
+
+    async def test_replacement_failure_and_recovery_still_bumps_epoch(self, monkeypatch):
+        """The epoch bump happens at the top of the rebuild's lock-held
+        section, before the old manager is even touched — it must apply
+        regardless of how the attempt eventually concludes.
+        """
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, _timeframes(_settings()))
+        monkeypatch.setattr(old_manager, "start", MagicMock(return_value=None))
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+        monkeypatch.setattr(main, "_candle_store", _FakeCandleStore())
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+        monkeypatch.setattr(main, "_ws_membership_epoch", 3)
+
+        real_build = main._build_ws_manager
+
+        def build_broken(subs, settings):
+            replacement = real_build(subs, settings)
+            _break_start(monkeypatch, replacement, "replacement start failed")
+            return replacement
+
+        monkeypatch.setattr(main, "_build_ws_manager", build_broken)
+
+        with pytest.raises(RuntimeError, match="replacement start failed"):
+            await _sync(monkeypatch, ["BTC", "ETH", "SOL"])
+
+        assert main._ws_membership_epoch == 4
+
+
+class TestReconciliationSuspendedDuringRebuild:
+    async def test_token_is_none_while_backfill_in_progress_even_with_unchanged_manager_state(self, monkeypatch):
+        """Correction D / rejected F7 blanket-compliance: a tick whose
+        lifecycle token is captured AFTER the epoch bump but WHILE backfill
+        is still awaited must be blocked — even though the old, still-
+        connected manager and its connection_attempt_epoch have not
+        actually changed, so a naive before/after token-equality check alone
+        would NOT catch this.
+        """
+        manager = main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        )
+        manager._connected = True
+        monkeypatch.setattr(main, "_ws_manager", manager)
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        monkeypatch.setattr(main, "_candle_store", _FakeCandleStore())
+
+        backfill_started = asyncio.Event()
+        backfill_release = asyncio.Event()
+
+        async def slow_backfill(client, store, symbols, timeframes):
+            backfill_started.set()
+            await backfill_release.wait()
+
+        monkeypatch.setattr(main, "backfill_candles", slow_backfill)
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH"]))
+
+        task = asyncio.create_task(
+            main.run_universe_ws_sync(object(), AsyncMock(), _settings(), _FakeApp())
+        )
+        await backfill_started.wait()
+
+        # Before/after token fields (manager identity, connection_attempt_
+        # epoch) are unchanged at this instant — the old manager is still
+        # the live one — yet the token must still be refused.
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+        backfill_release.set()
+        await task
+        # Rebuild completed successfully; suspension itself is lifted
+        # afterward (the freshly-swapped-in manager is not yet marked
+        # connected in this test, since .start() is a no-op fixture, so a
+        # full token still requires is_connected -- but suspension no
+        # longer contributes to the None result).
+        assert main._reconciliation_suspended is False
+
+    async def test_pending_persist_retry_deferred_while_suspended(self, monkeypatch):
+        """The same suspension must gate the persist-only retry path too,
+        not merely a fresh REST fetch."""
+        monkeypatch.setattr(main, "_reconciliation_suspended", True)
+        monkeypatch.setattr(main, "_ws_manager", main._ConnectionEpochWebSocket(
+            url="wss://example.invalid/ws", on_message=main.on_ws_message, subscriptions=[],
+        ))
+        main._ws_manager._connected = True
+        monkeypatch.setattr(main, "_ws_symbols", ["BTC"])
+        assert main._reconciliation_lifecycle_token("BTC") is None
+
+
+class TestReconciliationMembershipPruneOnRebuild:
+    async def test_rebuild_prunes_reconciliation_membership_when_enabled(self, monkeypatch, tmp_path):
+        from apex.db.connection import init_db as real_init_db
+        from apex.data.candle_store import CandleStore
+
+        settings = Settings(candle_reconciliation_enabled=True)
+        timeframes = main._build_timeframes(settings)
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, timeframes)
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+
+        store = CandleStore(real_init_db(str(tmp_path / "test.db")), reconciliation_enabled=True)
+        store.set_reconciliation_membership({(sym, tf) for sym in old_symbols for tf in timeframes})
+        monkeypatch.setattr(main, "_candle_store", store)
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+        await main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+
+        from apex.data.candle_store import SUPPORTED_RECONCILIATION_TIMEFRAMES
+        for tf in timeframes:
+            if tf in SUPPORTED_RECONCILIATION_TIMEFRAMES:
+                assert store.is_reconciliation_tracked("SOL", tf) is True
+
+    async def test_rebuild_does_not_prune_reconciliation_when_disabled(self, monkeypatch):
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, _timeframes(_settings()))
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+        store = _FakeCandleStore()
+        monkeypatch.setattr(main, "_candle_store", store)
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+
+        await _sync(monkeypatch, ["BTC", "ETH", "SOL"])  # default settings: reconciliation disabled
+
+        # _FakeCandleStore has no prune_reconciliation method at all — if
+        # main.py called it unconditionally this would raise AttributeError
+        # and fail the test.
+
+
+class TestReconciliationFeedDownAndRecoveryHistory:
+    """Remaining-scope item 3: total feed-down/recovery/retained-history
+    regressions for `_feed_down_reconciliation_cleanup` and its NOT being
+    invoked on a successful old-manager recovery.
+    """
+
+    async def test_recovered_old_feed_retains_reconciliation_membership_and_pending_state(
+        self, monkeypatch
+    ):
+        """A failed replacement that successfully recovers the OLD manager
+        must leave the still-live old reconciliation membership (and any
+        gap window already tracked for it) completely untouched — pruning
+        only ever happens after a confirmed-successful swap, and total
+        feed-down cleanup only ever happens when recovery itself also
+        fails.
+        """
+        from apex.db.connection import init_db as real_init_db
+
+        settings = Settings(candle_reconciliation_enabled=True)
+        timeframes = _timeframes(settings)
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, timeframes)
+        monkeypatch.setattr(old_manager, "stop", AsyncMock(wraps=old_manager.stop))
+        monkeypatch.setattr(old_manager, "start", MagicMock(return_value=None))  # recovery succeeds
+
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+
+        store = CandleStore(real_init_db(":memory:"), reconciliation_enabled=True)
+        store.set_reconciliation_membership({(sym, "1m") for sym in old_symbols})
+        # Seed a genuine tracked gap window for BTC/1m so "retained" means
+        # more than bare membership — the actual candidate state survives.
+        open_time = 1_800_000_000_000
+        store.update("BTC", "1m", {"t": open_time, "T": open_time + 59_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}, persist=False, now_ms=open_time, source="ws")
+        store.update("BTC", "1m", {"t": open_time + 120_000, "T": open_time + 179_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}, persist=False, now_ms=open_time + 120_000, source="ws")
+        assert store.get_reconciliation_targets() != []
+
+        monkeypatch.setattr(main, "_candle_store", store)
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+
+        real_build = main._build_ws_manager
+
+        def build_broken(subs, settings):
+            replacement = real_build(subs, settings)
+            _break_start(monkeypatch, replacement, "replacement start failed")
+            return replacement
+
+        monkeypatch.setattr(main, "_build_ws_manager", build_broken)
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+        with pytest.raises(RuntimeError, match="replacement start failed"):
+            await main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+
+        assert main._ws_manager is old_manager  # recovered, still live
+        assert store.is_reconciliation_tracked("BTC", "1m") is True
+        assert store.get_reconciliation_targets() != []  # gap window untouched
+
+    async def test_total_feed_down_clears_reconciliation_membership_and_pending_state(
+        self, monkeypatch
+    ):
+        """When BOTH the replacement AND old-manager recovery fail, the
+        feed is explicitly down — `_feed_down_reconciliation_cleanup` must
+        empty the store's reconciliation membership (and thus any pending
+        gap window/persist-retry state), not leave stale targets/pending
+        markers for symbols nothing is actually subscribed to any more.
+        """
+        from apex.db.connection import init_db as real_init_db
+
+        settings = Settings(candle_reconciliation_enabled=True)
+        timeframes = _timeframes(settings)
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, timeframes)
+        monkeypatch.setattr(old_manager, "stop", AsyncMock(wraps=old_manager.stop))
+        _break_start(monkeypatch, old_manager, "old-manager recovery start failed")
+
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+
+        store = CandleStore(real_init_db(":memory:"), reconciliation_enabled=True)
+        store.set_reconciliation_membership({(sym, "1m") for sym in old_symbols})
+        open_time = 1_800_000_000_000
+        store.update("BTC", "1m", {"t": open_time, "T": open_time + 59_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}, persist=False, now_ms=open_time, source="ws")
+        store.update("BTC", "1m", {"t": open_time + 120_000, "T": open_time + 179_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}, persist=False, now_ms=open_time + 120_000, source="ws")
+        assert store.get_reconciliation_targets() != []
+
+        monkeypatch.setattr(main, "_candle_store", store)
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+
+        real_build = main._build_ws_manager
+
+        def build_broken(subs, settings):
+            replacement = real_build(subs, settings)
+            _break_start(monkeypatch, replacement, "replacement start failed")
+            return replacement
+
+        monkeypatch.setattr(main, "_build_ws_manager", build_broken)
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+        with pytest.raises(RuntimeError, match="old-manager recovery start failed"):
+            await main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+
+        assert main._ws_manager is None  # explicitly degraded
+        assert store.is_reconciliation_tracked("BTC", "1m") is False
+        assert store.get_reconciliation_targets() == []
+
+
+class TestCancellationDuringFailedReplacementCleanup:
+    async def test_cancellation_during_replacement_stop_cleanup_still_releases_suspension(
+        self, monkeypatch
+    ):
+        """A cancellation raised from inside the failed-replacement
+        `.stop()` cleanup call (see run_universe_ws_sync's outer
+        try/finally docstring: "including a BaseException/cancellation
+        raised from deep inside (e.g. during the replacement.stop()
+        cleanup below)") must still unconditionally release
+        `_reconciliation_suspended` and propagate as genuine cancellation —
+        the narrow `except Exception` around that cleanup call must never
+        swallow it.
+        """
+        settings = Settings(candle_reconciliation_enabled=True)
+        timeframes = _timeframes(settings)
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, timeframes)
+        monkeypatch.setattr(old_manager, "stop", AsyncMock(wraps=old_manager.stop))
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+        monkeypatch.setattr(main, "_candle_store", _FakeCandleStore())
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+        real_build = main._build_ws_manager
+
+        def build_broken(subs, settings):
+            replacement = real_build(subs, settings)
+            _break_start(monkeypatch, replacement, "replacement start failed")
+            monkeypatch.setattr(replacement, "stop", AsyncMock(side_effect=asyncio.CancelledError()))
+            return replacement
+
+        monkeypatch.setattr(main, "_build_ws_manager", build_broken)
+
+        assert main._reconciliation_suspended is False
+        with pytest.raises(asyncio.CancelledError):
+            await main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+
+        assert main._reconciliation_suspended is False  # released despite the cancellation
+
+    async def test_cancellation_while_replacement_stop_cleanup_is_genuinely_blocked(
+        self, monkeypatch
+    ):
+        """Final-gaps pass item 3: unlike the test above (which raises
+        CancelledError directly from a mocked `.stop()`, proving only that
+        `finally` propagation works), this drives a REAL suspended await
+        inside the cleanup call — proving cancellation delivered while
+        `run_universe_ws_sync` is genuinely blocked inside
+        `replacement.stop()` still unconditionally releases
+        `_reconciliation_suspended` and still propagates as cancellation.
+        """
+        settings = Settings(candle_reconciliation_enabled=True)
+        timeframes = _timeframes(settings)
+        old_symbols = ["BTC", "ETH"]
+        old_manager = _manager(old_symbols, timeframes)
+        monkeypatch.setattr(old_manager, "stop", AsyncMock(wraps=old_manager.stop))
+        monkeypatch.setattr(main, "_ws_manager", old_manager)
+        monkeypatch.setattr(main, "_ws_symbols", old_symbols)
+        monkeypatch.setattr(main, "_candle_store", _FakeCandleStore())
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC", "ETH", "SOL"]))
+
+        entered_cleanup = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_stop():
+            entered_cleanup.set()
+            await release_cleanup.wait()  # never set — only cancellation ends this
+
+        real_build = main._build_ws_manager
+
+        def build_broken(subs, settings):
+            replacement = real_build(subs, settings)
+            _break_start(monkeypatch, replacement, "replacement start failed")
+            monkeypatch.setattr(replacement, "stop", AsyncMock(side_effect=blocked_stop))
+            return replacement
+
+        monkeypatch.setattr(main, "_build_ws_manager", build_broken)
+
+        assert main._reconciliation_suspended is False
+        task = asyncio.create_task(
+            main.run_universe_ws_sync(object(), AsyncMock(), settings, _FakeApp())
+        )
+        try:
+            await asyncio.wait_for(entered_cleanup.wait(), timeout=5.0)
+
+            # Still genuinely suspended in the outer try/finally, blocked
+            # deep inside replacement.stop() — not yet unwound.
+            assert main._reconciliation_suspended is True
+            assert task.done() is False
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert task.cancelled() is True  # genuine cancellation, not swallowed
+            assert main._reconciliation_suspended is False  # outer finally still ran
+        finally:
+            if not task.done():  # pragma: no cover - defensive cleanup on assertion failure
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
+class TestReconciliationSchedulerWiring:
+    async def test_scheduler_registers_reconciliation_job_when_enabled(self, monkeypatch, tmp_path):
+        scheduler = await _run_startup_with_mocks(
+            monkeypatch, tmp_path, candle_diagnostics_enabled=False, candle_reconciliation_enabled=True,
+        )
+        assert "candle_reconciliation" in scheduler.job_ids
+        assert scheduler.job_ids.count("candle_reconciliation") == 1
+
+    async def test_scheduler_omits_reconciliation_job_when_disabled(self, monkeypatch, tmp_path):
+        scheduler = await _run_startup_with_mocks(
+            monkeypatch, tmp_path, candle_diagnostics_enabled=False, candle_reconciliation_enabled=False,
+        )
+        assert "candle_reconciliation" not in scheduler.job_ids
+
+    async def test_disabled_reconciliation_constructs_no_reconciler_and_no_extra_state(self, monkeypatch, tmp_path):
+        await _run_startup_with_mocks(
+            monkeypatch, tmp_path, candle_diagnostics_enabled=False, candle_reconciliation_enabled=False,
+        )
+        assert main._candle_reconciler is None
+        assert main._candle_store.reconciliation_enabled is False
+
+    async def test_enabled_reconciliation_constructs_reconciler_with_membership(self, monkeypatch, tmp_path):
+        await _run_startup_with_mocks(
+            monkeypatch, tmp_path, candle_diagnostics_enabled=False, candle_reconciliation_enabled=True,
+        )
+        assert main._candle_reconciler is not None
+        assert main._candle_store.reconciliation_enabled is True
+        assert main._candle_store.is_reconciliation_tracked("BTC", "1m") is True
+
+
+class TestReconciliationTickWrapper:
+    async def test_noop_when_reconciler_is_none(self):
+        await main.run_candle_reconciliation_tick()  # must not raise
+
+    async def test_noop_when_shutdown_started(self, monkeypatch):
+        fake_reconciler = AsyncMock()
+        monkeypatch.setattr(main, "_candle_reconciler", fake_reconciler)
+        monkeypatch.setattr(main, "_shutdown_started", True)
+        await main.run_candle_reconciliation_tick()
+        fake_reconciler.tick.assert_not_called()
+
+    async def test_delegates_to_reconciler_tick(self, monkeypatch):
+        fake_reconciler = AsyncMock()
+        monkeypatch.setattr(main, "_candle_reconciler", fake_reconciler)
+        await main.run_candle_reconciliation_tick()
+        fake_reconciler.tick.assert_awaited_once()
+
+
+class TestReconciliationShutdown:
+    async def test_run_shutdown_calls_reconciler_stop(self, monkeypatch, tmp_path):
+        fake_scheduler = _FakeScheduler()
+        monkeypatch.setattr(main, "AsyncIOScheduler", lambda: fake_scheduler)
+        monkeypatch.setattr(main, "configure_logging", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            main, "get_settings",
+            lambda: Settings(
+                apex_db_path=str(tmp_path / "apex.db"), candle_reconciliation_enabled=True,
+            ),
+        )
+        monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC"]))
+        monkeypatch.setattr(main, "backfill_candles", AsyncMock())
+
+        stop_spy = AsyncMock()
+
+        class _ServeThenCaptureReconciler:
+            def __init__(self, config):
+                self.config = config
+
+            async def serve(self):
+                # Reconciler exists by now (constructed during startup);
+                # patch its stop() before run()'s finally block runs.
+                monkeypatch.setattr(main._candle_reconciler, "stop", stop_spy)
+
+        monkeypatch.setattr(main.uvicorn, "Server", _ServeThenCaptureReconciler)
+
+        await main.run()
+
+        stop_spy.assert_awaited_once()

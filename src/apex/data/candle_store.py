@@ -147,12 +147,105 @@ def _now_ms() -> int:
 # Finite, bounded set of diagnostic source labels — an unrecognized/hostile
 # caller-supplied `source` string is folded into "unknown" rather than
 # growing `source_counts`/`source_last_at_ms` without bound.
-KNOWN_SOURCES = ("ws", "backfill", "preload", "unknown")
+KNOWN_SOURCES = ("ws", "backfill", "preload", "reconciliation", "unknown")
 
 # Bound on distinct (symbol, timeframe) pairs a CandleStore will ever
 # allocate diagnostics for, regardless of how many are ever observed or how
 # many are named by set_diagnostics_membership().
 MAX_DIAGNOSTIC_PAIRS = 120
+
+# ---------------------------------------------------------------------------
+# Closed-candle reconciliation (bounded, opt-in, default off)
+# ---------------------------------------------------------------------------
+# Tracks, per (symbol, timeframe), a single compact "gap window" of candidate
+# missing closed bars — bars a strictly-newer live WS open_time has proven
+# must exist but which this store has never recorded as closed. This is
+# purely bookkeeping: it never fetches anything itself (that is
+# apex.data.candle_reconciler.CandleReconciler's job) and never promotes a
+# cached forming candle to closed based on elapsed time alone — the existing
+# _is_eligible_closed boundary check is completely unchanged and remains the
+# sole authority over what get_df()/persistence expose as closed.
+#
+# Only the four timeframes this store already knows a fixed duration for are
+# ever tracked; membership is independently capped and pruned, separate from
+# (and never reset by) the diagnostics membership epoch above.
+SUPPORTED_RECONCILIATION_TIMEFRAMES = frozenset({"1m", "3m", "5m", "15m"})
+
+# Bound on distinct (symbol, timeframe) pairs ever tracked for reconciliation
+# gap windows, independent of MAX_DIAGNOSTIC_PAIRS.
+MAX_RECONCILIATION_PAIRS = 120
+
+# Bound on how many bar-slots (steps of the pair's own timeframe duration) a
+# single pair's gap window may span. A rollover that would extend it further
+# drops the oldest (earliest) overflow slots rather than growing unbounded.
+MAX_RECONCILIATION_WINDOW_BARS = 300
+
+# Bound on how many distinct open_times per (symbol, timeframe) pair are ever
+# kept pending a persist-only retry (see retry_persist/get_persist_retry_
+# candidates below) — independent of, and much smaller than, the 300-bar gap
+# window cap. A pathologically-long DB outage evicts its oldest pending
+# open_time rather than growing without bound; that dropped entry is never
+# retried again and is counted (persist_pending_overflow_total), never
+# silently treated as persisted.
+MAX_PERSIST_PENDING_PER_PAIR = 5
+
+
+@dataclass
+class ReconciliationGapWindow:
+    """One pair's compact coalesced candidate range: [start_open_time,
+    end_open_time] inclusive, at the pair's own fixed timeframe step. Does
+    not itself enumerate which slots within the range are still missing —
+    apex.data.candle_reconciler re-checks each candidate's actual recorded
+    state (see CandleStore.is_candle_closed) before ever fetching/writing.
+    """
+
+    start_open_time: int
+    end_open_time: int
+    first_seen_ms: int
+    dropped_count: int = 0
+
+
+@dataclass(frozen=True)
+class ReconciliationTarget:
+    """Read-only snapshot of one pair's current gap window, for a caller
+    (CandleReconciler) to decide what to fetch. Never mutable, never shared
+    with the store's own live dict.
+
+    `incarnation` is a small bounded per-pair token (see
+    CandleStore._reconciliation_pair_incarnation) that changes whenever this
+    exact (symbol, timeframe) pair is removed from reconciliation membership
+    and later re-added — so a caller keying its own retry/backoff state by
+    (symbol, timeframe) can detect that a coincidentally-matching
+    start_open_time does NOT mean the same logical gap window, even across
+    a remove+readd between ticks.
+    """
+
+    symbol: str
+    timeframe: str
+    start_open_time: int
+    end_open_time: int
+    first_seen_ms: int
+    dropped_count: int
+    incarnation: int = 0
+
+
+@dataclass(frozen=True)
+class CandleUpdateResult:
+    """Backwards-compatible richer outcome of one `update()` call.
+
+    Existing callers ignore this return value entirely (update() previously
+    always implicitly returned None) so adding it is additive. `persisted`
+    is None when persistence was never attempted (not closed, or
+    `persist=False`); True/False only for an actual attempted repository
+    call — distinct from `is_closed`, which reflects the in-memory decision
+    alone and is true regardless of whether the DB write actually succeeded.
+    """
+
+    open_time: Optional[int]
+    is_closed: bool
+    ignored_late_partial: bool = False
+    persisted: Optional[bool] = None
+
 
 def _log_diag_error(context: str, exc: BaseException) -> None:
     """Fixed-text, non-throwing diagnostics-failure log line.
@@ -368,6 +461,32 @@ def _is_eligible_closed(
     return now_ms >= boundary
 
 
+def is_eligible_closed(
+    open_time: Optional[int], close_time: Optional[int], timeframe: str, now_ms: int
+) -> bool:
+    """Public wrapper around this store's own closed-candle eligibility
+    predicate, for a caller (apex.data.candle_reconciler.CandleReconciler)
+    that has no nonstandard closed/is_closed flag to consider — REST
+    candleSnapshot rows carry none (see module docstring) — so there is no
+    `raw_flag` to pass. Exists so that caller never implements its own,
+    potentially weaker, close test.
+    """
+    return _is_eligible_closed(None, open_time, close_time, timeframe, now_ms)
+
+
+def close_boundary_ms(
+    open_time: Optional[int], close_time: Optional[int], timeframe: str
+) -> Optional[int]:
+    """Public wrapper around this store's own close-boundary calculation
+    (see `_close_boundary_ms`), for a caller that needs the boundary value
+    itself rather than just a closed/not-closed verdict — e.g.
+    apex.data.candle_reconciler.CandleReconciler layering its own additional
+    post-boundary grace buffer on top of (never instead of) this store's
+    eligibility authority.
+    """
+    return _close_boundary_ms(open_time, close_time, timeframe)
+
+
 @dataclass
 class CandleKey:
     symbol: str
@@ -375,7 +494,12 @@ class CandleKey:
 
 
 class CandleStore:
-    def __init__(self, conn: sqlite3.Connection, diagnostics_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        diagnostics_enabled: bool = False,
+        reconciliation_enabled: bool = False,
+    ) -> None:
         self._conn = conn
         # {(symbol, timeframe): deque of dicts sorted oldest-first}
         self._data: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -401,9 +525,64 @@ class CandleStore:
         # replace=True call.
         self._diagnostics_membership_epoch_started_ms: Optional[int] = None
 
+        # Bounded, opt-in closed-candle reconciliation tracking (see module
+        # docstring section above). Disabled by default: no per-pair
+        # tracking dict is even allocated, and no ordinary ingestion
+        # decision (eligibility, persistence, get_df output) ever changes
+        # based on this flag — it only gates whether gap-window bookkeeping
+        # happens alongside the existing logic. Entirely independent of
+        # diagnostics: never allocated/reset by a diagnostics membership
+        # epoch, and vice versa.
+        self._reconciliation_enabled = reconciliation_enabled
+        self._reconciliation_ws_max_open: dict[tuple[str, str], int] = {}
+        self._reconciliation_windows: dict[tuple[str, str], ReconciliationGapWindow] = {}
+        self._reconciliation_membership: Optional[set[tuple[str, str]]] = None
+        self._reconciliation_overflow_dropped_total: int = 0
+        self._reconciliation_exhausted_count: int = 0
+        # Persist-only retry bookkeeping (see retry_persist/_track_persist_
+        # pending below): {(symbol, timeframe): {open_time, ...}}, no cached
+        # payload — a retry always reads the CURRENT frozen in-memory record
+        # for that open_time, never a stale copy.
+        self._persist_pending: dict[tuple[str, str], set[int]] = {}
+        self._persist_pending_overflow_total: int = 0
+        self._persist_exhausted_total: int = 0
+        # Bumped on every `replace=True` set_reconciliation_membership call
+        # (mirrors diagnostics_membership_generation) — used only to mint a
+        # fresh per-pair incarnation token below, never itself exposed to
+        # bound anything on its own.
+        self._reconciliation_membership_epoch: int = 0
+        # Bounded (pruned in lockstep with membership, exactly like
+        # _reconciliation_windows/_reconciliation_ws_max_open/_persist_
+        # pending above) per-pair incarnation token — see ReconciliationTarget
+        # docstring. A key only ever gets a NEW value here when it (re)enters
+        # membership after not being present immediately prior, never on an
+        # unchanged/retained refresh (so retained-pair retry age/gaps are
+        # never spuriously invalidated).
+        self._reconciliation_pair_incarnation: dict[tuple[str, str], int] = {}
+
     @property
     def diagnostics_enabled(self) -> bool:
         return self._diagnostics_enabled
+
+    @property
+    def reconciliation_enabled(self) -> bool:
+        return self._reconciliation_enabled
+
+    @property
+    def reconciliation_overflow_dropped_total(self) -> int:
+        return self._reconciliation_overflow_dropped_total
+
+    @property
+    def reconciliation_exhausted_count(self) -> int:
+        return self._reconciliation_exhausted_count
+
+    @property
+    def persist_pending_overflow_total(self) -> int:
+        return self._persist_pending_overflow_total
+
+    @property
+    def persist_exhausted_total(self) -> int:
+        return self._persist_exhausted_total
 
     @property
     def diagnostics_membership_generation(self) -> int:
@@ -548,6 +727,322 @@ class CandleStore:
         except Exception as e:  # pragma: no cover - diagnostics must never break candle handling
             _log_diag_error(context, e)
 
+    # ----------------------------------------------------- reconciliation
+
+    def set_reconciliation_membership(self, keys, *, replace: bool = True) -> None:
+        """Establish/extend the current capped reconciliation membership.
+
+        Independent of diagnostics membership: never reset by a diagnostics
+        membership-epoch replace, and never itself touches diagnostics.
+        Unsupported timeframes (anything outside
+        SUPPORTED_RECONCILIATION_TIMEFRAMES) are silently filtered out —
+        this store has no fixed duration for them, so a gap window could
+        never be computed anyway.
+
+        `replace=True` (default) sets membership to exactly the filtered,
+        capped `keys` and drops (not merely hides) gap-window/WS-max state
+        for any pair no longer in it — a pair later re-added starts
+        genuinely fresh rather than resuming stale work. A pair that stays
+        in membership across the replace keeps its existing gap window and
+        WS-max marker untouched (unlike the diagnostics epoch reset).
+
+        `replace=False` only ever adds to the existing membership, exactly
+        mirroring set_diagnostics_membership's same-named parameter.
+
+        A no-op when reconciliation is disabled.
+        """
+        if not self._reconciliation_enabled:
+            return
+        try:
+            filtered = [
+                k for k in dict.fromkeys(keys) if k[1] in SUPPORTED_RECONCILIATION_TIMEFRAMES
+            ]
+            if replace:
+                accepted = set(filtered[:MAX_RECONCILIATION_PAIRS])
+                prior_membership = self._reconciliation_membership or set()
+                self._reconciliation_membership_epoch += 1
+                for key in list(self._reconciliation_windows.keys()):
+                    if key not in accepted:
+                        del self._reconciliation_windows[key]
+                for key in list(self._reconciliation_ws_max_open.keys()):
+                    if key not in accepted:
+                        del self._reconciliation_ws_max_open[key]
+                for key in list(self._persist_pending.keys()):
+                    if key not in accepted:
+                        del self._persist_pending[key]
+                for key in list(self._reconciliation_pair_incarnation.keys()):
+                    if key not in accepted:
+                        del self._reconciliation_pair_incarnation[key]
+                for key in accepted:
+                    if key not in prior_membership:
+                        # Newly (re)joining this replace — including a pair
+                        # that was previously removed and is only now coming
+                        # back — mints a fresh incarnation. A retained pair
+                        # (already in prior_membership) is left untouched.
+                        self._reconciliation_pair_incarnation[key] = self._reconciliation_membership_epoch
+                self._reconciliation_membership = accepted
+            else:
+                existing = (
+                    set(self._reconciliation_membership)
+                    if self._reconciliation_membership is not None
+                    else set(self._reconciliation_windows) | set(self._reconciliation_ws_max_open)
+                )
+                ordered = list(existing) + [k for k in filtered if k not in existing]
+                accepted = set(ordered[:MAX_RECONCILIATION_PAIRS])
+                for key in accepted:
+                    if key not in existing and key not in self._reconciliation_pair_incarnation:
+                        self._reconciliation_pair_incarnation[key] = self._reconciliation_membership_epoch
+                self._reconciliation_membership = accepted
+        except Exception as e:  # pragma: no cover - reconciliation bookkeeping must never break the caller
+            _log_diag_error("reconciliation_set_membership", e)
+
+    def prune_reconciliation(self, keep: set) -> None:
+        """Drop reconciliation state for pairs outside the current membership."""
+        self.set_reconciliation_membership(keep, replace=True)
+
+    def is_reconciliation_tracked(self, symbol: str, timeframe: str) -> bool:
+        """Whether (symbol, timeframe) is within the current capped
+        reconciliation allocation. False when reconciliation is disabled or
+        the timeframe is unsupported.
+        """
+        if not self._reconciliation_enabled:
+            return False
+        if timeframe not in SUPPORTED_RECONCILIATION_TIMEFRAMES:
+            return False
+        key = (symbol, timeframe)
+        if self._reconciliation_membership is not None:
+            return key in self._reconciliation_membership
+        # No explicit membership ever established (e.g. direct/test
+        # construction) — bound allocation across ALL reconciliation
+        # bookkeeping dicts together (windows, WS-max markers, and
+        # persist-pending), not just WS-max markers alone: a caller that
+        # only ever writes via update(source="reconciliation") never
+        # populates _reconciliation_ws_max_open at all, so consulting only
+        # its length would never actually cap anything.
+        if key in self._reconciliation_windows or key in self._reconciliation_ws_max_open:
+            return True
+        if key in self._persist_pending:
+            return True
+        allocated = (
+            set(self._reconciliation_windows)
+            | set(self._reconciliation_ws_max_open)
+            | set(self._persist_pending)
+        )
+        return len(allocated) < MAX_RECONCILIATION_PAIRS
+
+    def get_reconciliation_ws_max_open(self, symbol: str, timeframe: str) -> Optional[int]:
+        """The highest open_time ever observed on the live WS path for this
+        pair (source="ws" only — never advanced by REST/preload/backfill).
+        """
+        return self._reconciliation_ws_max_open.get((symbol, timeframe))
+
+    def get_reconciliation_incarnation(self, symbol: str, timeframe: str) -> int:
+        """The current bounded per-pair incarnation token (see
+        `ReconciliationTarget.incarnation`) for (symbol, timeframe), 0 if
+        the pair has never (re)joined reconciliation membership. Lets a
+        caller (CandleReconciler) key its own persist-only retry bookkeeping
+        by the same identity used for fetch-retry state, so a pair removed
+        and re-added between ticks never carries over stale local retry
+        history for a coincidentally-matching open_time.
+        """
+        return self._reconciliation_pair_incarnation.get((symbol, timeframe), 0)
+
+    def get_reconciliation_targets(self) -> list[ReconciliationTarget]:
+        """Read-only snapshot of every pair currently holding an open gap
+        window. Empty when reconciliation is disabled. The caller
+        (CandleReconciler) must re-check each candidate's actual closed
+        state (see is_candle_closed) before ever fetching/writing — a
+        pair's presence here only means "this store observed proof of a gap
+        at some point", not "still definitely missing right now".
+        """
+        if not self._reconciliation_enabled:
+            return []
+        return [
+            ReconciliationTarget(
+                symbol=sym,
+                timeframe=tf,
+                start_open_time=w.start_open_time,
+                end_open_time=w.end_open_time,
+                first_seen_ms=w.first_seen_ms,
+                dropped_count=w.dropped_count,
+                incarnation=self._reconciliation_pair_incarnation.get((sym, tf), 0),
+            )
+            for (sym, tf), w in self._reconciliation_windows.items()
+        ]
+
+    def is_candle_closed(self, symbol: str, timeframe: str, open_time: int) -> bool:
+        """Whether this exact open_time is already recorded closed in
+        memory — used by CandleReconciler to avoid ever re-fetching or
+        overwriting an already-resolved bar.
+        """
+        return self._is_candle_closed_in_memory((symbol, timeframe), open_time)
+
+    def _is_candle_closed_in_memory(self, key: tuple[str, str], open_time: int) -> bool:
+        for c in self._data.get(key, ()):
+            if c["open_time"] == open_time:
+                return bool(c.get("is_closed"))
+        return False
+
+    def acknowledge_reconciliation_progress(
+        self,
+        symbol: str,
+        timeframe: str,
+        resolved_up_to_open_time_inclusive: int,
+        *,
+        dropped: bool = False,
+    ) -> None:
+        """Advance (or fully clear) a pair's gap window past every candidate
+        up to and including `resolved_up_to_open_time_inclusive`.
+
+        `dropped=True` marks this as an exhausted-window drop (after
+        CandleReconciler's own bounded retry/backoff budget for this exact
+        window is spent) rather than a genuine resolution — counted
+        separately (see reconciliation_exhausted_count) so it is
+        distinguishable from real progress, but the window is cleared
+        identically either way: a dropped window must never be reoffered as
+        a target at the next rollover (see get_reconciliation_targets).
+        A no-op when reconciliation is disabled or no window exists for
+        this pair.
+        """
+        if not self._reconciliation_enabled:
+            return
+        key = (symbol, timeframe)
+        window = self._reconciliation_windows.get(key)
+        if window is None:
+            return
+        duration = TIMEFRAME_DURATION_MS.get(timeframe)
+        if duration is None:
+            return
+        if dropped:
+            self._reconciliation_exhausted_count += 1
+        new_start = resolved_up_to_open_time_inclusive + duration
+        if new_start > window.start_open_time:
+            window.start_open_time = new_start
+        if window.start_open_time > window.end_open_time:
+            del self._reconciliation_windows[key]
+
+    def _record_reconciliation_ws_observation(
+        self, key: tuple[str, str], timeframe: str, open_time: int, now_ms: int
+    ) -> None:
+        """Advance this pair's WS-only max open_time and, if it strictly
+        advanced, register never-confirmed-closed bars between the previous
+        max (inclusive) and the new one (exclusive) as reconciliation
+        candidates. Only ever called for source="ws" — REST/preload/backfill
+        observations never move this marker (see module docstring: "Track
+        valid live WS maximum open time separately from REST/preload").
+
+        `open_time` is only trusted if it is a genuine, aligned, non-negative
+        open time on this timeframe's own grid and no more than one bar
+        ahead of `now_ms` (a defensible observation-time bound) — an
+        off-grid or implausible-future value must never poison this marker
+        (or the store's own max-open bookkeeping) rather than merely being
+        rejected by row validation elsewhere.
+
+        A jump spanning more than MAX_RECONCILIATION_WINDOW_BARS candidate
+        slots keeps only the NEWEST `MAX_RECONCILIATION_WINDOW_BARS` of them
+        (nearest the new max) — the older remainder is explicitly counted via
+        `reconciliation_overflow_dropped_total` rather than silently advancing
+        the max marker past an unaccounted-for gap.
+        """
+        if not self.is_reconciliation_tracked(*key):
+            return
+        try:
+            duration = TIMEFRAME_DURATION_MS.get(timeframe)
+            if not duration or duration <= 0:
+                return
+            if open_time < 0 or open_time % duration != 0:
+                return  # off-grid WS t must not poison tracking
+            if open_time > now_ms + duration:
+                return  # implausible future timestamp
+
+            prior_max = self._reconciliation_ws_max_open.get(key)
+            if prior_max is None:
+                self._reconciliation_ws_max_open[key] = open_time
+                return
+            if open_time <= prior_max:
+                return
+
+            total_gap_steps = (open_time - prior_max) // duration
+            skip_steps = 0
+            start_candidate = prior_max
+            if total_gap_steps > MAX_RECONCILIATION_WINDOW_BARS:
+                # Keep only the newest MAX_RECONCILIATION_WINDOW_BARS
+                # candidates; the older skip_steps ones are dropped and
+                # explicitly counted rather than left uncounted once the
+                # max marker advances past them.
+                skip_steps = total_gap_steps - MAX_RECONCILIATION_WINDOW_BARS
+                start_candidate = prior_max + skip_steps * duration
+                # A jump this large alone already fills the entire cap with
+                # strictly newer candidates, so any pre-existing window for
+                # this pair (necessarily entirely older, since the WS-max
+                # marker only ever advances) is unconditionally superseded.
+                # Drop it and count its own full span exactly once HERE,
+                # rather than leaving it in place to be re-discovered and
+                # re-counted by _add_reconciliation_candidate's own
+                # incremental per-candidate trim below (which would count
+                # the same already-known-dropped span a second time).
+                old_window = self._reconciliation_windows.pop(key, None)
+                if old_window is not None:
+                    old_span = (
+                        old_window.end_open_time - old_window.start_open_time
+                    ) // duration + 1
+                    self._reconciliation_overflow_dropped_total += old_span
+                self._reconciliation_overflow_dropped_total += skip_steps
+
+            candidate = start_candidate
+            steps = 0
+            max_steps = total_gap_steps - skip_steps
+            while candidate < open_time and steps < max_steps:
+                if not self._is_candle_closed_in_memory(key, candidate):
+                    self._add_reconciliation_candidate(key, candidate, now_ms)
+                candidate += duration
+                steps += 1
+            self._reconciliation_ws_max_open[key] = open_time
+        except Exception as e:  # pragma: no cover - reconciliation bookkeeping must never break the caller
+            _log_diag_error("reconciliation_ws_observe", e)
+
+    def _add_reconciliation_candidate(self, key: tuple[str, str], open_time: int, now_ms: int) -> None:
+        window = self._reconciliation_windows.get(key)
+        if window is None:
+            self._reconciliation_windows[key] = ReconciliationGapWindow(
+                start_open_time=open_time, end_open_time=open_time, first_seen_ms=now_ms,
+            )
+            return
+        if open_time < window.start_open_time:
+            window.start_open_time = open_time
+        if open_time > window.end_open_time:
+            window.end_open_time = open_time
+        duration = TIMEFRAME_DURATION_MS.get(key[1])
+        if not duration:
+            return
+        span_steps = (window.end_open_time - window.start_open_time) // duration + 1
+        if span_steps > MAX_RECONCILIATION_WINDOW_BARS:
+            overflow = span_steps - MAX_RECONCILIATION_WINDOW_BARS
+            window.start_open_time += overflow * duration
+            window.dropped_count += overflow
+            self._reconciliation_overflow_dropped_total += overflow
+
+    def _maybe_advance_reconciliation_window(self, key: tuple[str, str], resolved_open_time: int) -> None:
+        """Auto-collapse the leading edge of a gap window when the bar at
+        exactly its current start becomes closed in memory, from *any*
+        source — this is what lets a late eligible WS receipt resolve a
+        tracked gap without CandleReconciler ever making a network call.
+        """
+        if not self._reconciliation_enabled:
+            return
+        try:
+            window = self._reconciliation_windows.get(key)
+            if window is None or resolved_open_time != window.start_open_time:
+                return
+            duration = TIMEFRAME_DURATION_MS.get(key[1])
+            if not duration:
+                return
+            window.start_open_time += duration
+            if window.start_open_time > window.end_open_time:
+                del self._reconciliation_windows[key]
+        except Exception as e:  # pragma: no cover - reconciliation bookkeeping must never break the caller
+            _log_diag_error("reconciliation_advance", e)
+
     def update(
         self,
         symbol: str,
@@ -556,7 +1051,7 @@ class CandleStore:
         persist: bool = True,
         now_ms: Optional[int] = None,
         source: str = "unknown",
-    ) -> None:
+    ) -> Optional[CandleUpdateResult]:
         """Insert or update a candle. candle dict must have: t, T, o, h, l, c, v,
         and optionally a nonstandard closed/is_closed flag (see module
         docstring — never trusted alone; always checked against the candle's
@@ -565,6 +1060,11 @@ class CandleStore:
         `source` labels where this observation came from ("ws", "backfill",
         or the caller's own label) for bounded diagnostics only (see
         CandleDiagnostics); it has no effect on eligibility or persistence.
+
+        Returns a `CandleUpdateResult` describing the in-memory/persistence
+        outcome (None only when the row was dropped outright for an
+        unusable open_time). Every existing caller predates this return
+        value and ignores it — purely additive/backwards-compatible.
         """
         key = (symbol, timeframe)
         store = self._data[key]
@@ -576,7 +1076,7 @@ class CandleStore:
                 f"Dropping candle with unusable open_time for {symbol}/{timeframe} "
                 f"(raw type={type(raw_t).__name__})"
             )
-            return
+            return None
         close_time = _safe_int(candle.get("T", candle.get("close_time")))
         raw_flag = candle.get("closed", candle.get("is_closed"))
         effective_now_ms = _now_ms() if now_ms is None else now_ms
@@ -609,7 +1109,7 @@ class CandleStore:
                     self._last_update[key] = time.time()
                     if diag is not None:
                         self._safe_diag(diag.record_ignored_late_partial, "ignored_late_partial")
-                    return
+                    return CandleUpdateResult(open_time=open_time, is_closed=False, ignored_late_partial=True)
                 store[i] = normalized
                 break
         else:
@@ -622,45 +1122,184 @@ class CandleStore:
 
         self._last_update[key] = time.time()
 
+        # Reconciliation gap-window bookkeeping (see module docstring
+        # section above). WS-only max-open tracking/candidate registration
+        # happens regardless of persist outcome — it is about in-memory
+        # visibility, which is already decided above. A no-op when
+        # reconciliation is disabled.
+        if self._reconciliation_enabled:
+            if source == "ws":
+                self._record_reconciliation_ws_observation(key, timeframe, open_time, effective_now_ms)
+            if is_closed:
+                self._maybe_advance_reconciliation_window(key, open_time)
+
         # Persist only candles that are actually closed as of this update's
         # observation instant — never on the raw flag alone. An update that
         # was ignored above (the finalized-sample-protection early return)
         # never reaches here, so it is correctly never counted as a
         # persistence attempt.
+        persisted: Optional[bool] = None
         if persist and is_closed:
-            try:
-                c_obj = Candle(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    open_time=open_time,
-                    close_time=close_time if close_time is not None else open_time,
-                    open=float(candle.get("o", candle.get("open", 0))),
-                    high=float(candle.get("h", candle.get("high", 0))),
-                    low=float(candle.get("l", candle.get("low", 0))),
-                    close=float(candle.get("c", candle.get("close", 0))),
-                    volume=float(candle.get("v", candle.get("volume", 0))),
-                    is_closed=True,
-                )
-            except Exception as e:
-                # Failed before any repository call was made — distinct from
-                # an actual write failure (see persist_construction_failures)
-                # and never counted as a persist_attempts (that counter means
-                # an actual repository call; see CandleDiagnostics).
-                if diag is not None:
-                    self._safe_diag(diag.record_persist_construction_failure, "persist_construction_failure")
-                logger.warning(f"Failed to persist candle {symbol}/{timeframe}: {e}")
-            else:
-                if diag is not None:
-                    self._safe_diag(diag.record_persist_attempt, "persist_attempt")
-                try:
-                    repo.upsert_candle(self._conn, c_obj)
-                except Exception as e:
-                    if diag is not None:
-                        self._safe_diag(diag.record_persist_failure, "persist_failure")
-                    logger.warning(f"Failed to persist candle {symbol}/{timeframe}: {e}")
-                else:
-                    if diag is not None:
-                        self._safe_diag(diag.record_persist_success, "persist_success")
+            persisted = self._persist_record(symbol, timeframe, normalized, diag)
+            # Only confirmed active/supported reconciliation membership ever
+            # allocates a persist-retry pending marker — an arbitrary
+            # backfill/unsupported-timeframe/removed pair must never grow
+            # this bookkeeping just because reconciliation happens to be
+            # enabled globally (see is_reconciliation_tracked's unified
+            # bound across windows/WS-max/persist-pending allocation).
+            if self._reconciliation_enabled and self.is_reconciliation_tracked(symbol, timeframe):
+                self._track_persist_pending(key, open_time, persisted)
+
+        return CandleUpdateResult(open_time=open_time, is_closed=is_closed, persisted=persisted)
+
+    def _persist_record(
+        self, symbol: str, timeframe: str, record: dict, diag: Optional[CandleDiagnostics] = None
+    ) -> bool:
+        """Actual repository write for one already-frozen closed record
+        (either the just-normalized row from `update()`, or the current
+        in-memory record for a later persist-only retry — see
+        `retry_persist`). Never re-derives eligibility; the caller is solely
+        responsible for only calling this on a record already decided
+        closed.
+        """
+        try:
+            c_obj = Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=record["open_time"],
+                close_time=record["close_time"] if record["close_time"] is not None else record["open_time"],
+                open=float(record["open"]),
+                high=float(record["high"]),
+                low=float(record["low"]),
+                close=float(record["close"]),
+                volume=float(record["volume"]),
+                is_closed=True,
+            )
+        except Exception as e:
+            # Failed before any repository call was made — distinct from an
+            # actual write failure (see persist_construction_failures) and
+            # never counted as a persist_attempts (that counter means an
+            # actual repository call; see CandleDiagnostics).
+            if diag is not None:
+                self._safe_diag(diag.record_persist_construction_failure, "persist_construction_failure")
+            logger.warning(f"Failed to persist candle {symbol}/{timeframe}: {e}")
+            return False
+
+        if diag is not None:
+            self._safe_diag(diag.record_persist_attempt, "persist_attempt")
+        try:
+            repo.upsert_candle(self._conn, c_obj)
+        except Exception as e:
+            if diag is not None:
+                self._safe_diag(diag.record_persist_failure, "persist_failure")
+            logger.warning(f"Failed to persist candle {symbol}/{timeframe}: {e}")
+            return False
+        if diag is not None:
+            self._safe_diag(diag.record_persist_success, "persist_success")
+        return True
+
+    def _track_persist_pending(self, key: tuple[str, str], open_time: int, persisted: bool) -> None:
+        """Bounded, no-payload persist-retry bookkeeping (see
+        `retry_persist`). A successful persist clears any stale pending
+        marker for this exact open_time (it may have been queued by an
+        earlier failed attempt for the same bar); a failed persist marks it
+        pending, evicting the pair's oldest pending open_time if already at
+        the per-pair cap.
+        """
+        pending = self._persist_pending.get(key)
+        if persisted:
+            if pending and open_time in pending:
+                pending.discard(open_time)
+                if not pending:
+                    del self._persist_pending[key]
+            return
+        if pending is None:
+            pending = set()
+            self._persist_pending[key] = pending
+        if open_time not in pending and len(pending) >= MAX_PERSIST_PENDING_PER_PAIR:
+            oldest = min(pending)
+            pending.discard(oldest)
+            self._persist_pending_overflow_total += 1
+        pending.add(open_time)
+
+    def get_persist_retry_candidates(self) -> list[tuple[str, str, int]]:
+        """Bounded snapshot of every (symbol, timeframe, open_time) whose
+        last persist attempt failed and has not since been superseded by a
+        successful persist of that exact bar. No payload — a caller
+        (CandleReconciler) retries via `retry_persist`, which always reads
+        the CURRENT frozen in-memory record, never a cached copy. Empty when
+        reconciliation is disabled.
+        """
+        if not self._reconciliation_enabled:
+            return []
+        out: list[tuple[str, str, int]] = []
+        for (sym, tf), opens in self._persist_pending.items():
+            for ot in sorted(opens):
+                out.append((sym, tf, ot))
+        return out
+
+    def retry_persist(self, symbol: str, timeframe: str, open_time: int) -> Optional[bool]:
+        """Persist-only retry of the CURRENT in-memory closed record at this
+        exact open_time — no re-fetch, no re-normalization/promotion of a
+        cached forming payload, and no overwrite of in-memory OHLC (only a
+        repository write of exactly what is already frozen in memory).
+
+        Returns True on a successful write (pending marker cleared), False
+        on another failed attempt (stays pending), or None if this
+        open_time is no longer a pending closed record for this pair
+        (already resolved by a newer successful persist, evicted by the
+        per-pair cap, or the pair was pruned from membership) — the caller
+        should stop retrying it.
+        """
+        key = (symbol, timeframe)
+        pending = self._persist_pending.get(key)
+        if not pending or open_time not in pending:
+            return None
+        record = None
+        for c in self._data.get(key, ()):
+            if c["open_time"] == open_time:
+                record = c
+                break
+        if record is None or not record.get("is_closed"):
+            # No longer a valid closed record to retry (evicted from the
+            # in-memory window, or — defensively — somehow not closed);
+            # never persisted, so drop the pending marker rather than retry
+            # forever.
+            pending.discard(open_time)
+            if not pending:
+                del self._persist_pending[key]
+            return None
+        diag = self._get_or_create_diag(key)
+        ok = self._persist_record(symbol, timeframe, record, diag)
+        if ok:
+            pending.discard(open_time)
+            if not pending:
+                del self._persist_pending[key]
+            return True
+        return False
+
+    def drop_persist_pending(self, symbol: str, timeframe: str, open_time: int) -> bool:
+        """Drop exactly this pending persist-retry marker WITHOUT another
+        attempt — used by a caller (CandleReconciler) that has exhausted its
+        own bounded local retry-attempt budget for this exact open_time.
+
+        Distinct from a successful persist: this bar's in-memory closed
+        record is retained (never lost/overwritten), but it is never
+        retried again and is counted separately (`persist_exhausted_total`)
+        so it is never confused with either a real success or the
+        unrelated `persist_pending_overflow_total` (per-pair cap eviction).
+        Returns False (no-op) if this exact open_time was not actually
+        pending — e.g. already resolved/evicted/pruned elsewhere.
+        """
+        key = (symbol, timeframe)
+        pending = self._persist_pending.get(key)
+        if not pending or open_time not in pending:
+            return False
+        pending.discard(open_time)
+        if not pending:
+            del self._persist_pending[key]
+        self._persist_exhausted_total += 1
+        return True
 
     def load_from_db(
         self, symbol: str, timeframe: str, limit: int = 200, now_ms: Optional[int] = None
