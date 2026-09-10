@@ -6,9 +6,11 @@ reservations not refunded on error, bounded single-wait-then-retry behavior,
 429 cooldown (bounded Retry-After, conservative default, no retry storm),
 oversized-response extra debt/cooldown, exactly-one-HTTP-attempt for a
 reconciliation call (RestBudgetUnavailable when the budget can't admit it),
-existing (legacy) call shapes/positional signatures preserved, and
-cancellation propagation. No real sockets/sleeps — httpx.AsyncClient and time
-are fully faked/injected.
+existing (legacy) call shapes/positional signatures preserved, cancellation
+propagation, and bounded (RATE_WINDOW_SECONDS) own-budget wait-then-admit for
+ordinary calls so a temporarily-full budget that frees in time is never
+misreported as a failed upstream request. No real sockets/sleeps —
+httpx.AsyncClient and time are fully faked/injected.
 """
 from __future__ import annotations
 
@@ -171,6 +173,42 @@ class TestRestRateLimiterWaiting:
         # that never actually frees capacity, so the single retry still fails.
         admitted = await limiter.acquire(10, wait=True, max_wait_seconds=0.001)
         assert admitted is False
+
+    async def test_default_max_wait_seconds_is_the_full_rolling_window(self):
+        """Regression for the production startup defect: the documented
+        default wait bound is RATE_WINDOW_SECONDS, not an arbitrarily short
+        cutoff — a caller relying on the default (as HyperliquidClient._post
+        does) must still observe capacity that frees just before the
+        window's edge, without having to pass an explicit override."""
+        clock = _FakeClock()
+        limiter = RestRateLimiter(total_per_minute=10, reconciliation_per_minute=10, clock=clock)
+        await limiter.acquire(10)  # fills the budget; wait_hint is ~60s
+
+        async def advancing_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        limiter._sleep = advancing_sleep
+        admitted = await limiter.acquire(10, wait=True)  # no max_wait_seconds override
+        assert admitted is True
+
+    async def test_cooldown_outlasting_documented_maximum_fails_closed_not_a_retry_storm(self):
+        """A cooldown longer than the documented maximum wait
+        (RATE_WINDOW_SECONDS) still correctly fails closed after exactly
+        one bounded wait — an honest bounded refusal, not a retry loop."""
+        clock = _FakeClock()
+        limiter = RestRateLimiter(total_per_minute=1000, reconciliation_per_minute=1000, clock=clock)
+        await limiter.note_429(retry_after=200.0)  # far outlasts the 60s bound
+
+        sleep_calls = []
+
+        async def advancing_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            clock.advance(seconds)
+
+        limiter._sleep = advancing_sleep
+        admitted = await limiter.acquire(10, wait=True)
+        assert admitted is False
+        assert sleep_calls == [60.0]  # exactly one bounded wait, not a loop
 
 
 class TestRestRateLimiter429Cooldown:
@@ -562,6 +600,124 @@ class TestReconciliationRequestPath:
                 "BTC", "1m", 1000, 2000, weight="SECRET_MARKER_DO_NOT_LEAK",
             )
         assert "SECRET_MARKER_DO_NOT_LEAK" not in caplog.text
+
+
+class TestOrdinaryCallWaitsForOwnBudgetInsteadOfFalseFailure:
+    """Regression coverage for the production startup defect: an ordinary
+    call must wait (bounded) for its own temporarily-full rolling budget
+    to free rather than being reported as a failed upstream request, while
+    reconciliation calls still never wait and a genuinely-unobtainable
+    budget still fails closed, bounded."""
+
+    async def test_near_full_window_waits_then_makes_exactly_one_http_attempt(self, monkeypatch, caplog):
+        clock = _FakeClock()
+
+        async def advancing_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        limiter = RestRateLimiter(
+            total_per_minute=20, reconciliation_per_minute=20, clock=clock, sleep=advancing_sleep,
+        )
+        await limiter.acquire(20)  # fills the budget; ~60s until it frees
+
+        post_calls = {"n": 0}
+        real_factory = _scripted_async_client([_response(json_data={"universe": []})])
+
+        class _CountingClient(real_factory):
+            async def post(self, url, json=None):
+                post_calls["n"] += 1
+                return await super().post(url, json=json)
+
+        monkeypatch.setattr(hl_module.httpx, "AsyncClient", _CountingClient)
+        monkeypatch.setattr(hl_module.asyncio, "sleep", _RecordingSleep())
+        client = HyperliquidClient(rate_limiter=limiter)
+        with caplog.at_level("ERROR"):
+            result = await client.get_perp_meta()
+        assert result == {"universe": []}
+        assert post_calls["n"] == 1
+        assert "Hyperliquid request failed" not in caplog.text
+
+    async def test_cooldown_clearing_within_bound_waits_then_succeeds(self, monkeypatch, caplog):
+        clock = _FakeClock()
+
+        async def advancing_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        limiter = RestRateLimiter(
+            total_per_minute=1000, reconciliation_per_minute=1000, clock=clock, sleep=advancing_sleep,
+        )
+        await limiter.note_429(retry_after=45.0)  # clears within the 60s bound
+
+        post_calls = {"n": 0}
+        real_factory = _scripted_async_client([_response(json_data={"BTC": "1"})])
+
+        class _CountingClient(real_factory):
+            async def post(self, url, json=None):
+                post_calls["n"] += 1
+                return await super().post(url, json=json)
+
+        monkeypatch.setattr(hl_module.httpx, "AsyncClient", _CountingClient)
+        monkeypatch.setattr(hl_module.asyncio, "sleep", _RecordingSleep())
+        client = HyperliquidClient(rate_limiter=limiter)
+        with caplog.at_level("ERROR"):
+            result = await client.get_all_mids()
+        assert result == {"BTC": "1"}
+        assert post_calls["n"] == 1
+        assert "Hyperliquid request failed" not in caplog.text
+
+    async def test_reconciliation_still_never_waits_even_near_full_window(self, monkeypatch):
+        clock = _FakeClock()
+        sleep = _RecordingSleep()
+        limiter = RestRateLimiter(total_per_minute=20, reconciliation_per_minute=20, clock=clock, sleep=sleep)
+        await limiter.acquire(20)
+        client = HyperliquidClient(rate_limiter=limiter)
+        with pytest.raises(RestBudgetUnavailable):
+            await client.get_candle_snapshot("BTC", "1m", 1000, 2000, reconciliation=True, weight=20)
+        assert sleep.calls == []
+
+    async def test_bounded_fail_closed_when_capacity_never_obtained_within_maximum(self, monkeypatch, caplog):
+        """If capacity genuinely cannot be obtained within the documented
+        maximum wait (here, a cooldown that outlasts it on every attempt),
+        an ordinary call still correctly fails closed — returning None, not
+        raising — with each attempt's wait bounded, never growing."""
+        clock = _FakeClock()
+        sleep_calls: list[float] = []
+
+        async def advancing_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            clock.advance(seconds)
+
+        limiter = RestRateLimiter(
+            total_per_minute=1000, reconciliation_per_minute=1000, clock=clock, sleep=advancing_sleep,
+        )
+        await limiter.note_429(retry_after=200.0)  # outlasts the 60s bound
+
+        monkeypatch.setattr(hl_module.asyncio, "sleep", _RecordingSleep())
+        client = HyperliquidClient(rate_limiter=limiter)
+        with caplog.at_level("ERROR"):
+            result = await client.get_perp_meta()
+        assert result is None
+        assert "Hyperliquid request failed after 3 attempts" in caplog.text
+        assert all(s <= 60.0 for s in sleep_calls)  # each wait individually bounded
+
+
+class TestCancellationDuringBudgetWait:
+    async def test_cancelled_error_propagates_while_waiting_for_admission(self):
+        """CancelledError raised while sleeping for own-budget admission
+        (not merely while blocked on the HTTP call) must still propagate,
+        never be swallowed as an ordinary budget-unavailable refusal."""
+        clock = _FakeClock()
+
+        async def cancelling_sleep(seconds: float) -> None:
+            raise asyncio.CancelledError()
+
+        limiter = RestRateLimiter(
+            total_per_minute=20, reconciliation_per_minute=20, clock=clock, sleep=cancelling_sleep,
+        )
+        await limiter.acquire(20)  # fills the budget so the next call must wait
+        client = HyperliquidClient(rate_limiter=limiter)
+        with pytest.raises(asyncio.CancelledError):
+            await client.get_perp_meta()
 
 
 class Test429Handling:
