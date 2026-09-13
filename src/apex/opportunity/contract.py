@@ -19,7 +19,7 @@ from typing import Literal, Optional
 CONTRACT_VERSION = "opportunity_v0_1"
 
 Direction = Literal["LONG", "SHORT"]
-SetupFamily = Literal["VOLATILITY_COMPRESSION", "SWEEP_RECLAIM"]
+SetupFamily = Literal["VOLATILITY_COMPRESSION", "SWEEP_RECLAIM", "SUPPORT_RESISTANCE_REJECTION"]
 OpportunityStatus = Literal["ACTIVE", "EXPIRED"]
 PrimaryTimeframe = Literal["3m", "5m"]
 
