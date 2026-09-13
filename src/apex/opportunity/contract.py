@@ -24,6 +24,7 @@ SetupFamily = Literal[
     "SWEEP_RECLAIM",
     "SUPPORT_RESISTANCE_REJECTION",
     "SUPPORT_RESISTANCE_BREAKOUT_RETEST",
+    "SUPPORT_RESISTANCE_FAILED_BREAKOUT",
 ]
 OpportunityStatus = Literal["ACTIVE", "EXPIRED"]
 PrimaryTimeframe = Literal["3m", "5m"]
