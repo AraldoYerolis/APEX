@@ -281,7 +281,11 @@ CREATE TABLE IF NOT EXISTS opportunity_observations (
     fingerprint              TEXT NOT NULL,          -- dedupe identity; NOT unique (see engine.py)
     symbol                   TEXT NOT NULL,
     direction                TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
-    setup_family             TEXT NOT NULL CHECK(setup_family IN ('VOLATILITY_COMPRESSION','SWEEP_RECLAIM')),
+    setup_family             TEXT NOT NULL CHECK(setup_family IN (
+                                 'VOLATILITY_COMPRESSION','SWEEP_RECLAIM',
+                                 'SUPPORT_RESISTANCE_REJECTION','SUPPORT_RESISTANCE_BREAKOUT_RETEST',
+                                 'SUPPORT_RESISTANCE_FAILED_BREAKOUT'
+                             )),
     detector_version         TEXT NOT NULL,
     contract_version         TEXT NOT NULL,
     primary_timeframe        TEXT NOT NULL CHECK(primary_timeframe IN ('3m','5m')),

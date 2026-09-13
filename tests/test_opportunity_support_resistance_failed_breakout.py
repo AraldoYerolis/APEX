@@ -1106,14 +1106,21 @@ def test_detector_module_has_no_runtime_wiring_imports():
 
 # The above proves the detector doesn't reach out to runtime wiring; this
 # reverse check proves runtime wiring doesn't reach in and call the
-# detector — v0.1 is research-only and must not yet be scanned/scheduled/
-# served live (see module docstring and CLAUDE.md milestone spec).
+# detector from anywhere except the one sealed integration point. The
+# Opportunity engine (apex.opportunity.engine) is the sole authorized
+# wiring site (see CLAUDE.md milestone spec / sealed S/R detector
+# integration design) — apex.main, apex.app, and apex.scheduler.tasks must
+# never import or call this detector directly.
 RUNTIME_ENTRY_POINT_MODULES = (
     "apex.opportunity.engine",
     "apex.main",
     "apex.app",
     "apex.scheduler.tasks",
 )
+
+# The only module in RUNTIME_ENTRY_POINT_MODULES permitted to wire in this
+# detector.
+AUTHORIZED_WIRING_MODULE = "apex.opportunity.engine"
 
 DETECTOR_MODULE_NAME = "apex.opportunity.detectors.support_resistance_failed_breakout"
 DETECTOR_FUNCTION_NAME = "detect_support_resistance_failed_breakout"
@@ -1154,8 +1161,12 @@ def _wires_in_detector(tree: ast.Module) -> bool:
 
 def test_runtime_entry_points_do_not_wire_in_failed_breakout_detector():
     """Parse each live entry point's own source with `ast` (engine.py,
-    main.py, app.py, scheduler/tasks.py — at minimum) and confirm none of
-    them imports or calls this still-research-only detector.
+    main.py, app.py, scheduler/tasks.py — at minimum) and confirm the
+    detector is wired in at most through the one sealed integration point,
+    apex.opportunity.engine — never directly through apex.main, apex.app, or
+    apex.scheduler.tasks. The Opportunity engine is itself still gated by
+    OPPORTUNITY_ENGINE_ENABLED && DRY_RUN_MODE (see engine.py), so wiring
+    through it alone does not make this detector live/scheduled by itself.
     """
     inspected: dict[str, ast.Module] = {}
     for module_name in RUNTIME_ENTRY_POINT_MODULES:
@@ -1175,7 +1186,18 @@ def test_runtime_entry_points_do_not_wire_in_failed_breakout_detector():
         assert node_count > 5, f"{module_name}: suspiciously little AST content inspected"
 
     wired = {name: _wires_in_detector(tree) for name, tree in inspected.items()}
-    assert not any(wired.values()), f"detector wired into: {sorted(n for n, w in wired.items() if w)}"
+
+    # Non-vacuous: the sealed integration must actually be present — this
+    # test would otherwise pass just as well on a build that never wired the
+    # detector in at all.
+    assert wired[AUTHORIZED_WIRING_MODULE] is True
+
+    unauthorized_wiring = {
+        name: w
+        for name, w in wired.items()
+        if w and name != AUTHORIZED_WIRING_MODULE
+    }
+    assert not unauthorized_wiring, f"detector wired into: {sorted(unauthorized_wiring)}"
 
 
 MAX_SECONDS = 10.0  # generous bound; actual runtime is expected to be well under 1s

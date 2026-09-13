@@ -1054,3 +1054,245 @@ def test_existing_signal_path_unchanged_by_opportunity_scan(monkeypatch, tmp_pat
         assert counts_after_opp["alerts"] == 0
     finally:
         close_db()
+
+
+# ------------------------------------------------------------------ SUPPORT_RESISTANCE detector wiring
+
+
+def test_all_five_detectors_called_once_in_fixed_order_with_same_df(monkeypatch, tmp_path):
+    """The complete fixed detector order is: volatility compression,
+    sweep/reclaim, S/R rejection, S/R breakout retest, S/R failed breakout.
+    All five must receive the identical already-fetched `df` object for a
+    given symbol/timeframe (not a fresh copy per detector); only the first
+    two receive `context_df_15m` — the three S/R detectors must be called
+    with no such keyword at all.
+    """
+    db_path = str(tmp_path / "five_detectors_order.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+        _load_into_store(store, "BTC", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "3m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "15m", _sweep_reclaim_df())
+
+        calls: list[tuple[str, str, str]] = []
+        seen_dfs: dict[str, pd.DataFrame] = {}
+
+        def _make_context_fake(name):
+            def fake(symbol, timeframe, df, context_df_15m=None):
+                calls.append((name, symbol, timeframe))
+                seen_dfs.setdefault(timeframe, df)
+                assert df is seen_dfs[timeframe]
+                assert context_df_15m is not None
+                return []
+
+            return fake
+
+        def _make_no_context_fake(name):
+            def fake(symbol, timeframe, df, **kwargs):
+                calls.append((name, symbol, timeframe))
+                seen_dfs.setdefault(timeframe, df)
+                assert df is seen_dfs[timeframe]
+                assert kwargs == {}
+                return []
+
+            return fake
+
+        monkeypatch.setattr(
+            opportunity_engine, "detect_volatility_compression",
+            _make_context_fake("volatility_compression"),
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_sweep_reclaim", _make_context_fake("sweep_reclaim")
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_rejection",
+            _make_no_context_fake("support_resistance_rejection"),
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_breakout_retest",
+            _make_no_context_fake("support_resistance_breakout_retest"),
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_failed_breakout",
+            _make_no_context_fake("support_resistance_failed_breakout"),
+        )
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        assert summary.detector_errors == 0
+        expected_order = [
+            "volatility_compression",
+            "sweep_reclaim",
+            "support_resistance_rejection",
+            "support_resistance_breakout_retest",
+            "support_resistance_failed_breakout",
+        ]
+        for timeframe in ("3m", "5m"):
+            tf_calls = [c for c in calls if c[2] == timeframe]
+            assert [c[0] for c in tf_calls] == expected_order
+            assert all(c[1] == "BTC" for c in tf_calls)
+    finally:
+        close_db()
+
+
+def test_all_three_support_resistance_families_persist_end_to_end_with_exact_family_values(
+    monkeypatch, tmp_path
+):
+    db_path = str(tmp_path / "sr_persist.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+        _load_into_store(store, "BTC", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "3m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "15m", _sweep_reclaim_df())
+
+        rejection_finding = _make_finding(
+            setup_family="SUPPORT_RESISTANCE_REJECTION",
+            detector_version="support_resistance_rejection_v0_1",
+            fingerprint_key="rejection-1",
+            direction="SHORT",
+            anchor_price=105.0,
+            evidence={"zone_lower": 104.5, "zone_upper": 105.5},
+        )
+        breakout_retest_finding = _make_finding(
+            setup_family="SUPPORT_RESISTANCE_BREAKOUT_RETEST",
+            detector_version="support_resistance_breakout_retest_v0_1",
+            fingerprint_key="breakout-retest-1",
+            direction="LONG",
+        )
+        failed_breakout_finding = _make_finding(
+            setup_family="SUPPORT_RESISTANCE_FAILED_BREAKOUT",
+            detector_version="support_resistance_failed_breakout_v0_1",
+            fingerprint_key="failed-breakout-1",
+            direction="SHORT",
+        )
+
+        monkeypatch.setattr(opportunity_engine, "detect_volatility_compression", lambda *a, **k: [])
+        monkeypatch.setattr(opportunity_engine, "detect_sweep_reclaim", lambda *a, **k: [])
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_rejection",
+            lambda *a, **k: [rejection_finding],
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_breakout_retest",
+            lambda *a, **k: [breakout_retest_finding],
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_failed_breakout",
+            lambda *a, **k: [failed_breakout_finding],
+        )
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+        assert summary.detector_errors == 0
+
+        # Each fake always returns the identical finding object regardless of
+        # which timeframe invoked it, so the 3m and 5m calls share one
+        # fingerprint (primary_timeframe is a field of the finding, not of
+        # the call) and collapse into a single re-confirmed row per family —
+        # exactly three rows, one per S/R family.
+        rows = repo.get_opportunities(conn)
+        assert len(rows) == 3
+        families = {r["setup_family"] for r in rows}
+        assert families == {
+            "SUPPORT_RESISTANCE_REJECTION",
+            "SUPPORT_RESISTANCE_BREAKOUT_RETEST",
+            "SUPPORT_RESISTANCE_FAILED_BREAKOUT",
+        }
+
+        rejection_row = next(r for r in rows if r["setup_family"] == "SUPPORT_RESISTANCE_REJECTION")
+        assert rejection_row["direction"] == "SHORT"
+        assert rejection_row["detector_version"] == "support_resistance_rejection_v0_1"
+        assert rejection_row["anchor_price"] == 105.0
+        assert json.loads(rejection_row["evidence_json"]) == {
+            "zone_lower": 104.5, "zone_upper": 105.5,
+        }
+        assert rejection_row["occurrence_count"] == 2  # touched once more (3m then 5m)
+    finally:
+        close_db()
+
+
+def test_one_detector_exception_increments_counter_and_does_not_suppress_others(
+    monkeypatch, tmp_path, caplog
+):
+    """A single SUPPORT_RESISTANCE_REJECTION exception must be isolated at
+    detector/symbol/timeframe granularity: it must not prevent the other
+    four detectors from running for that same timeframe, nor prevent the
+    next timeframe (or the outer per-symbol scan) from completing.
+    """
+    db_path = str(tmp_path / "detector_error.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+        _load_into_store(store, "BTC", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "3m", _sweep_reclaim_df())
+        _load_into_store(store, "BTC", "15m", _sweep_reclaim_df())
+
+        other_calls: list[tuple[str, str]] = []
+
+        def _raiser(symbol, timeframe, df, **kwargs):
+            raise RuntimeError(f"simulated failure for {symbol}/{timeframe}")
+
+        def _recorder(name):
+            def fake(symbol, timeframe, df, **kwargs):
+                other_calls.append((name, timeframe))
+                return []
+
+            return fake
+
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_rejection", _raiser
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_volatility_compression",
+            _recorder("volatility_compression"),
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_sweep_reclaim", _recorder("sweep_reclaim")
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_breakout_retest",
+            _recorder("support_resistance_breakout_retest"),
+        )
+        monkeypatch.setattr(
+            opportunity_engine, "detect_support_resistance_failed_breakout",
+            _recorder("support_resistance_failed_breakout"),
+        )
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        # One raise per eligible timeframe (3m and 5m both qualify).
+        assert summary.detector_errors == 2
+        assert summary.markets_scanned == 1
+        assert summary.timeframe_pairs_scanned == 2
+
+        for name in (
+            "volatility_compression",
+            "sweep_reclaim",
+            "support_resistance_breakout_retest",
+            "support_resistance_failed_breakout",
+        ):
+            assert {tf for (n, tf) in other_calls if n == name} == {"3m", "5m"}, name
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 2
+        for record in error_records:
+            message = record.getMessage()
+            assert "support_resistance_rejection" in message
+            assert "BTC" in message
+        logged_timeframes = {
+            tf for r in error_records for tf in ("3m", "5m") if tf in r.getMessage()
+        }
+        assert logged_timeframes == {"3m", "5m"}
+    finally:
+        close_db()
