@@ -1,9 +1,27 @@
 """TA Opportunity Engine v0.1 orchestration — additive, research-only.
 
-Runs the VOLATILITY_COMPRESSION and SWEEP_RECLAIM detectors over 3m/5m
-candles already held in the shared CandleStore (no new REST/WS calls, no
-new per-symbol DB queries — see CLAUDE.md milestone spec J), using 15m
-purely as recorded context, never a hard gate.
+Runs the VOLATILITY_COMPRESSION, SWEEP_RECLAIM, SUPPORT_RESISTANCE_REJECTION,
+SUPPORT_RESISTANCE_BREAKOUT_RETEST, and SUPPORT_RESISTANCE_FAILED_BREAKOUT
+detectors, in that fixed order, over 3m/5m candles already held in the
+shared CandleStore (no new REST/WS calls, no new per-symbol DB queries — see
+CLAUDE.md milestone spec J), using 15m purely as recorded context for the
+first two detectors, never a hard gate. The three Support/Resistance
+detectors do not take a 15m context argument at all — they evaluate `df`
+alone, at their own default parameters.
+
+Detector error containment
+---------------------------
+Each of the five detector calls is isolated individually: an exception
+raised by one detector for one symbol/timeframe increments
+`OpportunityScanSummary.detector_errors`, is logged once via
+`logger.error(..., exc_info=True)` naming the detector, symbol, and
+timeframe, and does not prevent the remaining detectors for that
+symbol/timeframe (or any other symbol/timeframe) from running. This sits
+*inside* the existing outer per-symbol try/except below, which remains the
+backstop for context/data/staleness/persistence failures (e.g. a bad 15m
+context fetch, a `_record_finding` failure) — it is not broadened to also
+swallow detector exceptions, since those are now handled at their own,
+finer granularity instead.
 
 This module is the only place that writes to opportunity_observations. It
 never touches signal_observations, signal_features, alerts, paper_trades,
@@ -94,6 +112,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -107,6 +126,15 @@ from apex.opportunity.contract import (
     DetectorFinding,
     Opportunity,
 )
+from apex.opportunity.detectors.support_resistance_breakout_retest import (
+    detect_support_resistance_breakout_retest,
+)
+from apex.opportunity.detectors.support_resistance_failed_breakout import (
+    detect_support_resistance_failed_breakout,
+)
+from apex.opportunity.detectors.support_resistance_rejection import (
+    detect_support_resistance_rejection,
+)
 from apex.opportunity.detectors.sweep_reclaim import detect_sweep_reclaim
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
 from apex.utils.ids import new_uid
@@ -116,8 +144,9 @@ logger = logging.getLogger(__name__)
 
 OPPORTUNITY_TIMEFRAMES: tuple[str, ...] = ("3m", "5m")
 
-# Enough history for both detectors' lookbacks (ATR/compression baseline is
-# the larger of the two requirements) plus headroom.
+# Enough history for all five detectors' lookbacks (VOLATILITY_COMPRESSION's
+# baseline window remains the largest of the five requirements) plus
+# headroom.
 MIN_CANDLES_REQUIRED = 60
 
 # A timeframe's ACTIVE opportunity expires if not re-confirmed within this
@@ -139,13 +168,15 @@ class OpportunityScanSummary:
     new_opportunities: int = 0
     re_confirmed: int = 0
     expired: int = 0
+    detector_errors: int = 0
 
     def log(self, logger: logging.Logger) -> None:
         logger.info(
             "[OPPORTUNITY ENGINE] "
             f"{self.markets_scanned} markets, {self.timeframe_pairs_scanned} symbol/timeframe pairs, "
             f"{self.findings} findings ({self.new_opportunities} new, {self.re_confirmed} re-confirmed), "
-            f"{self.expired} expired, {self.no_data} no data, {self.stale} stale"
+            f"{self.expired} expired, {self.no_data} no data, {self.stale} stale, "
+            f"{self.detector_errors} detector errors"
         )
 
 
@@ -160,6 +191,33 @@ def _ms_to_iso(ms: int) -> str:
     time.time()/datetime.now() call.
     """
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _safe_detect(
+    detector_name: str,
+    symbol: str,
+    timeframe: str,
+    summary: OpportunityScanSummary,
+    call: Callable[[], list[DetectorFinding]],
+) -> list[DetectorFinding]:
+    """Run one detector call in isolation.
+
+    An exception here must never abort the remaining detectors for this
+    symbol/timeframe (nor the outer per-symbol backstop it runs inside, see
+    run_opportunity_scan) — it is counted and logged at detector/symbol/
+    timeframe granularity instead, and treated as "no findings" for this one
+    detector call.
+    """
+    try:
+        return call()
+    except Exception:
+        summary.detector_errors += 1
+        logger.error(
+            f"Opportunity detector error: detector={detector_name} symbol={symbol} "
+            f"timeframe={timeframe}",
+            exc_info=True,
+        )
+        return []
 
 
 def compute_fingerprint(finding: DetectorFinding) -> str:
@@ -256,12 +314,53 @@ async def run_opportunity_scan(
                 summary.timeframe_pairs_scanned += 1
                 findings: list[DetectorFinding] = []
                 findings.extend(
-                    detect_volatility_compression(
-                        symbol, timeframe, df, context_df_15m=context_df_15m
+                    _safe_detect(
+                        "volatility_compression",
+                        symbol,
+                        timeframe,
+                        summary,
+                        lambda: detect_volatility_compression(
+                            symbol, timeframe, df, context_df_15m=context_df_15m
+                        ),
                     )
                 )
                 findings.extend(
-                    detect_sweep_reclaim(symbol, timeframe, df, context_df_15m=context_df_15m)
+                    _safe_detect(
+                        "sweep_reclaim",
+                        symbol,
+                        timeframe,
+                        summary,
+                        lambda: detect_sweep_reclaim(
+                            symbol, timeframe, df, context_df_15m=context_df_15m
+                        ),
+                    )
+                )
+                findings.extend(
+                    _safe_detect(
+                        "support_resistance_rejection",
+                        symbol,
+                        timeframe,
+                        summary,
+                        lambda: detect_support_resistance_rejection(symbol, timeframe, df),
+                    )
+                )
+                findings.extend(
+                    _safe_detect(
+                        "support_resistance_breakout_retest",
+                        symbol,
+                        timeframe,
+                        summary,
+                        lambda: detect_support_resistance_breakout_retest(symbol, timeframe, df),
+                    )
+                )
+                findings.extend(
+                    _safe_detect(
+                        "support_resistance_failed_breakout",
+                        symbol,
+                        timeframe,
+                        summary,
+                        lambda: detect_support_resistance_failed_breakout(symbol, timeframe, df),
+                    )
                 )
 
                 for finding in findings:
