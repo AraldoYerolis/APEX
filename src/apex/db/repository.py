@@ -8,6 +8,7 @@ from typing import Optional
 
 from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalFeature, SignalObservation, Snooze
 from apex.opportunity.contract import Opportunity
+from apex.opportunity.scoring import SCORE_VERSION
 
 
 def _now_utc() -> str:
@@ -662,8 +663,10 @@ def insert_opportunity(conn: sqlite3.Connection, opportunity: Opportunity) -> in
             research_only, first_detected_at, last_seen_at, occurrence_count,
             source_candle_open_time, source_candle_close_time,
             anchor_price, anchor_open_time,
-            evidence_json, warnings_json, measurements_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            evidence_json, warnings_json, measurements_json,
+            context_json, component_scores_json, total_score,
+            score_version, score_warnings_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             opportunity.opportunity_uid,
@@ -686,6 +689,16 @@ def insert_opportunity(conn: sqlite3.Connection, opportunity: Opportunity) -> in
             opportunity.evidence_json,
             opportunity.warnings_json,
             opportunity.measurements_json,
+            # Context and ranking v0.1 — immutable first-detection score/
+            # context snapshot (see contract.py's Opportunity docstring and
+            # engine.py's _record_finding). touch_opportunity() below never
+            # writes these five columns, so this INSERT is their only
+            # writer for a row's entire lifetime.
+            opportunity.context_json,
+            opportunity.component_scores_json,
+            opportunity.total_score,
+            opportunity.score_version,
+            opportunity.score_warnings_json,
         ),
     )
     conn.commit()
@@ -788,4 +801,89 @@ def get_opportunities(
     return conn.execute(
         f"SELECT * FROM opportunity_observations {where} ORDER BY last_seen_at DESC LIMIT ?",
         params,
+    ).fetchall()
+
+
+def get_ranked_opportunities(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[str] = None,
+    setup_family: Optional[str] = None,
+    symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    primary_timeframe: Optional[str] = None,
+    status: Optional[str] = "ACTIVE",
+    limit: int = 500,
+) -> list[sqlite3.Row]:
+    """Read-only ranked query for reporting (Context and ranking v0.1) —
+    never used by the engine itself, and never writes anything.
+
+    Ranking is applied over the FULL filtered result set BEFORE `LIMIT` is
+    applied (a single ORDER BY ... LIMIT statement, not a Python sort of an
+    already-limited batch), within whatever `since`/`setup_family`/
+    `symbol`/`direction`/`primary_timeframe`/`status` filters are supplied —
+    it never reaches across those filters.
+
+    A row ranks in the "scored" group only if its `score_version` matches
+    the CURRENT `apex.opportunity.scoring.SCORE_VERSION` AND its
+    `total_score` is a finite, in-range [0, 100] number; every other row
+    (NULL score, an older/unknown score_version, or a malformed/
+    out-of-range stored value) is explicitly unscored/incompatible and
+    always sorts after every scored row, regardless of its numeric value.
+    Deterministic tie-break within each group: total_score DESC,
+    last_seen_at DESC, symbol ASC, primary_timeframe ASC, setup_family ASC,
+    direction ASC, opportunity_uid ASC — never incidental DB row order.
+
+    `status` defaults to 'ACTIVE' (an explicit, historical EXPIRED view is
+    a separate, deliberate call with `status="EXPIRED"`; the two are never
+    mixed by default). Pass `status=None` to explicitly disable the status
+    filter and rank across every status.
+    """
+    conditions = []
+    params: list = []
+    if since:
+        conditions.append("last_seen_at >= ?")
+        params.append(since)
+    if setup_family:
+        conditions.append("setup_family = ?")
+        params.append(setup_family)
+    if symbol:
+        conditions.append("symbol = ?")
+        params.append(symbol.upper())
+    if direction:
+        conditions.append("direction = ?")
+        params.append(direction)
+    if primary_timeframe:
+        conditions.append("primary_timeframe = ?")
+        params.append(primary_timeframe)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    query_params = [SCORE_VERSION, *params, limit]
+    return conn.execute(
+        f"""
+        SELECT *,
+            CASE
+                WHEN score_version = ?
+                     AND total_score IS NOT NULL
+                     AND typeof(total_score) IN ('integer', 'real')
+                     AND total_score >= 0 AND total_score <= 100
+                THEN 0 ELSE 1
+            END AS rank_group
+        FROM opportunity_observations
+        {where}
+        ORDER BY
+            rank_group ASC,
+            total_score DESC,
+            last_seen_at DESC,
+            symbol ASC,
+            primary_timeframe ASC,
+            setup_family ASC,
+            direction ASC,
+            opportunity_uid ASC
+        LIMIT ?
+        """,
+        query_params,
     ).fetchall()

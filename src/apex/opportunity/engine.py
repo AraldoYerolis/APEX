@@ -115,16 +115,29 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional, get_args
 
 from apex.config import Settings
 from apex.data.candle_store import CandleStore
 from apex.db import repository as repo
+from apex.opportunity.context import (
+    StructureComponent,
+    TrendComponent,
+    VolatilityComponent,
+    assemble_context,
+    compute_primary_structure_component,
+    compute_symbol_trend_component,
+    compute_volatility_component,
+    context_to_dict,
+    not_applicable_trend_component,
+)
 from apex.opportunity.contract import (
     CONTRACT_VERSION,
     DIRECTION_INVARIANT_FAMILIES,
     DIRECTION_INVARIANT_FINGERPRINT_TOKEN,
     DetectorFinding,
     Opportunity,
+    SetupFamily,
 )
 from apex.opportunity.detectors.support_resistance_breakout_retest import (
     detect_support_resistance_breakout_retest,
@@ -137,12 +150,29 @@ from apex.opportunity.detectors.support_resistance_rejection import (
 )
 from apex.opportunity.detectors.sweep_reclaim import detect_sweep_reclaim
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
+from apex.opportunity.scoring import SCORE_VERSION, component_scores_to_dict, score_opportunity
 from apex.utils.ids import new_uid
 from apex.utils.time import minutes_ago_iso
 
 logger = logging.getLogger(__name__)
 
 OPPORTUNITY_TIMEFRAMES: tuple[str, ...] = ("3m", "5m")
+
+# Reference symbol for the BTC 15m trend context component (see context.py's
+# btc_htf_trend / scoring.py's btc_alignment). Matches the literal "BTC"
+# already used for macro context elsewhere (scheduler/tasks.py) rather than
+# introducing a new settings knob for this milestone.
+BTC_SYMBOL = "BTC"
+
+# Context and ranking v0.1 — a finding's setup_family is only ever a
+# detector-assigned literal today, but _build_score_snapshot below still
+# validates it against the sealed contract before scoring (typing.get_args,
+# never a hand-maintained duplicate list), so an unsupported/malformed
+# family degrades to an explicit unscored warning instead of silently
+# scoring under assumptions that don't hold for it. This never widens what
+# is persisted to opportunity_observations.setup_family itself (schema.sql's
+# own CHECK constraint is untouched).
+SUPPORTED_SETUP_FAMILIES = frozenset(get_args(SetupFamily))
 
 # Enough history for all five detectors' lookbacks (VOLATILITY_COMPRESSION's
 # baseline window remains the largest of the five requirements) plus
@@ -169,6 +199,20 @@ class OpportunityScanSummary:
     re_confirmed: int = 0
     expired: int = 0
     detector_errors: int = 0
+    # Context and ranking v0.1 — optional-enrichment failure counters,
+    # entirely separate from detector_errors. Neither ever skips
+    # _record_finding or any other finding/market: an enrichment failure
+    # only ever degrades that one opportunity's context/score to NULL (see
+    # _record_finding / _build_score_snapshot below). context_errors covers
+    # BOTH a failing candle fetch (BTC or symbol 15m get_df) AND a failing
+    # context *computation* (compute_symbol_trend_component,
+    # compute_primary_structure_component, compute_volatility_component) —
+    # each of the four call sites is caught individually and substitutes a
+    # directly-constructed typed UNAVAILABLE fallback (never a second call
+    # into the same failing computation) so the remaining healthy
+    # components, later timeframes, and later markets are unaffected.
+    context_errors: int = 0
+    score_errors: int = 0
 
     def log(self, logger: logging.Logger) -> None:
         logger.info(
@@ -176,8 +220,28 @@ class OpportunityScanSummary:
             f"{self.markets_scanned} markets, {self.timeframe_pairs_scanned} symbol/timeframe pairs, "
             f"{self.findings} findings ({self.new_opportunities} new, {self.re_confirmed} re-confirmed), "
             f"{self.expired} expired, {self.no_data} no data, {self.stale} stale, "
-            f"{self.detector_errors} detector errors"
+            f"{self.detector_errors} detector errors, "
+            f"{self.context_errors} context fetch/computation errors, "
+            f"{self.score_errors} scoring errors"
         )
+
+
+@dataclass
+class ContextInputs:
+    """Shared, already-computed context components for one (symbol,
+    timeframe) pair's findings — built at most once per (symbol, timeframe)
+    per scan (see run_opportunity_scan) and reused across every finding
+    that timeframe produces. Only `_record_finding`'s NEW-row path ever
+    reads this; a re-confirmation (touch) never does (see the module
+    docstring's immutable first-detection snapshot policy).
+    """
+
+    as_of_ms: int
+    primary_timeframe: str
+    symbol_htf_trend: TrendComponent
+    primary_structure: StructureComponent
+    btc_htf_trend: TrendComponent
+    volatility: VolatilityComponent
 
 
 def _ms_to_iso(ms: int) -> str:
@@ -297,10 +361,90 @@ async def run_opportunity_scan(
             conn, primary_timeframe=timeframe, cutoff_iso=cutoff
         )
 
+    # BTC 15m context is fetched at most once per scan, using the same
+    # now_ms as every other read this scan — never per-symbol, never a
+    # second independent clock/read. A missing or failing read degrades
+    # gracefully (btc_df_15m stays None -> every symbol's btc_htf_trend
+    # component becomes UNAVAILABLE, never an aborted scan).
+    try:
+        btc_df_15m = candle_store.get_df(BTC_SYMBOL, "15m", now_ms=now_ms)
+    except Exception:
+        summary.context_errors += 1
+        logger.error("Opportunity BTC 15m context fetch error", exc_info=True)
+        btc_df_15m = None
+    try:
+        btc_trend_component = compute_symbol_trend_component(btc_df_15m, now_ms)
+    except Exception:
+        # Caught separately from the fetch above: a failure HERE means the
+        # frame was fetched fine but the pure computation itself raised. A
+        # typed UNAVAILABLE fallback is constructed directly — this must
+        # never call compute_symbol_trend_component(btc_df_15m, now_ms)
+        # again to "recover", since that is the exact call that just failed.
+        summary.context_errors += 1
+        logger.error("Opportunity BTC 15m trend computation error", exc_info=True)
+        btc_trend_component = TrendComponent(
+            status="UNAVAILABLE",
+            direction=None,
+            reason="COMPUTATION_FAILED",
+            sample_count=0,
+            latest_close_boundary_ms=None,
+        )
+
     for market in markets:
         symbol = market.symbol
         try:
-            context_df_15m = candle_store.get_df(symbol, "15m", now_ms=now_ms)
+            # The symbol's own 15m context fetch and its own trend
+            # computation are each isolated in their own try/except (not the
+            # outer per-symbol one below), so either one failing degrades
+            # gracefully instead of aborting this symbol's otherwise-valid
+            # 3m/5m primary detection entirely.
+            #
+            # Computed once per symbol (not per timeframe): symbol_htf_trend
+            # always reads the same 15m frame regardless of 3m vs 5m, and
+            # symbol_btc_htf_trend is either the shared once-per-scan BTC
+            # component or the fixed NOT_APPLICABLE constant for BTC itself.
+            #
+            # When symbol IS the BTC reference symbol, its own 15m trend is
+            # IDENTICAL to btc_trend_component (same frame, same now_ms) —
+            # reuse that already-computed result directly rather than
+            # calling compute_symbol_trend_component a second time on the
+            # same inputs (BTC trend is computed at most once per scan).
+            if symbol == BTC_SYMBOL:
+                context_df_15m = btc_df_15m
+                symbol_htf_trend = btc_trend_component
+            else:
+                try:
+                    context_df_15m = candle_store.get_df(symbol, "15m", now_ms=now_ms)
+                except Exception:
+                    summary.context_errors += 1
+                    logger.error(
+                        f"Opportunity 15m context fetch error for {symbol}", exc_info=True
+                    )
+                    context_df_15m = None
+                try:
+                    symbol_htf_trend = compute_symbol_trend_component(context_df_15m, now_ms)
+                except Exception:
+                    # Caught separately from the fetch above (own try/except,
+                    # not the outer per-symbol backstop): a failure here must
+                    # degrade only this symbol's own trend to UNAVAILABLE, not
+                    # abort this symbol's otherwise-valid 3m/5m primary
+                    # detection below. A typed UNAVAILABLE fallback is
+                    # constructed directly — never a second call into the
+                    # same failing computation.
+                    summary.context_errors += 1
+                    logger.error(
+                        f"Opportunity 15m trend computation error for {symbol}", exc_info=True
+                    )
+                    symbol_htf_trend = TrendComponent(
+                        status="UNAVAILABLE",
+                        direction=None,
+                        reason="COMPUTATION_FAILED",
+                        sample_count=0,
+                        latest_close_boundary_ms=None,
+                    )
+            symbol_btc_htf_trend = (
+                not_applicable_trend_component() if symbol == BTC_SYMBOL else btc_trend_component
+            )
 
             for timeframe in OPPORTUNITY_TIMEFRAMES:
                 df = candle_store.get_df(symbol, timeframe, now_ms=now_ms)
@@ -363,8 +507,66 @@ async def run_opportunity_scan(
                     )
                 )
 
+                # primary_structure/volatility are only computed "as
+                # needed" — i.e. lazily, once per eligible (symbol,
+                # timeframe), and only when there is at least one finding
+                # to score (skipped entirely on a no-findings timeframe).
+                context_inputs: Optional[ContextInputs] = None
+                if findings:
+                    # Each computation is caught in its own try/except so a
+                    # failure here can only ever degrade that one component
+                    # to a directly-constructed typed UNAVAILABLE fallback
+                    # (never a second call into the same failing
+                    # computation) — it must never discard the findings
+                    # already collected above for this (symbol, timeframe),
+                    # nor prevent the _record_finding loop below from
+                    # running for them.
+                    try:
+                        primary_structure = compute_primary_structure_component(
+                            df, timeframe, now_ms
+                        )
+                    except Exception:
+                        summary.context_errors += 1
+                        logger.error(
+                            "Opportunity primary structure computation error for "
+                            f"{symbol}/{timeframe}",
+                            exc_info=True,
+                        )
+                        primary_structure = StructureComponent(
+                            status="UNAVAILABLE",
+                            direction=None,
+                            reason="COMPUTATION_FAILED",
+                            sample_count=0,
+                            latest_close_boundary_ms=None,
+                        )
+                    try:
+                        volatility = compute_volatility_component(df, timeframe, now_ms)
+                    except Exception:
+                        summary.context_errors += 1
+                        logger.error(
+                            f"Opportunity volatility computation error for {symbol}/{timeframe}",
+                            exc_info=True,
+                        )
+                        volatility = VolatilityComponent(
+                            status="UNAVAILABLE",
+                            atr_percent=None,
+                            reason="COMPUTATION_FAILED",
+                            sample_count=0,
+                            latest_close_boundary_ms=None,
+                        )
+                    context_inputs = ContextInputs(
+                        as_of_ms=now_ms,
+                        primary_timeframe=timeframe,
+                        symbol_htf_trend=symbol_htf_trend,
+                        primary_structure=primary_structure,
+                        btc_htf_trend=symbol_btc_htf_trend,
+                        volatility=volatility,
+                    )
+
                 for finding in findings:
-                    is_new = _record_finding(conn, finding, now)
+                    is_new = _record_finding(
+                        conn, finding, now, context_inputs=context_inputs, summary=summary
+                    )
                     summary.findings += 1
                     if is_new:
                         summary.new_opportunities += 1
@@ -378,11 +580,87 @@ async def run_opportunity_scan(
     return summary
 
 
-def _record_finding(conn: sqlite3.Connection, finding: DetectorFinding, now: str) -> bool:
+def _build_score_snapshot(
+    finding: DetectorFinding,
+    context_inputs: Optional[ContextInputs],
+) -> tuple[Optional[str], Optional[str], Optional[float], Optional[str], Optional[str]]:
+    """Build the one-time, immutable first-detection context/score snapshot
+    for a NEW opportunity row only — reconfirmations (touch_opportunity)
+    never call this again, for any family (see module docstring).
+
+    Returns `(context_json, component_scores_json, total_score,
+    score_version, score_warnings_json)`.
+
+    `context_inputs is None` (no enrichment supplied at all — e.g. a unit
+    test calling `_record_finding` directly) is not an error: it silently
+    yields all-NULL fields with no warning, distinct from an enrichment
+    that was actually attempted and failed below (which still yields NULL
+    context/score, but tags score_version and records an explicit
+    warning). Any exception here is contained — the caller still inserts
+    the original detector finding either way.
+    """
+    if context_inputs is None:
+        return None, None, None, None, None
+    if finding.setup_family not in SUPPORTED_SETUP_FAMILIES:
+        # Defensive: setup_family is only ever detector-assigned today (the
+        # five literals in contract.SetupFamily), but this is verified
+        # against the sealed contract (typing.get_args) rather than assumed,
+        # so an unsupported/malformed value never reaches assemble_context/
+        # score_opportunity — it yields the same NULL-enrichment-plus-
+        # explicit-warning outcome as any other contained scoring failure,
+        # and never loosens schema.sql's own setup_family CHECK constraint.
+        logger.error(
+            "Opportunity scoring error: unsupported setup_family="
+            f"{finding.setup_family} symbol={finding.symbol} "
+            f"timeframe={finding.primary_timeframe}"
+        )
+        return None, None, None, SCORE_VERSION, json.dumps(["UNSUPPORTED_SETUP_FAMILY"])
+    try:
+        context = assemble_context(
+            as_of_ms=context_inputs.as_of_ms,
+            primary_timeframe=context_inputs.primary_timeframe,
+            scored_direction=finding.direction,
+            symbol_htf_trend=context_inputs.symbol_htf_trend,
+            primary_structure=context_inputs.primary_structure,
+            btc_htf_trend=context_inputs.btc_htf_trend,
+            volatility=context_inputs.volatility,
+        )
+        result = score_opportunity(context)
+        context_json = json.dumps(context_to_dict(context), allow_nan=False)
+        component_scores_json = json.dumps(component_scores_to_dict(result), allow_nan=False)
+        score_warnings_json = json.dumps(list(result.warnings), allow_nan=False)
+        return (
+            context_json,
+            component_scores_json,
+            result.total_score,
+            result.score_version,
+            score_warnings_json,
+        )
+    except Exception:
+        logger.error(
+            "Opportunity context/scoring error: "
+            f"symbol={finding.symbol} timeframe={finding.primary_timeframe} "
+            f"family={finding.setup_family}",
+            exc_info=True,
+        )
+        return None, None, None, SCORE_VERSION, json.dumps(["CONTEXT_SCORING_FAILED"])
+
+
+def _record_finding(
+    conn: sqlite3.Connection,
+    finding: DetectorFinding,
+    now: str,
+    *,
+    context_inputs: Optional[ContextInputs] = None,
+    summary: Optional[OpportunityScanSummary] = None,
+) -> bool:
     """Insert or touch the opportunity row for this finding.
 
     Returns True if a new row was inserted, False if an existing ACTIVE
-    opportunity was touched instead.
+    opportunity was touched instead. `context_inputs`/`summary` are
+    optional keyword-only additions (Context and ranking v0.1) so existing
+    callers that pass only `(conn, finding, now)` keep working unchanged —
+    see _build_score_snapshot.
     """
     fingerprint = compute_fingerprint(finding)
     existing = repo.get_active_opportunity_by_fingerprint(conn, fingerprint)
@@ -404,7 +682,20 @@ def _record_finding(conn: sqlite3.Connection, finding: DetectorFinding, now: str
             occurrence_count=int(existing["occurrence_count"]) + 1,
             measurements_json=measurements_json,
         )
+        # touch_opportunity() never touches context_json/component_scores_json/
+        # total_score/score_version/score_warnings_json for any family — the
+        # first-detection snapshot (including NULL, if that is what was first
+        # recorded) stays frozen exactly as inserted.
         return False
+
+    context_json, component_scores_json, total_score, score_version, score_warnings_json = (
+        _build_score_snapshot(finding, context_inputs)
+    )
+    if context_inputs is not None and context_json is None and summary is not None:
+        # An enrichment attempt was made (context_inputs supplied) but
+        # failed (contained inside _build_score_snapshot) — distinct from
+        # "no enrichment supplied at all", which is not an error.
+        summary.score_errors += 1
 
     opportunity = Opportunity(
         opportunity_uid=new_uid(),
@@ -423,6 +714,11 @@ def _record_finding(conn: sqlite3.Connection, finding: DetectorFinding, now: str
         evidence_json=json.dumps(finding.evidence),
         warnings_json=json.dumps(finding.warnings),
         measurements_json=json.dumps(finding.measurements),
+        context_json=context_json,
+        component_scores_json=component_scores_json,
+        total_score=total_score,
+        score_version=score_version,
+        score_warnings_json=score_warnings_json,
     )
     opportunity.id = repo.insert_opportunity(conn, opportunity)
     return True

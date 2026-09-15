@@ -1,14 +1,24 @@
-"""Tests for the opportunity_observations.setup_family widening migration
-(src/apex/db/connection.py's _migrate_opportunity_observations_setup_family,
-invoked by init_db()).
+"""Tests for the opportunity_observations schema migrations in
+src/apex/db/connection.py, invoked by init_db():
+_migrate_opportunity_observations_setup_family (the five-family widening)
+and _migrate_opportunity_observations_score_columns (Context and ranking
+v0.1's five nullable score/context columns), including their required
+ordering.
 
 Covers: a fresh database accepting all five setup families and rejecting an
-unknown one; an old exact two-family table with representative ACTIVE and
-EXPIRED rows migrating without data/ID/timestamp/JSON/default/constraint/
-index loss; a second init_db() call being idempotent; and unexpected table
+unknown one, and already declaring all five score columns; an old exact
+two-family table with representative ACTIVE and EXPIRED rows migrating
+without data/ID/timestamp/JSON/default/constraint/index loss, ending up
+with all five score columns NULL (no backfill/re-scoring); a second
+init_db() call being idempotent; a current five-family database that
+predates the score columns gaining exactly those five, appended at the end,
+via ALTER; a database with only some score columns already present gaining
+the rest; an induced score-column type mismatch failing closed without
+altering anything; and the setup_family migration's own unexpected table
 shape, a trigger, an unexpected existing family value, or a leftover
 migration table each failing closed and leaving the original table/data
-usable and unchanged.
+usable and unchanged (score-column migration never reached in those cases,
+since it deliberately runs AFTER setup_family migration).
 
 All tests use disposable tmp_path SQLite files only — never the production
 database or any repository data file.
@@ -22,9 +32,13 @@ import pytest
 from apex.db import connection as connection_module
 from apex.db.connection import (
     _OPPORTUNITY_OBSERVATIONS_MIGRATION_TMP_TABLE,
+    _OPPORTUNITY_OBSERVATIONS_SCORE_COLUMNS,
+    _migrate_opportunity_observations_score_columns,
     close_db,
     init_db,
 )
+
+_SCORE_COLUMN_NAMES = tuple(name for name, _ in _OPPORTUNITY_OBSERVATIONS_SCORE_COLUMNS)
 
 
 class _TrackingConnection(sqlite3.Connection):
@@ -79,7 +93,11 @@ CREATE INDEX idx_opportunity_observations_uid
     ON opportunity_observations(opportunity_uid);
 """
 
-_EXPECTED_COLUMNS = (
+# The pre-widen (setup_family migration) column shape — used to build the
+# old two-family test database (_OLD_OPPORTUNITY_OBSERVATIONS_SQL matches
+# this exactly) and as the expected shape immediately after that migration
+# alone, before the score-column migration has run.
+_PRE_SCORE_COLUMNS = (
     "id", "opportunity_uid", "fingerprint", "symbol", "direction", "setup_family",
     "detector_version", "contract_version", "primary_timeframe", "status",
     "research_only", "first_detected_at", "last_seen_at", "occurrence_count",
@@ -87,6 +105,11 @@ _EXPECTED_COLUMNS = (
     "anchor_open_time", "evidence_json", "warnings_json", "measurements_json",
     "closed_at", "created_at", "updated_at",
 )
+
+# The full column shape after BOTH migrations have run (init_db()'s normal,
+# complete path): the five Context and ranking v0.1 score columns are always
+# appended after `updated_at` by ALTER TABLE ADD COLUMN, in this fixed order.
+_EXPECTED_COLUMNS = _PRE_SCORE_COLUMNS + _SCORE_COLUMN_NAMES
 
 _EXPECTED_INDEXES = (
     "idx_opportunity_observations_fingerprint",
@@ -280,6 +303,11 @@ def test_old_two_family_table_migrates_preserving_data_and_allows_new_families(t
             actual = rows[expected["opportunity_uid"]]
             for key, value in expected.items():
                 assert actual[key] == value, f"{expected['opportunity_uid']}.{key} changed"
+            # Context and ranking v0.1's five score columns are additive-only:
+            # a legacy row migrated here gets them as NULL, never backfilled
+            # or re-scored from data that didn't exist at first detection.
+            for score_column in _SCORE_COLUMN_NAMES:
+                assert actual[score_column] is None, f"{score_column} was backfilled"
 
         # New families can now be inserted; unknown families are still rejected.
         _insert_opportunity(conn, setup_family="SUPPORT_RESISTANCE_REJECTION", uid="new-1")
@@ -316,6 +344,8 @@ def test_second_init_db_call_is_idempotent(tmp_path):
         assert rows_after_second == rows_after_first
         assert _table_sql(conn2, "opportunity_observations") == table_sql_after_first
         assert _index_names(conn2, "opportunity_observations") == set(_EXPECTED_INDEXES)
+        columns = conn2.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        assert tuple(c["name"] for c in columns) == _EXPECTED_COLUMNS
 
         # Still usable and still enforcing the widened constraint.
         _insert_opportunity(conn2, setup_family="SUPPORT_RESISTANCE_FAILED_BREAKOUT", uid="post-idempotent")
@@ -479,3 +509,229 @@ def test_leftover_migration_tmp_table_fails_closed(tmp_path):
         assert leftover is not None
     finally:
         raw.close()
+
+
+# ------------------------------------------------------------------ score-column migration
+# (Context and ranking v0.1's _migrate_opportunity_observations_score_columns)
+
+
+# A "current" (already five-family-widened) opportunity_observations table
+# that predates Context and ranking v0.1 — i.e. it has all five setup
+# families in its CHECK constraint already, but none of the five score
+# columns. Distinct from _OLD_OPPORTUNITY_OBSERVATIONS_SQL (which is the
+# pre-widen two-family shape the setup_family migration itself targets).
+_FIVE_FAMILY_NO_SCORE_COLUMNS_SQL = """
+CREATE TABLE opportunity_observations (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_uid          TEXT NOT NULL UNIQUE,
+    fingerprint              TEXT NOT NULL,
+    symbol                   TEXT NOT NULL,
+    direction                TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+    setup_family             TEXT NOT NULL CHECK(setup_family IN (
+                                 'VOLATILITY_COMPRESSION','SWEEP_RECLAIM',
+                                 'SUPPORT_RESISTANCE_REJECTION','SUPPORT_RESISTANCE_BREAKOUT_RETEST',
+                                 'SUPPORT_RESISTANCE_FAILED_BREAKOUT'
+                             )),
+    detector_version         TEXT NOT NULL,
+    contract_version         TEXT NOT NULL,
+    primary_timeframe        TEXT NOT NULL CHECK(primary_timeframe IN ('3m','5m')),
+    status                   TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','EXPIRED')),
+    research_only            INTEGER NOT NULL DEFAULT 1,
+    first_detected_at        TEXT NOT NULL,
+    last_seen_at             TEXT NOT NULL,
+    occurrence_count         INTEGER NOT NULL DEFAULT 1,
+    source_candle_open_time  INTEGER NOT NULL,
+    source_candle_close_time INTEGER NOT NULL,
+    anchor_price             REAL,
+    anchor_open_time         INTEGER,
+    evidence_json            TEXT,
+    warnings_json            TEXT,
+    measurements_json        TEXT,
+    closed_at                TEXT,
+    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX idx_opportunity_observations_fingerprint
+    ON opportunity_observations(fingerprint, status);
+CREATE INDEX idx_opportunity_observations_lookup
+    ON opportunity_observations(symbol, setup_family, primary_timeframe, status);
+CREATE INDEX idx_opportunity_observations_uid
+    ON opportunity_observations(opportunity_uid);
+"""
+
+
+def _build_five_family_no_score_columns_db(db_path: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_FIVE_FAMILY_NO_SCORE_COLUMNS_SQL)
+        columns = ", ".join(_ACTIVE_ROW.keys())
+        placeholders = ", ".join("?" for _ in _ACTIVE_ROW)
+        conn.execute(
+            f"INSERT INTO opportunity_observations ({columns}) VALUES ({placeholders})",
+            tuple(_ACTIVE_ROW.values()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_fresh_database_already_has_all_five_score_columns_with_correct_types(tmp_path):
+    db_path = str(tmp_path / "fresh_score_columns.db")
+    conn = init_db(db_path)
+    try:
+        columns = {
+            row["name"]: row["type"]
+            for row in conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        }
+        for name, col_type in _OPPORTUNITY_OBSERVATIONS_SCORE_COLUMNS:
+            assert columns[name].upper() == col_type
+    finally:
+        close_db()
+
+
+def test_current_five_family_database_gains_exactly_the_five_score_columns(tmp_path):
+    db_path = str(tmp_path / "five_family_no_score.db")
+    _build_five_family_no_score_columns_db(db_path)
+
+    conn = init_db(db_path)
+    try:
+        columns = conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        assert tuple(c["name"] for c in columns) == _PRE_SCORE_COLUMNS + _SCORE_COLUMN_NAMES
+
+        row = conn.execute(
+            "SELECT * FROM opportunity_observations WHERE opportunity_uid='uid-active-1'"
+        ).fetchone()
+        for score_column in _SCORE_COLUMN_NAMES:
+            assert row[score_column] is None
+
+        # Still usable for real inserts including the new columns.
+        conn.execute(
+            """
+            INSERT INTO opportunity_observations (
+                opportunity_uid, fingerprint, symbol, direction, setup_family,
+                detector_version, contract_version, primary_timeframe,
+                first_detected_at, last_seen_at,
+                source_candle_open_time, source_candle_close_time,
+                total_score, score_version
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "uid-scored", "fp-scored", "BTC", "LONG", "SWEEP_RECLAIM",
+                "test_v0_1", "opportunity_v0_1", "5m",
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+                1000, 1300, 62.5, "context_alignment_v0_1",
+            ),
+        )
+        conn.commit()
+        scored_row = conn.execute(
+            "SELECT total_score, score_version FROM opportunity_observations WHERE opportunity_uid='uid-scored'"
+        ).fetchone()
+        assert scored_row["total_score"] == 62.5
+        assert scored_row["score_version"] == "context_alignment_v0_1"
+    finally:
+        close_db()
+
+
+def test_partial_score_columns_already_present_gains_only_the_rest(tmp_path):
+    db_path = str(tmp_path / "partial_score_columns.db")
+    _build_five_family_no_score_columns_db(db_path)
+
+    # Simulate a database that already gained ONE of the five columns
+    # (e.g. an interrupted prior migration) before init_db() ever runs.
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("ALTER TABLE opportunity_observations ADD COLUMN total_score REAL")
+        raw.commit()
+    finally:
+        raw.close()
+
+    conn = init_db(db_path)
+    try:
+        columns = conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        names = tuple(c["name"] for c in columns)
+        # total_score was added first (manually, above); the migration only
+        # appends the remaining four after it, in their fixed order.
+        assert names == _PRE_SCORE_COLUMNS + ("total_score", "context_json", "component_scores_json", "score_version", "score_warnings_json")
+        for score_column in _SCORE_COLUMN_NAMES:
+            assert score_column in names
+    finally:
+        close_db()
+
+
+def test_induced_score_column_type_mismatch_fails_closed_without_altering_anything(tmp_path):
+    db_path = str(tmp_path / "score_column_type_mismatch.db")
+    _build_five_family_no_score_columns_db(db_path)
+
+    # Simulate a corrupted/foreign migration: total_score exists with the
+    # WRONG declared type (TEXT instead of REAL).
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("ALTER TABLE opportunity_observations ADD COLUMN total_score TEXT")
+        raw.commit()
+    finally:
+        raw.close()
+
+    try:
+        with pytest.raises(RuntimeError, match="total_score"):
+            init_db(db_path)
+    finally:
+        close_db()
+
+    # No column was added at all — the type check runs as a pure read
+    # before any ALTER, so this fails before mutating anything.
+    raw = _raw_connect(db_path)
+    try:
+        columns = raw.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        names = tuple(c["name"] for c in columns)
+        assert names == _PRE_SCORE_COLUMNS + ("total_score",)
+        row = raw.execute(
+            "SELECT opportunity_uid FROM opportunity_observations WHERE opportunity_uid='uid-active-1'"
+        ).fetchone()
+        assert row is not None
+    finally:
+        raw.close()
+
+
+class _FailingOnSecondAlterConnection(sqlite3.Connection):
+    """sqlite3.Connection subclass that raises on the SECOND ALTER TABLE
+    statement it executes (a real DDL execution failure partway through the
+    migration's ALTER sequence), letting every other statement (BEGIN,
+    PRAGMA, the first ALTER, SELECT, rollback) run for real."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._alter_count = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().upper().startswith("ALTER TABLE"):
+            self._alter_count += 1
+            if self._alter_count == 2:
+                raise sqlite3.OperationalError("simulated mid-migration failure")
+        return super().execute(sql, *args, **kwargs)
+
+
+def test_score_column_migration_rolls_back_atomically_on_mid_alter_failure(tmp_path):
+    """A failure partway through the ALTER sequence (not a pre-flight type
+    mismatch) must roll back every ALTER already issued in that same call —
+    never a partially-added set of columns.
+    """
+    db_path = str(tmp_path / "score_column_mid_failure.db")
+    _build_five_family_no_score_columns_db(db_path)
+
+    conn = sqlite3.connect(db_path, factory=_FailingOnSecondAlterConnection)
+    conn.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="simulated mid-migration failure"):
+            _migrate_opportunity_observations_score_columns(conn)
+
+        columns = conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+        names = tuple(c["name"] for c in columns)
+        # The first ALTER (context_json) must have been rolled back along
+        # with the second (which raised) — all-or-nothing, not partial.
+        assert names == _PRE_SCORE_COLUMNS
+        row = conn.execute(
+            "SELECT opportunity_uid FROM opportunity_observations WHERE opportunity_uid='uid-active-1'"
+        ).fetchone()
+        assert row is not None
+    finally:
+        conn.close()

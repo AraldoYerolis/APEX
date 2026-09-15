@@ -243,6 +243,71 @@ def _migrate_opportunity_observations_setup_family(conn: sqlite3.Connection) -> 
         raise
 
 
+# Context and ranking v0.1 — the five nullable score/context columns added
+# to opportunity_observations. Order matters: ALTER TABLE ADD COLUMN always
+# appends at the end of the table in the order the ALTERs run, so a legacy
+# database migrated by _migrate_opportunity_observations_setup_family first
+# (see below) ends up with these five columns after `updated_at`, matching
+# a fresh schema.sql install exactly.
+_OPPORTUNITY_OBSERVATIONS_SCORE_COLUMNS: list[tuple[str, str]] = [
+    ("context_json", "TEXT"),
+    ("component_scores_json", "TEXT"),
+    ("total_score", "REAL"),
+    ("score_version", "TEXT"),
+    ("score_warnings_json", "TEXT"),
+]
+
+
+def _migrate_opportunity_observations_score_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add the five nullable Context and ranking v0.1 score
+    columns to opportunity_observations.
+
+    MUST run AFTER _migrate_opportunity_observations_setup_family (see
+    init_db) — that migration requires the table's exact pre-widen
+    24-column shape to decide whether a legacy two-family database needs
+    rebuilding, and would fail closed (refuse to migrate) if these five
+    columns already existed on such a database. Running in this order
+    means: a legacy two-family database is rebuilt into the five-family
+    shape first (still without these columns), and only then do these
+    ALTERs run against it — identical in effect to an already-widened
+    five-family database that predates this milestone, or a completely
+    fresh install (whose schema.sql CREATE TABLE already declares all five
+    columns, making every check below a same-type no-op).
+
+    Column-type validation happens as a pure read (PRAGMA table_info) before
+    any DDL runs, so a type mismatch on an already-present column raises
+    without mutating anything. Once any ALTER is needed, all of them run
+    inside one explicit transaction that rolls back atomically on any
+    failure — never a partial set of added columns.
+    """
+    existing = conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()
+    existing_types = {row[1]: (row[2] or "").upper() for row in existing}
+
+    missing: list[tuple[str, str]] = []
+    for name, col_type in _OPPORTUNITY_OBSERVATIONS_SCORE_COLUMNS:
+        if name in existing_types:
+            if existing_types[name] != col_type:
+                raise RuntimeError(
+                    "opportunity_observations migration: score column "
+                    f"{name!r} exists with unexpected type "
+                    f"{existing_types[name]!r} (expected {col_type!r}); refusing to migrate"
+                )
+            continue
+        missing.append((name, col_type))
+
+    if not missing:
+        return
+
+    try:
+        conn.execute("BEGIN")
+        for name, col_type in missing:
+            conn.execute(f"ALTER TABLE opportunity_observations ADD COLUMN {name} {col_type}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def get_connection() -> sqlite3.Connection:
     global _conn
     if _conn is None:
@@ -269,6 +334,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
         _migrate_signal_observations(conn)
         _migrate_opportunity_observations_setup_family(conn)
+        _migrate_opportunity_observations_score_columns(conn)
     except Exception:
         conn.close()
         raise
