@@ -302,6 +302,19 @@ CREATE TABLE IF NOT EXISTS opportunity_observations (
     warnings_json            TEXT,                    -- conflicting evidence / warnings
     measurements_json        TEXT,                    -- raw detector measurements
     closed_at                TEXT,                    -- ISO8601 UTC when EXPIRED
+    -- Context and ranking v0.1 — immutable first-detection score/context
+    -- snapshot. Nullable; only ever written by insert_opportunity (see
+    -- src/apex/opportunity/engine.py's _record_finding /
+    -- src/apex/db/repository.py). touch_opportunity()'s UPDATE never
+    -- touches these five columns, so a row's snapshot never changes after
+    -- its first insert, for any setup_family. No stored rank column: rank
+    -- is a read-time ORDER BY (see repository.get_ranked_opportunities),
+    -- never a persisted value.
+    context_json             TEXT,                    -- opportunity.context.OpportunityContext snapshot
+    component_scores_json    TEXT,                    -- opportunity.scoring.ScoringResult components
+    total_score              REAL,                     -- clamped [0,100] or NULL if unscored
+    score_version            TEXT,                    -- opportunity.scoring.SCORE_VERSION at scoring time
+    score_warnings_json      TEXT,                    -- deterministic warning codes, if any
     created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );

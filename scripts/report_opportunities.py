@@ -4,18 +4,35 @@ Usage (run from repo root):
     PYTHONPATH=src python scripts/report_opportunities.py
     PYTHONPATH=src python scripts/report_opportunities.py --since 2026-09-01T00:00:00Z
     PYTHONPATH=src python scripts/report_opportunities.py --family SWEEP_RECLAIM --status ACTIVE
+    PYTHONPATH=src python scripts/report_opportunities.py --ranked
+    PYTHONPATH=src python scripts/report_opportunities.py --ranked --status EXPIRED
 
-Does not start the bot and does not change config, but it does call
-init_db(settings.apex_db_path), which executes schema.sql's CREATE TABLE IF
-NOT EXISTS statements and the signal_observations column-migration ALTERs
+Without --ranked, this does not start the bot and does not change config,
+but it does call init_db(settings.apex_db_path), which executes schema.sql's
+CREATE TABLE IF NOT EXISTS statements and the column-migration ALTERs
 against whatever database that path points at — idempotent DDL, but DDL
 execution nonetheless. Point APEX_DB_PATH at a disposable/local database, not
 an existing user or production database, unless you have independently
 confirmed running this schema DDL against it is acceptable.
 
-This report does NOT score or rank opportunities — that is a later
-milestone (see CLAUDE.md). It only surfaces detection counts and raw
-detector measurements so the underlying data can be inspected.
+--ranked uses a genuine READ-ONLY SQLite connection instead (mode=ro,
+PRAGMA query_only=ON) and never calls init_db — it never creates a missing
+database file and never applies any migration/backfill merely to display a
+report. If the database or its opportunity_observations table does not
+exist yet, or predates the Context and ranking v0.1 score columns, this is
+detected via safe read-only schema inspection (PRAGMA table_info) and every
+row is reported as legacy/unscored rather than raising or mutating
+anything.
+
+CONTEXT-ALIGNMENT SCORE DISCLAIMER (see opportunity/scoring.py,
+opportunity/context.py): `total_score` is a transparent research
+context-alignment score — NOT a win probability, NOT a live signal
+confidence rating, and NOT a trade recommendation. No score or rank ever
+removes a finding from this report.
+
+Without --ranked, this report does NOT score or rank opportunities at all
+— it only surfaces detection counts and raw detector measurements so the
+underlying data can be inspected.
 
 Snapshot/version semantics (read before interpreting VOLATILITY_COMPRESSION
 rows)
@@ -46,13 +63,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections import Counter
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from apex.config import get_settings
 from apex.db import repository as repo
 from apex.db.connection import close_db, init_db
+from apex.opportunity.scoring import SCORE_VERSION
+
+# Context and ranking v0.1's five score columns — used only to detect
+# whether a database predates this milestone via safe read-only schema
+# inspection (see _has_score_columns). Not a second source of truth for
+# the column list itself; repository.py/schema.sql/connection.py own that.
+_SCORE_COLUMNS = frozenset(
+    {"context_json", "component_scores_json", "total_score", "score_version", "score_warnings_json"}
+)
 
 # Compression detector_version that introduced the immutable first-detection
 # snapshot (direction-invariant fingerprint + frozen measurements_json/
@@ -81,6 +109,188 @@ def _snapshot_label(row: Any) -> str:
     return "initial direction; measurements last-touched (pre-snapshot detector version)"
 
 
+# ------------------------------------------------------------------ --ranked (read-only)
+
+
+def _open_readonly_connection(db_path: str) -> sqlite3.Connection:
+    """A genuine read-only SQLite connection: mode=ro fails closed (raises)
+    instead of creating a missing database file, and PRAGMA query_only=ON
+    additionally refuses any write this connection might otherwise attempt
+    — this never applies schema.sql or any migration, unlike init_db().
+    """
+    uri = f"file:{Path(db_path).as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def _has_score_columns(conn: sqlite3.Connection) -> bool:
+    """Safe read-only schema inspection (PRAGMA table_info) — the only way
+    this script decides whether a database predates the Context and
+    ranking v0.1 score columns; it never attempts to add them itself."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunity_observations)").fetchall()}
+    return _SCORE_COLUMNS.issubset(cols)
+
+
+def _is_current_scored_row(row: Any, scored_schema: bool) -> bool:
+    if not scored_schema:
+        return False
+    keys = row.keys()
+    if "total_score" not in keys or "score_version" not in keys:
+        return False
+    total_score = row["total_score"]
+    score_version = row["score_version"]
+    if total_score is None or score_version != SCORE_VERSION:
+        return False
+    if not isinstance(total_score, (int, float)) or isinstance(total_score, bool):
+        return False
+    return 0 <= total_score <= 100
+
+
+def _print_ranked_report(rows: list, *, status: Optional[str], scored_schema: bool) -> None:
+    total = len(rows)
+    print()
+    print("=" * 88)
+    print("  APEX TA Opportunity Engine — Ranked Report (read-only, --ranked)")
+    print("=" * 88)
+    print("  Score = research CONTEXT-ALIGNMENT only (see opportunity/scoring.py).")
+    print("  NOT a win probability, NOT live signal confidence, NOT a trade recommendation.")
+    print("  No score or rank ever removes a finding from this report.")
+    print(f"  Status filter      : {status}")
+    print(f"  Total rows         : {total}")
+    if not scored_schema:
+        print("  Schema predates Context and ranking v0.1 score columns — every row is UNSCORED/legacy.")
+    print()
+
+    if total == 0:
+        print("  No opportunities match this filter.")
+        print("=" * 88)
+        return
+
+    print(
+        f"  {'Rank':>4} {'UID':>10} {'Score':>7} {'Version':<24} {'Symbol':<10} {'Family':<30} "
+        f"{'Dir':<5} {'TF':<3} {'First detected (as-of)':<22} {'Status':<8}"
+    )
+    print("  " + "-" * 148)
+    for i, row in enumerate(rows, start=1):
+        keys = row.keys()
+        is_current = _is_current_scored_row(row, scored_schema)
+        total_score = row["total_score"] if scored_schema and "total_score" in keys else None
+        score_version = row["score_version"] if scored_schema and "score_version" in keys else None
+        score_label = f"{total_score:.1f}" if is_current else "UNSCORED"
+        version_label = score_version if (scored_schema and score_version) else "legacy/none"
+        uid_short = row["opportunity_uid"][:10]
+        print(
+            f"  {i:>4} {uid_short:>10} {score_label:>7} {version_label:<24} {row['symbol']:<10} "
+            f"{row['setup_family']:<30} {row['direction']:<5} {row['primary_timeframe']:<3} "
+            f"{row['first_detected_at']:<22} {row['status']:<8}"
+        )
+
+        if scored_schema and "score_warnings_json" in keys and row["score_warnings_json"]:
+            try:
+                warnings = json.loads(row["score_warnings_json"])
+            except (TypeError, ValueError):
+                warnings = row["score_warnings_json"]
+            if warnings:
+                print(f"        warnings   : {warnings}")
+
+        if scored_schema and "component_scores_json" in keys and row["component_scores_json"]:
+            try:
+                components = json.loads(row["component_scores_json"])
+            except (TypeError, ValueError):
+                components = None
+            if components:
+                print(
+                    "        coverage   : "
+                    f"available={components.get('available_weight')} "
+                    f"applicable={components.get('applicable_weight')}"
+                )
+                for c in components.get("components", []):
+                    print(
+                        f"          {c['name']:<18} status={c['status']:<14} "
+                        f"direction={c['component_direction']} alignment={c['alignment']} "
+                        f"contribution={c['contribution']}"
+                    )
+
+    print("=" * 88)
+
+
+def _run_ranked_report(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    db_path = settings.apex_db_path
+
+    if not Path(db_path).exists():
+        print(
+            f"No database file at {db_path!r}; --ranked never creates one "
+            "(use the non-ranked report, or run the bot, to initialize it first).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        conn = _open_readonly_connection(db_path)
+    except sqlite3.Error as e:
+        print(f"ERROR: could not open {db_path!r} read-only: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        if not _table_exists(conn, "opportunity_observations"):
+            print()
+            print("=" * 88)
+            print("  APEX TA Opportunity Engine — Ranked Report (read-only, --ranked)")
+            print("=" * 88)
+            print("  No opportunity_observations table found. Nothing to report.")
+            print("=" * 88)
+            return
+
+        scored_schema = _has_score_columns(conn)
+        # --ranked defaults to ACTIVE unless the caller explicitly filtered
+        # by --status; the optional EXPIRED view stays an explicit,
+        # separate, historical call, never mixed with ACTIVE by default.
+        status = args.status if args.status is not None else "ACTIVE"
+
+        try:
+            if scored_schema:
+                rows = repo.get_ranked_opportunities(
+                    conn,
+                    since=args.since,
+                    setup_family=args.family,
+                    symbol=args.symbol,
+                    primary_timeframe=args.timeframe,
+                    status=status,
+                    limit=args.limit,
+                )
+            else:
+                # Legacy schema predating Context and ranking v0.1 has no
+                # score columns at all, so every row is unscored by
+                # definition — fall back to the plain chronological query
+                # rather than issuing SQL that references missing columns.
+                rows = repo.get_opportunities(
+                    conn,
+                    since=args.since,
+                    setup_family=args.family,
+                    symbol=args.symbol,
+                    primary_timeframe=args.timeframe,
+                    status=status,
+                    limit=args.limit,
+                )
+        except sqlite3.Error as e:
+            print(f"ERROR: could not query opportunity_observations: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        _print_ranked_report(list(rows), status=status, scored_schema=scored_schema)
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="APEX TA Opportunity Engine v0.1 report — read-only, no scoring"
@@ -93,7 +303,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--timeframe", metavar="3m|5m", default=None)
     parser.add_argument("--status", metavar="ACTIVE|EXPIRED", default=None)
     parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument(
+        "--ranked", action="store_true",
+        help=(
+            "Show the read-only, research CONTEXT-ALIGNMENT ranked view instead of the "
+            "default chronological report (defaults --status to ACTIVE unless set explicitly). "
+            "Uses a genuine read-only connection; never creates or migrates the database."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.ranked:
+        _run_ranked_report(args)
+        return
 
     settings = get_settings()
     conn = init_db(settings.apex_db_path)

@@ -117,4 +117,15 @@ class Opportunity:
     warnings_json: Optional[str] = None
     measurements_json: Optional[str] = None
     closed_at: Optional[str] = None
+    # Context and ranking v0.1 — immutable first-detection score/context
+    # snapshot (see opportunity/context.py, opportunity/scoring.py,
+    # engine.py's _record_finding). Nullable: unset until a scan actually
+    # attempts enrichment, and left NULL (not backfilled) on any
+    # enrichment/serialization failure or on rows predating this milestone.
+    # Never touched by touch_opportunity() on reconfirmation for any family.
+    context_json: Optional[str] = None
+    component_scores_json: Optional[str] = None
+    total_score: Optional[float] = None
+    score_version: Optional[str] = None
+    score_warnings_json: Optional[str] = None
     id: Optional[int] = None

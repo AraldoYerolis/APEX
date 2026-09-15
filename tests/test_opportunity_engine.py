@@ -12,6 +12,7 @@ import asyncio
 import json
 
 import pandas as pd
+import pytest
 
 from apex.config import get_settings
 from apex.data.candle_store import CandleStore
@@ -19,10 +20,24 @@ from apex.db import repository as repo
 from apex.db.connection import close_db, init_db
 from apex.db.models import Market
 from apex.notifications.pushover_client import PushoverClient
+from apex.opportunity.context import (
+    StructureComponent,
+    TrendComponent,
+    VolatilityComponent,
+    not_applicable_trend_component,
+)
 from apex.opportunity.contract import DetectorFinding, Opportunity
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
 import apex.opportunity.engine as opportunity_engine
-from apex.opportunity.engine import _record_finding, compute_fingerprint, run_opportunity_scan
+from apex.opportunity.engine import (
+    BTC_SYMBOL,
+    ContextInputs,
+    OpportunityScanSummary,
+    _record_finding,
+    compute_fingerprint,
+    run_opportunity_scan,
+)
+from apex.opportunity.scoring import SCORE_VERSION
 from apex.scheduler.tasks import run_signal_scan
 from apex.utils.time import utc_from_iso
 
@@ -708,9 +723,19 @@ class _RaisingOn15mCandleStore:
 
 
 def test_one_symbols_15m_context_failure_does_not_abort_remaining_symbols(monkeypatch, tmp_path):
-    """Correction 2: the 15m context fetch used to sit outside the per-symbol
-    try/except, so a single symbol's get_df("...", "15m") raising aborted the
-    whole scan (every remaining symbol silently got no evaluation at all).
+    """Correction 2 (original): the 15m context fetch used to sit outside
+    the per-symbol try/except, so a single symbol's get_df("...", "15m")
+    raising aborted the whole scan (every remaining symbol silently got no
+    evaluation at all).
+
+    Context and ranking v0.1 correction: the fix above only isolated
+    symbols from EACH OTHER — a failing symbol's own 15m fetch still sat
+    before its per-timeframe loop and aborted that ONE symbol's otherwise-
+    valid 3m/5m primary detection entirely. The 15m context fetch is now
+    isolated in its own try/except per symbol, so AAA_BAD's real 3m/5m
+    findings are still detected and recorded — only its context/score
+    enrichment degrades (symbol_htf_trend UNAVAILABLE, counted in
+    summary.context_errors), it does not disappear.
     """
     db_path = str(tmp_path / "isolation_15m.db")
     _env(monkeypatch, db_path)
@@ -728,21 +753,260 @@ def test_one_symbols_15m_context_failure_does_not_abort_remaining_symbols(monkey
 
         summary = asyncio.run(run_opportunity_scan(conn, wrapped, settings))
 
-        # The scan itself completed (no exception propagated) and the good
-        # symbol was still fully evaluated.
+        # The scan itself completed (no exception propagated) and BOTH
+        # symbols were still fully evaluated for 3m/5m primary detection.
         assert summary.markets_scanned == 2
         assert summary.findings > 0
+        assert summary.context_errors == 1  # exactly AAA_BAD's own 15m fetch failure
 
         rows = repo.get_opportunities(conn)
         symbols_with_findings = {r["symbol"] for r in rows}
         assert "ZZZ_GOOD" in symbols_with_findings
-        assert "AAA_BAD" not in symbols_with_findings
+        assert "AAA_BAD" in symbols_with_findings
+
+        # AAA_BAD's rows still got a context/score snapshot attempt — its
+        # symbol_htf_trend degrades to UNAVAILABLE (no 15m data at all,
+        # independent of the simulated exception), but total_score is not
+        # simply dropped: the other components (primary_structure,
+        # btc_alignment) can still be available/scored.
+        bad_row = next(r for r in rows if r["symbol"] == "AAA_BAD")
+        assert bad_row["context_json"] is not None
+        bad_context = json.loads(bad_row["context_json"])
+        assert bad_context["symbol_htf_trend"]["status"] == "UNAVAILABLE"
 
         # The existing APEX signal scanner is a wholly separate code path
         # (scheduler/tasks.py) and is unaffected by this change or failure.
         pushover = PushoverClient(app_token="fake", user_key="fake")
         signal_summary = asyncio.run(run_signal_scan(conn, store, settings, pushover))
         assert signal_summary.markets_scanned == 2
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ context COMPUTATION failure containment
+#
+# Contrast with test_one_symbols_15m_context_failure_does_not_abort_remaining_symbols
+# above (which injects a candle *fetch* failure): these inject a failure in
+# the pure *computation* itself at each of the four call sites
+# (compute_symbol_trend_component for the once-per-scan BTC frame,
+# compute_symbol_trend_component for a symbol's own 15m frame,
+# compute_primary_structure_component, compute_volatility_component). Each
+# must be caught in its own try/except, counted in context_errors, and
+# degrade only that one component to a directly-constructed UNAVAILABLE
+# fallback — never abort the scan, never drop findings already detected for
+# the affected (symbol, timeframe) pair, and never affect later pairs.
+
+
+def test_btc_trend_computation_failure_is_contained(monkeypatch, tmp_path, caplog):
+    db_path = str(tmp_path / "btc_trend_computation_failure.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "AAA")
+        _seed_market(conn, "ZZZ")
+        store = CandleStore(conn)
+        for symbol in ("AAA", "ZZZ"):
+            _load_into_store(store, symbol, "5m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "3m", _sweep_reclaim_df())
+
+        real_compute = opportunity_engine.compute_symbol_trend_component
+        call_count = {"n": 0}
+
+        def fake(df, now_ms):
+            call_count["n"] += 1
+            if call_count["n"] == 1:  # the once-per-scan BTC frame, before any symbol
+                raise RuntimeError("simulated BTC trend computation failure")
+            return real_compute(df, now_ms)
+
+        monkeypatch.setattr(opportunity_engine, "compute_symbol_trend_component", fake)
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        assert summary.context_errors == 1
+        assert summary.findings > 0
+
+        rows = repo.get_opportunities(conn)
+        # Real findings survive for BOTH symbols' BOTH timeframes — the
+        # once-per-scan BTC-trend failure happens before any symbol is
+        # evaluated, so it must never suppress any (symbol, timeframe) pair.
+        by_symbol_tf = {(r["symbol"], r["primary_timeframe"]) for r in rows}
+        assert by_symbol_tf == {("AAA", "3m"), ("AAA", "5m"), ("ZZZ", "3m"), ("ZZZ", "5m")}
+
+        for row in rows:
+            context = json.loads(row["context_json"])
+            assert context["btc_htf_trend"]["status"] == "UNAVAILABLE"
+            assert context["btc_htf_trend"]["reason"] == "COMPUTATION_FAILED"
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any("BTC" in r.getMessage() for r in error_records)
+    finally:
+        close_db()
+
+
+def test_symbol_trend_computation_failure_is_contained_to_one_symbol(monkeypatch, tmp_path, caplog):
+    db_path = str(tmp_path / "symbol_trend_computation_failure.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "AAA")
+        _seed_market(conn, "ZZZ")
+        store = CandleStore(conn)
+        for symbol in ("AAA", "ZZZ"):
+            _load_into_store(store, symbol, "5m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "3m", _sweep_reclaim_df())
+
+        real_compute = opportunity_engine.compute_symbol_trend_component
+        call_count = {"n": 0}
+
+        def fake(df, now_ms):
+            call_count["n"] += 1
+            # Call 1 is the once-per-scan BTC frame (no BTC market seeded
+            # here, so it must not raise); call 2 is the FIRST per-symbol
+            # own-trend computation — exactly one symbol's.
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated symbol trend computation failure")
+            return real_compute(df, now_ms)
+
+        monkeypatch.setattr(opportunity_engine, "compute_symbol_trend_component", fake)
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        assert summary.context_errors == 1
+        assert summary.findings > 0
+
+        rows = repo.get_opportunities(conn)
+        by_symbol_tf = {(r["symbol"], r["primary_timeframe"]) for r in rows}
+        # Both symbols' 3m AND 5m findings survive — including BOTH
+        # timeframes of the ONE symbol whose own-trend computation failed,
+        # since that failure happens once per symbol, before its 3m/5m loop.
+        assert by_symbol_tf == {("AAA", "3m"), ("AAA", "5m"), ("ZZZ", "3m"), ("ZZZ", "5m")}
+
+        contexts_by_symbol: dict[str, list[dict]] = {"AAA": [], "ZZZ": []}
+        for row in rows:
+            contexts_by_symbol[row["symbol"]].append(json.loads(row["context_json"]))
+
+        failed_symbols = {
+            symbol for symbol, ctxs in contexts_by_symbol.items()
+            if all(c["symbol_htf_trend"]["reason"] == "COMPUTATION_FAILED" for c in ctxs)
+        }
+        assert len(failed_symbols) == 1  # exactly one symbol hit the failure
+        other_symbol = ({"AAA", "ZZZ"} - failed_symbols).pop()
+        assert all(
+            c["symbol_htf_trend"]["reason"] != "COMPUTATION_FAILED"
+            for c in contexts_by_symbol[other_symbol]
+        )
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+    finally:
+        close_db()
+
+
+def test_primary_structure_computation_failure_is_contained_and_findings_still_recorded(
+    monkeypatch, tmp_path, caplog
+):
+    db_path = str(tmp_path / "primary_structure_computation_failure.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "AAA")
+        _seed_market(conn, "ZZZ")
+        store = CandleStore(conn)
+        for symbol in ("AAA", "ZZZ"):
+            _load_into_store(store, symbol, "5m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "3m", _sweep_reclaim_df())
+
+        real_compute = opportunity_engine.compute_primary_structure_component
+        call_count = {"n": 0}
+
+        def fake(df, timeframe, now_ms):
+            call_count["n"] += 1
+            if call_count["n"] == 1:  # the first (symbol, timeframe) pair with findings
+                raise RuntimeError("simulated primary structure computation failure")
+            return real_compute(df, timeframe, now_ms)
+
+        monkeypatch.setattr(opportunity_engine, "compute_primary_structure_component", fake)
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        assert summary.context_errors == 1
+        assert summary.findings > 0
+
+        rows = repo.get_opportunities(conn)
+        by_symbol_tf = {(r["symbol"], r["primary_timeframe"]) for r in rows}
+        # The already-detected findings for the AFFECTED (symbol, timeframe)
+        # pair are still recorded (not discarded by the enrichment failure),
+        # and every later pair is unaffected.
+        assert by_symbol_tf == {("AAA", "3m"), ("AAA", "5m"), ("ZZZ", "3m"), ("ZZZ", "5m")}
+
+        reasons = {
+            (row["symbol"], row["primary_timeframe"]):
+                json.loads(row["context_json"])["primary_structure"]["reason"]
+            for row in rows
+        }
+        failed_pairs = [k for k, reason in reasons.items() if reason == "COMPUTATION_FAILED"]
+        assert len(failed_pairs) == 1
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+        assert "primary structure" in error_records[0].getMessage()
+    finally:
+        close_db()
+
+
+def test_volatility_computation_failure_is_contained_and_findings_still_recorded(
+    monkeypatch, tmp_path, caplog
+):
+    db_path = str(tmp_path / "volatility_computation_failure.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "AAA")
+        _seed_market(conn, "ZZZ")
+        store = CandleStore(conn)
+        for symbol in ("AAA", "ZZZ"):
+            _load_into_store(store, symbol, "5m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "3m", _sweep_reclaim_df())
+
+        real_compute = opportunity_engine.compute_volatility_component
+        call_count = {"n": 0}
+
+        def fake(df, timeframe, now_ms):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated volatility computation failure")
+            return real_compute(df, timeframe, now_ms)
+
+        monkeypatch.setattr(opportunity_engine, "compute_volatility_component", fake)
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+
+        assert summary.context_errors == 1
+        assert summary.findings > 0
+
+        rows = repo.get_opportunities(conn)
+        by_symbol_tf = {(r["symbol"], r["primary_timeframe"]) for r in rows}
+        assert by_symbol_tf == {("AAA", "3m"), ("AAA", "5m"), ("ZZZ", "3m"), ("ZZZ", "5m")}
+
+        reasons = {
+            (row["symbol"], row["primary_timeframe"]):
+                json.loads(row["context_json"])["volatility"]["reason"]
+            for row in rows
+        }
+        failed_pairs = [k for k, reason in reasons.items() if reason == "COMPUTATION_FAILED"]
+        assert len(failed_pairs) == 1
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+        assert "volatility" in error_records[0].getMessage()
     finally:
         close_db()
 
@@ -1294,5 +1558,720 @@ def test_one_detector_exception_increments_counter_and_does_not_suppress_others(
             tf for r in error_records for tf in ("3m", "5m") if tf in r.getMessage()
         }
         assert logged_timeframes == {"3m", "5m"}
+    finally:
+        close_db()
+
+
+# ==================================================================
+# Context and ranking v0.1
+# ==================================================================
+#
+# _record_finding-level tests below construct ContextInputs directly
+# (hand-built context.py component dataclasses) rather than through real
+# candle data — engine.py's own responsibility here is correctly wiring
+# context_inputs through to assemble_context/score_opportunity and
+# persisting/freezing the result, which is exactly what these prove;
+# context.py's OWN component-computation correctness (real candle data,
+# pivots, trend bias, ATR%) is covered by tests/test_opportunity_context.py,
+# and scoring.py's own arithmetic by tests/test_opportunity_scoring.py.
+
+
+def _trend_component(status="AVAILABLE", direction="LONG") -> TrendComponent:
+    return TrendComponent(
+        status=status, direction=direction, reason="test", sample_count=30,
+        latest_close_boundary_ms=1000,
+    )
+
+
+def _structure_component(status="AVAILABLE", direction="LONG") -> StructureComponent:
+    return StructureComponent(
+        status=status, direction=direction, reason="test", sample_count=30,
+        latest_close_boundary_ms=1000,
+    )
+
+
+def _volatility_component(status="AVAILABLE", atr_percent=1.5) -> VolatilityComponent:
+    return VolatilityComponent(
+        status=status, atr_percent=atr_percent, reason="test", sample_count=30,
+        latest_close_boundary_ms=1000,
+    )
+
+
+def _context_inputs(**overrides) -> ContextInputs:
+    base = dict(
+        as_of_ms=1_700_000_000_000,
+        primary_timeframe="5m",
+        symbol_htf_trend=_trend_component(),
+        primary_structure=_structure_component(),
+        btc_htf_trend=_trend_component(),
+        volatility=_volatility_component(),
+    )
+    base.update(overrides)
+    return ContextInputs(**base)
+
+
+# ------------------------------------------------------------------ _record_finding score/context wiring
+
+
+def test_new_finding_with_context_inputs_persists_populated_score_snapshot(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "score_snapshot_new.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(direction="LONG")
+        context_inputs = _context_inputs(
+            symbol_htf_trend=_trend_component(direction="LONG"),
+            primary_structure=_structure_component(direction="LONG"),
+            btc_htf_trend=_trend_component(direction="LONG"),
+        )
+        is_new = _record_finding(conn, finding, "2026-01-01T00:00:00Z", context_inputs=context_inputs)
+        assert is_new is True
+
+        row = repo.get_opportunities(conn)[0]
+        assert row["context_json"] is not None
+        assert row["component_scores_json"] is not None
+        assert row["score_version"] == SCORE_VERSION
+        assert row["total_score"] == 100.0  # 50 base + 25 + 15 + 10, all aligned
+        assert json.loads(row["score_warnings_json"]) == []
+
+        context = json.loads(row["context_json"])
+        assert context["scored_direction"] == "LONG"
+        assert context["symbol_htf_trend"]["direction"] == "LONG"
+    finally:
+        close_db()
+
+
+def test_record_finding_without_context_inputs_leaves_score_fields_null_with_no_warning(
+    monkeypatch, tmp_path
+):
+    db_path = str(tmp_path / "score_snapshot_no_enrichment.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding()
+        is_new = _record_finding(conn, finding, "2026-01-01T00:00:00Z")  # no context_inputs at all
+        assert is_new is True
+
+        row = repo.get_opportunities(conn)[0]
+        assert row["context_json"] is None
+        assert row["component_scores_json"] is None
+        assert row["total_score"] is None
+        assert row["score_version"] is None
+        assert row["score_warnings_json"] is None
+    finally:
+        close_db()
+
+
+def test_btc_self_finding_records_not_applicable_btc_alignment(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "btc_self.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(symbol=BTC_SYMBOL, direction="LONG")
+        context_inputs = _context_inputs(btc_htf_trend=not_applicable_trend_component())
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z", context_inputs=context_inputs)
+
+        row = repo.get_opportunities(conn)[0]
+        components = json.loads(row["component_scores_json"])["components"]
+        btc_component = next(c for c in components if c["name"] == "btc_alignment")
+        assert btc_component["status"] == "NOT_APPLICABLE"
+        assert btc_component["contribution"] == 0.0
+
+        context = json.loads(row["context_json"])
+        assert context["btc_htf_trend"]["status"] == "NOT_APPLICABLE"
+    finally:
+        close_db()
+
+
+def test_reconfirmation_never_touches_score_or_context_fields(monkeypatch, tmp_path):
+    """Immutable first-detection snapshot policy generalized to ALL
+    families, not just VOLATILITY_COMPRESSION: a re-confirmation of an
+    already-ACTIVE opportunity must leave context_json/component_scores_json/
+    total_score/score_version/score_warnings_json exactly as first inserted,
+    even when the reconfirming call supplies DIFFERENT context_inputs.
+    """
+    db_path = str(tmp_path / "score_snapshot_frozen.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(direction="LONG")
+        first_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="LONG"))
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z", context_inputs=first_inputs)
+        first_row = repo.get_opportunities(conn)[0]
+
+        # A materially different context on the reconfirming call — if this
+        # leaked through, the assertions below would catch it.
+        second_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="SHORT"))
+        is_new = _record_finding(
+            conn, finding, "2026-01-01T00:05:00Z", context_inputs=second_inputs
+        )
+        assert is_new is False
+
+        second_row = repo.get_opportunities(conn)[0]
+        assert second_row["context_json"] == first_row["context_json"]
+        assert second_row["component_scores_json"] == first_row["component_scores_json"]
+        assert second_row["total_score"] == first_row["total_score"]
+        assert second_row["score_version"] == first_row["score_version"]
+        assert second_row["score_warnings_json"] == first_row["score_warnings_json"]
+        assert second_row["last_seen_at"] == "2026-01-01T00:05:00Z"  # activity fields still moved
+        assert second_row["occurrence_count"] == 2
+    finally:
+        close_db()
+
+
+def test_reconfirmation_of_compression_also_leaves_score_fields_frozen(monkeypatch, tmp_path):
+    """Same guarantee as above, specifically for the DIRECTION_INVARIANT
+    VOLATILITY_COMPRESSION family, whose existing measurements_json
+    freezing this milestone must not disturb."""
+    db_path = str(tmp_path / "compression_score_frozen.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding_long = _make_compression_finding(direction="LONG")
+        first_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="LONG"))
+        _record_finding(conn, finding_long, "2026-01-01T00:00:00Z", context_inputs=first_inputs)
+        first_row = repo.get_opportunities(conn)[0]
+        assert first_row["total_score"] is not None
+
+        finding_short = _make_compression_finding(direction="SHORT")  # same episode, opposite dir
+        second_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="SHORT"))
+        is_new = _record_finding(
+            conn, finding_short, "2026-01-01T00:05:00Z", context_inputs=second_inputs
+        )
+        assert is_new is False
+
+        second_row = repo.get_opportunities(conn)[0]
+        assert second_row["total_score"] == first_row["total_score"]
+        assert second_row["context_json"] == first_row["context_json"]
+        assert json.loads(second_row["context_json"])["scored_direction"] == "LONG"
+    finally:
+        close_db()
+
+
+def test_enrichment_exception_is_contained_finding_still_inserted_and_score_error_counted(
+    monkeypatch, tmp_path
+):
+    """A raising assemble_context/score_opportunity must never drop the
+    underlying detector finding — only its own score/context degrade to
+    NULL, with an explicit warning and a counted, logged failure."""
+    db_path = str(tmp_path / "enrichment_failure.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        monkeypatch.setattr(
+            opportunity_engine,
+            "assemble_context",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated context failure")),
+        )
+
+        finding = _make_finding()
+        summary = OpportunityScanSummary()
+        is_new = _record_finding(
+            conn, finding, "2026-01-01T00:00:00Z",
+            context_inputs=_context_inputs(), summary=summary,
+        )
+        assert is_new is True  # the finding itself is still recorded
+        assert summary.score_errors == 1
+
+        row = repo.get_opportunities(conn)[0]
+        assert row["context_json"] is None
+        assert row["component_scores_json"] is None
+        assert row["total_score"] is None
+        assert row["score_version"] == SCORE_VERSION
+        assert json.loads(row["score_warnings_json"]) == ["CONTEXT_SCORING_FAILED"]
+    finally:
+        close_db()
+
+
+def test_mixed_context_availability_findings_all_still_inserted(monkeypatch, tmp_path):
+    """One finding whose enrichment succeeds and one whose enrichment
+    raises, recorded back-to-back — neither is dropped, only the failing
+    one's score/context is NULL."""
+    db_path = str(tmp_path / "mixed_context.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        good_finding = _make_finding(fingerprint_key="anchor-good")
+        bad_finding = _make_finding(fingerprint_key="anchor-bad")
+
+        _record_finding(
+            conn, good_finding, "2026-01-01T00:00:00Z", context_inputs=_context_inputs()
+        )
+
+        monkeypatch.setattr(
+            opportunity_engine,
+            "score_opportunity",
+            lambda context: (_ for _ in ()).throw(RuntimeError("simulated scoring failure")),
+        )
+        _record_finding(
+            conn, bad_finding, "2026-01-01T00:00:00Z", context_inputs=_context_inputs()
+        )
+
+        rows = repo.get_opportunities(conn)
+        assert len(rows) == 2
+        by_score_presence = {r["total_score"] is not None for r in rows}
+        assert by_score_presence == {True, False}
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ BTC 15m context: once-per-scan, missing, self
+
+
+def test_btc_15m_fetched_at_most_once_per_scan_and_reused_for_btc_symbol(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "btc_once.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, BTC_SYMBOL)
+        _seed_market(conn, "ETH")
+        store = CandleStore(conn)
+        for symbol in (BTC_SYMBOL, "ETH"):
+            _load_into_store(store, symbol, "5m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "3m", _sweep_reclaim_df())
+            _load_into_store(store, symbol, "15m", _sweep_reclaim_df())
+
+        capturing = _CapturingCandleStore(store)
+        summary = asyncio.run(run_opportunity_scan(conn, capturing, settings))
+        assert summary.markets_scanned == 2
+
+        fifteen_m_symbols = [c[0] for c in capturing.calls if c[1] == "15m"]
+        # Exactly one 15m read for BTC (the shared once-per-scan frame,
+        # reused for BTC's own symbol_htf_trend context too — never a
+        # second, redundant get_df call), and exactly one for ETH (its own
+        # ordinary once-per-symbol 15m read).
+        assert fifteen_m_symbols.count(BTC_SYMBOL) == 1
+        assert fifteen_m_symbols.count("ETH") == 1
+    finally:
+        close_db()
+
+
+def test_btc_missing_does_not_crash_scan_and_marks_btc_component_unavailable(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "btc_missing.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "ETH")  # no BTC market/candles at all in this scan
+        store = CandleStore(conn)
+        _load_into_store(store, "ETH", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "ETH", "3m", _sweep_reclaim_df())
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+        assert summary.markets_scanned == 1
+        assert summary.findings > 0
+        assert summary.context_errors == 0  # missing data (None), not a raised fetch error
+
+        rows = repo.get_opportunities(conn)
+        assert len(rows) > 0
+        context = json.loads(rows[0]["context_json"])
+        assert context["btc_htf_trend"]["status"] == "UNAVAILABLE"
+    finally:
+        close_db()
+
+
+class _RaisingOnBTC15mCandleStore:
+    """Wraps a real CandleStore, raising only for the BTC reference
+    symbol's own 15m read — every other call delegates through untouched.
+    """
+
+    def __init__(self, inner: CandleStore):
+        self._inner = inner
+
+    def get_df(self, symbol: str, timeframe: str, now_ms=None):
+        if symbol == BTC_SYMBOL and timeframe == "15m":
+            raise RuntimeError("simulated BTC 15m context fetch failure")
+        return self._inner.get_df(symbol, timeframe, now_ms=now_ms)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_btc_15m_fetch_error_is_isolated_counted_and_does_not_abort_the_scan(
+    monkeypatch, tmp_path, caplog
+):
+    db_path = str(tmp_path / "btc_fetch_error.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "ETH")
+        store = CandleStore(conn)
+        _load_into_store(store, "ETH", "5m", _sweep_reclaim_df())
+        _load_into_store(store, "ETH", "3m", _sweep_reclaim_df())
+        wrapped = _RaisingOnBTC15mCandleStore(store)
+
+        with caplog.at_level("ERROR", logger="apex.opportunity.engine"):
+            summary = asyncio.run(run_opportunity_scan(conn, wrapped, settings))
+
+        assert summary.markets_scanned == 1
+        assert summary.findings > 0  # ETH's own primary detection unaffected
+        assert summary.context_errors == 1
+        assert summary.detector_errors == 0  # a distinct, separate counter
+
+        rows = repo.get_opportunities(conn)
+        context = json.loads(rows[0]["context_json"])
+        assert context["btc_htf_trend"]["status"] == "UNAVAILABLE"
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any("BTC" in r.getMessage() for r in error_records)
+    finally:
+        close_db()
+
+
+def test_btc_symbol_findings_get_not_applicable_btc_alignment_end_to_end(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "btc_self_e2e.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, BTC_SYMBOL)
+        store = CandleStore(conn)
+        _load_into_store(store, BTC_SYMBOL, "5m", _sweep_reclaim_df())
+        _load_into_store(store, BTC_SYMBOL, "3m", _sweep_reclaim_df())
+        _load_into_store(store, BTC_SYMBOL, "15m", _sweep_reclaim_df())
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+        assert summary.findings > 0
+
+        rows = repo.get_opportunities(conn)
+        assert all(r["symbol"] == BTC_SYMBOL for r in rows)
+        for row in rows:
+            context = json.loads(row["context_json"])
+            assert context["btc_htf_trend"]["status"] == "NOT_APPLICABLE"
+            components = json.loads(row["component_scores_json"])["components"]
+            btc_component = next(c for c in components if c["name"] == "btc_alignment")
+            assert btc_component["status"] == "NOT_APPLICABLE"
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ unsupported setup_family / five-family parity
+
+FIVE_FAMILIES = [
+    "VOLATILITY_COMPRESSION",
+    "SWEEP_RECLAIM",
+    "SUPPORT_RESISTANCE_REJECTION",
+    "SUPPORT_RESISTANCE_BREAKOUT_RETEST",
+    "SUPPORT_RESISTANCE_FAILED_BREAKOUT",
+]
+
+
+def test_build_score_snapshot_rejects_unsupported_setup_family_with_explicit_warning():
+    """_build_score_snapshot validates setup_family against the sealed
+    contract (SetupFamily via typing.get_args) before ever calling
+    assemble_context/score_opportunity — an unsupported/malformed family
+    yields the same NULL-enrichment-plus-explicit-warning outcome as any
+    other contained scoring failure, tested directly against the helper.
+    """
+    finding = _make_finding(setup_family="NOT_A_REAL_FAMILY", detector_version="fake_v1")
+    context_json, component_scores_json, total_score, score_version, score_warnings_json = (
+        opportunity_engine._build_score_snapshot(finding, _context_inputs())
+    )
+    assert context_json is None
+    assert component_scores_json is None
+    assert total_score is None
+    assert score_version == SCORE_VERSION
+    assert json.loads(score_warnings_json) == ["UNSUPPORTED_SETUP_FAMILY"]
+
+
+@pytest.mark.parametrize("family", FIVE_FAMILIES)
+def test_build_score_snapshot_scores_every_one_of_the_five_valid_families_identically(family):
+    """All five current families share identical context rules and scoring
+    weights (sealed design) — no family-quality adapter anywhere."""
+    finding = _make_finding(
+        setup_family=family, detector_version=f"{family.lower()}_v_test", direction="LONG"
+    )
+    context_inputs = _context_inputs(
+        symbol_htf_trend=_trend_component(direction="LONG"),
+        primary_structure=_structure_component(direction="LONG"),
+        btc_htf_trend=_trend_component(direction="LONG"),
+    )
+    context_json, component_scores_json, total_score, score_version, score_warnings_json = (
+        opportunity_engine._build_score_snapshot(finding, context_inputs)
+    )
+    assert total_score == 100.0  # 50 base + 25 + 15 + 10, all aligned — identical for every family
+    assert score_version == SCORE_VERSION
+    assert json.loads(score_warnings_json) == []
+    assert context_json is not None
+    assert component_scores_json is not None
+
+
+# ------------------------------------------------------------------ five-family score-snapshot immutability / legacy NULL
+
+
+@pytest.mark.parametrize("family", FIVE_FAMILIES)
+def test_first_detection_score_snapshot_immutable_across_all_five_families(monkeypatch, tmp_path, family):
+    """Generalizes test_reconfirmation_never_touches_score_or_context_fields
+    (SWEEP_RECLAIM) and test_reconfirmation_of_compression_also_leaves_score_fields_frozen
+    (VOLATILITY_COMPRESSION) to all five families in one parameterized
+    sweep: a reconfirmation supplying a materially DIFFERENT context must
+    never move context_json/component_scores_json/total_score/
+    score_version/score_warnings_json away from the first-detection value,
+    for any family — while existing measurements_json refresh-vs-freeze
+    semantics (compression frozen, others refreshed) stay untouched by this
+    test, since it reconfirms with the identical finding object either way.
+    """
+    db_path = str(tmp_path / f"immutable_{family.lower()}.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(setup_family=family, detector_version=f"{family.lower()}_v_test")
+        first_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="LONG"))
+        is_new = _record_finding(conn, finding, "2026-01-01T00:00:00Z", context_inputs=first_inputs)
+        assert is_new is True
+        first_row = repo.get_opportunities(conn)[0]
+        assert first_row["total_score"] is not None
+
+        second_inputs = _context_inputs(symbol_htf_trend=_trend_component(direction="SHORT"))
+        is_new_2 = _record_finding(
+            conn, finding, "2026-01-01T00:05:00Z", context_inputs=second_inputs
+        )
+        assert is_new_2 is False
+
+        second_row = repo.get_opportunities(conn)[0]
+        assert second_row["context_json"] == first_row["context_json"]
+        assert second_row["component_scores_json"] == first_row["component_scores_json"]
+        assert second_row["total_score"] == first_row["total_score"]
+        assert second_row["score_version"] == first_row["score_version"]
+        assert second_row["score_warnings_json"] == first_row["score_warnings_json"]
+        assert second_row["last_seen_at"] == "2026-01-01T00:05:00Z"  # activity fields still moved
+        assert second_row["occurrence_count"] == 2
+    finally:
+        close_db()
+
+
+@pytest.mark.parametrize("family", FIVE_FAMILIES)
+def test_legacy_null_score_snapshot_never_backfilled_on_reconfirmation_across_all_five_families(
+    monkeypatch, tmp_path, family
+):
+    """A finding first recorded with NO context_inputs at all (equivalent to
+    a legacy pre-milestone row's permanently-NULL score) must stay NULL
+    forever, even when a LATER reconfirmation of the same opportunity
+    supplies real context_inputs — the score snapshot is only ever
+    attempted at first detection, never manufactured retroactively from
+    future context, for any of the five families.
+    """
+    db_path = str(tmp_path / f"legacy_null_{family.lower()}.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(setup_family=family, detector_version=f"{family.lower()}_v_test")
+        is_new = _record_finding(conn, finding, "2026-01-01T00:00:00Z")  # no context_inputs at all
+        assert is_new is True
+        first_row = repo.get_opportunities(conn)[0]
+        assert first_row["total_score"] is None
+        assert first_row["context_json"] is None
+
+        is_new_2 = _record_finding(
+            conn, finding, "2026-01-01T00:05:00Z", context_inputs=_context_inputs()
+        )
+        assert is_new_2 is False
+
+        second_row = repo.get_opportunities(conn)[0]
+        assert second_row["total_score"] is None
+        assert second_row["context_json"] is None
+        assert second_row["component_scores_json"] is None
+        assert second_row["score_version"] is None
+        assert second_row["score_warnings_json"] is None
+        assert second_row["last_seen_at"] == "2026-01-01T00:05:00Z"  # activity fields still moved
+        assert second_row["occurrence_count"] == 2
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ repo.get_ranked_opportunities
+
+
+def _insert_scored_opportunity(conn, **overrides) -> None:
+    base = dict(
+        opportunity_uid=f"uid-{overrides.get('fingerprint', 'x')}",
+        fingerprint=overrides.get("fingerprint", "fp-x"),
+        symbol="BTC",
+        direction="LONG",
+        setup_family="SWEEP_RECLAIM",
+        detector_version="sweep_reclaim_v0_1",
+        primary_timeframe="5m",
+        first_detected_at="2026-01-01T00:00:00Z",
+        last_seen_at="2026-01-01T00:00:00Z",
+        source_candle_open_time=1000,
+        source_candle_close_time=1300,
+        status="ACTIVE",
+    )
+    base.update(overrides)
+    repo.insert_opportunity(conn, Opportunity(**base))
+
+
+def test_ranked_opportunities_orders_by_score_before_limit_over_full_filtered_set(
+    monkeypatch, tmp_path
+):
+    db_path = str(tmp_path / "ranked_order_limit.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        # Deliberately inserted in an order that does NOT match score order,
+        # so a bug that sorted only an already-limited/incidental-order
+        # batch would fail this.
+        scores = [10.0, 90.0, 50.0, 70.0, 30.0]
+        for i, score in enumerate(scores):
+            _insert_scored_opportunity(
+                conn, opportunity_uid=f"uid-{i}", fingerprint=f"fp-{i}",
+                total_score=score, score_version=SCORE_VERSION,
+            )
+
+        ranked = repo.get_ranked_opportunities(conn, limit=3)
+        assert [r["total_score"] for r in ranked] == [90.0, 70.0, 50.0]
+    finally:
+        close_db()
+
+
+def test_ranked_opportunities_unscored_and_unknown_version_sort_after_scored(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "ranked_unscored_last.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-scored", fingerprint="fp-scored",
+            total_score=40.0, score_version=SCORE_VERSION,
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-null", fingerprint="fp-null",
+            total_score=None, score_version=None,
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-old-version", fingerprint="fp-old-version",
+            total_score=95.0, score_version="context_alignment_v0_0_pretend_old",
+        )
+
+        ranked = repo.get_ranked_opportunities(conn)
+        uids_in_order = [r["opportunity_uid"] for r in ranked]
+        assert uids_in_order[0] == "uid-scored"
+        # An old/unknown score_version sorts AFTER the current-version
+        # scored row regardless of its own (higher) numeric total_score.
+        assert set(uids_in_order[1:]) == {"uid-null", "uid-old-version"}
+    finally:
+        close_db()
+
+
+def test_ranked_opportunities_out_of_range_and_nonnumeric_scores_sort_after_valid(
+    monkeypatch, tmp_path
+):
+    """Extends test_ranked_opportunities_unscored_and_unknown_version_sort_after_scored:
+    a stored total_score that is numerically out of [0, 100] or not numeric
+    at all (both possible via direct row manipulation, not through the
+    engine's own clamped scoring path) must also sort after every valid,
+    current-version, in-range scored row — never ahead of it by raw
+    numeric value.
+    """
+    db_path = str(tmp_path / "ranked_invalid_scores.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-valid", fingerprint="fp-valid",
+            total_score=10.0, score_version=SCORE_VERSION,
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-too-high", fingerprint="fp-too-high",
+            total_score=150.0, score_version=SCORE_VERSION,
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-too-low", fingerprint="fp-too-low",
+            total_score=-5.0, score_version=SCORE_VERSION,
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-nonnumeric", fingerprint="fp-nonnumeric",
+            total_score="not-a-number", score_version=SCORE_VERSION,
+        )
+
+        ranked = repo.get_ranked_opportunities(conn)
+        uids_in_order = [r["opportunity_uid"] for r in ranked]
+        assert uids_in_order[0] == "uid-valid"
+        assert set(uids_in_order[1:]) == {"uid-too-high", "uid-too-low", "uid-nonnumeric"}
+    finally:
+        close_db()
+
+
+def test_ranked_opportunities_deterministic_tie_break_last_seen_at(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "ranked_ties_last_seen.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        # Identical score/version/symbol; differ only by last_seen_at -> DESC.
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-earlier", fingerprint="fp-earlier",
+            total_score=50.0, score_version=SCORE_VERSION,
+            last_seen_at="2026-01-01T00:00:00Z",
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-later", fingerprint="fp-later",
+            total_score=50.0, score_version=SCORE_VERSION,
+            last_seen_at="2026-01-01T00:10:00Z",
+        )
+
+        ranked = repo.get_ranked_opportunities(conn)
+        assert [r["opportunity_uid"] for r in ranked] == ["uid-later", "uid-earlier"]
+    finally:
+        close_db()
+
+
+def test_ranked_opportunities_deterministic_tie_break_symbol(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "ranked_ties_symbol.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        # Identical score/version/last_seen_at; differ only by symbol -> ASC.
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-zzz", fingerprint="fp-zzz", symbol="ZZZ",
+            total_score=50.0, score_version=SCORE_VERSION,
+            last_seen_at="2026-01-01T00:10:00Z",
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-aaa", fingerprint="fp-aaa", symbol="AAA",
+            total_score=50.0, score_version=SCORE_VERSION,
+            last_seen_at="2026-01-01T00:10:00Z",
+        )
+
+        ranked = repo.get_ranked_opportunities(conn)
+        assert [r["opportunity_uid"] for r in ranked] == ["uid-aaa", "uid-zzz"]
+    finally:
+        close_db()
+
+
+def test_ranked_opportunities_default_status_active_excludes_expired(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "ranked_status_default.db")
+    _env(monkeypatch, db_path)
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-active", fingerprint="fp-active",
+            total_score=60.0, score_version=SCORE_VERSION, status="ACTIVE",
+        )
+        _insert_scored_opportunity(
+            conn, opportunity_uid="uid-expired", fingerprint="fp-expired",
+            total_score=90.0, score_version=SCORE_VERSION, status="EXPIRED",
+        )
+
+        default_ranked = repo.get_ranked_opportunities(conn)
+        assert [r["opportunity_uid"] for r in default_ranked] == ["uid-active"]
+
+        expired_ranked = repo.get_ranked_opportunities(conn, status="EXPIRED")
+        assert [r["opportunity_uid"] for r in expired_ranked] == ["uid-expired"]
     finally:
         close_db()
