@@ -2275,3 +2275,187 @@ def test_ranked_opportunities_default_status_active_excludes_expired(monkeypatch
         assert [r["opportunity_uid"] for r in expired_ranked] == ["uid-expired"]
     finally:
         close_db()
+
+
+# ============================================================================
+# Trade plans and outcome evidence v0.1 — engine wiring
+# ============================================================================
+
+
+def test_new_opportunity_creates_exactly_one_trade_plan(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "trade_plan_new.db")
+    _env(monkeypatch, db_path)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(
+            setup_family="SWEEP_RECLAIM",
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0},
+        )
+        is_new = _record_finding(conn, finding, "2026-01-01T00:00:00Z", settings=settings)
+        assert is_new is True
+
+        opp_row = repo.get_opportunities(conn)[0]
+        plan_row = repo.get_trade_plan_by_opportunity_uid(conn, opp_row["opportunity_uid"])
+        assert plan_row is not None
+        assert plan_row["availability"] == "AVAILABLE"
+        assert plan_row["entry_price"] == 110.0
+        assert plan_row["stop_price"] == 100.0
+
+        outcome_row = conn.execute(
+            "SELECT * FROM opportunity_trade_plan_outcomes WHERE plan_uid=?",
+            (plan_row["plan_uid"],),
+        ).fetchone()
+        assert outcome_row["state"] == "PENDING_ENTRY"
+
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 1
+    finally:
+        close_db()
+
+
+def test_unavailable_plan_created_for_compression(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "trade_plan_compression.db")
+    _env(monkeypatch, db_path)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_compression_finding()
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z", settings=settings)
+
+        plan_row = conn.execute("SELECT * FROM opportunity_trade_plans").fetchone()
+        assert plan_row["availability"] == "UNAVAILABLE"
+        assert plan_row["unavailable_reason"] == "NO_STRUCTURAL_INVALIDATION"
+        assert plan_row["entry_price"] is None
+
+        outcome_row = conn.execute("SELECT * FROM opportunity_trade_plan_outcomes").fetchone()
+        assert outcome_row["state"] == "NOT_EVALUABLE"
+    finally:
+        close_db()
+
+
+def test_reconfirmation_does_not_duplicate_trade_plan(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "trade_plan_reconfirm.db")
+    _env(monkeypatch, db_path)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(
+            setup_family="SWEEP_RECLAIM",
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0},
+        )
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z", settings=settings)
+        _record_finding(conn, finding, "2026-01-01T00:05:00Z", settings=settings)  # reconfirmation
+
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 1
+    finally:
+        close_db()
+
+
+def test_historical_opportunity_never_gets_backfilled_plan(monkeypatch, tmp_path):
+    """A row created before the flag was enabled (or with settings omitted
+    entirely) must never gain a plan on a later reconfirmation, even once
+    the flag is on — plans are only ever created on the NEW-opportunity
+    branch.
+    """
+    db_path = str(tmp_path / "trade_plan_no_backfill.db")
+    _env(monkeypatch, db_path)
+    settings_no_plan = get_settings()
+    conn = init_db(settings_no_plan.apex_db_path)
+    try:
+        finding = _make_finding(
+            setup_family="SWEEP_RECLAIM",
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0},
+        )
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z")  # settings=None -> no plan
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 0
+
+        monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+        get_settings.cache_clear()
+        settings_with_plan = get_settings()
+
+        _record_finding(conn, finding, "2026-01-01T00:05:00Z", settings=settings_with_plan)
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 0
+    finally:
+        close_db()
+
+
+def test_contained_plan_failure_does_not_suppress_opportunity(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "trade_plan_failure.db")
+    _env(monkeypatch, db_path)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        def _boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(opportunity_engine, "build_trade_plan", _boom)
+
+        finding = _make_finding(
+            setup_family="SWEEP_RECLAIM",
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0},
+        )
+        summary = OpportunityScanSummary()
+        is_new = _record_finding(
+            conn, finding, "2026-01-01T00:00:00Z", settings=settings, summary=summary
+        )
+        assert is_new is True
+        assert len(repo.get_opportunities(conn)) == 1
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 0
+        assert summary.trade_plan_errors == 1
+        assert summary.trade_plans_created == 0
+    finally:
+        close_db()
+
+
+@pytest.mark.parametrize(
+    "trade_plan_flag,engine_flag,dry_run_flag",
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_trade_plan_guard_recheck_prevents_writes_when_any_flag_false(
+    monkeypatch, tmp_path, trade_plan_flag, engine_flag, dry_run_flag
+):
+    db_path = str(
+        tmp_path / f"guard_{int(trade_plan_flag)}_{int(engine_flag)}_{int(dry_run_flag)}.db"
+    )
+    _env(monkeypatch, db_path, opportunity_enabled=engine_flag, dry_run=dry_run_flag)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true" if trade_plan_flag else "false")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        finding = _make_finding(
+            setup_family="SWEEP_RECLAIM",
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0},
+        )
+        _record_finding(conn, finding, "2026-01-01T00:00:00Z", settings=settings)
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plan_outcomes").fetchone()[0] == 0
+    finally:
+        close_db()
+
+
+def test_run_opportunity_scan_creates_trade_plan_end_to_end(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "trade_plan_e2e.db")
+    _env(monkeypatch, db_path)
+    monkeypatch.setenv("TRADE_PLAN_EVIDENCE_ENABLED", "true")
+    settings = get_settings()
+    conn = init_db(settings.apex_db_path)
+    try:
+        _seed_market(conn, "BTC")
+        store = CandleStore(conn)
+        _load_into_store(store, "BTC", "5m", _sweep_reclaim_df())
+
+        summary = asyncio.run(run_opportunity_scan(conn, store, settings))
+        assert summary.trade_plans_created >= 1
+        assert summary.trade_plan_errors == 0
+        stored = conn.execute("SELECT COUNT(*) FROM opportunity_trade_plans").fetchone()[0]
+        assert stored == summary.trade_plans_created
+    finally:
+        close_db()

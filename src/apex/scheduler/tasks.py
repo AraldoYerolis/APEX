@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime as _dt, timezone as _tz
 from typing import Literal, Optional
@@ -22,6 +23,8 @@ from apex.notifications.templates import (
     format_forming_alert,
     format_followup_message,
 )
+from apex.opportunity.trade_plan import trade_plan_from_row
+from apex.opportunity.trade_plan_outcome import evaluate_trade_plan_outcome
 from apex.strategy.signal_engine import SignalCandidate, evaluate_symbol
 from apex.utils.ids import new_uid
 from apex.utils.time import minutes_from_now, utcnow_iso, minutes_ago_iso
@@ -817,3 +820,61 @@ async def run_observation_evaluation(
 
     except Exception as e:
         logger.error(f"Observation evaluation error: {e}", exc_info=True)
+
+
+async def run_trade_plan_outcome_evaluation(
+    conn: sqlite3.Connection,
+    candle_store: CandleStore,
+    settings: Settings,
+) -> None:
+    """Evaluate every nonterminal trade-plan outcome row against currently
+    closed candle data — prospective, closed-candle-only, no-look-ahead
+    research evidence, entirely separate from the immutable
+    opportunity_trade_plans rows (see apex.opportunity.trade_plan_outcome).
+
+    Defensive guard mirrors run_opportunity_scan: main.py only registers
+    this job when trade_plan_evidence_enabled AND opportunity_engine_enabled
+    AND dry_run_mode are all true, and this function rechecks all three so
+    it stays safe even if called directly outside that scheduler wiring.
+
+    One whole-second-floored `now_ms` is captured once for the entire pass
+    and used for every candle fetch and every evaluation (mirrors
+    run_opportunity_scan's identical no-look-ahead rationale). Candles are
+    fetched at most once per unique (symbol, primary_timeframe) pair this
+    pass, reused across every plan sharing it. A per-plan failure (fetch or
+    evaluation) is isolated and logged — it never aborts the rest of the
+    pass, and this function never writes to opportunity_observations or any
+    table other than opportunity_trade_plan_outcomes.
+    """
+    if not (
+        settings.trade_plan_evidence_enabled
+        and settings.opportunity_engine_enabled
+        and settings.dry_run_mode
+    ):
+        return
+
+    try:
+        rows = repo.get_nonterminal_trade_plan_outcomes(conn)
+        if not rows:
+            return
+
+        now_ms = int(time.time()) * 1000
+        frames: dict[tuple[str, str], object] = {}
+
+        for row in rows:
+            key = (row["symbol"], row["primary_timeframe"])
+            try:
+                if key not in frames:
+                    frames[key] = candle_store.get_df(key[0], key[1], now_ms=now_ms)
+                df = frames[key]
+                plan = trade_plan_from_row(row)
+                evaluation = evaluate_trade_plan_outcome(plan, df, now_ms)
+                repo.update_trade_plan_outcome(conn, evaluation)
+            except Exception:
+                logger.error(
+                    f"Trade plan outcome evaluation error: plan_uid={row['plan_uid']} "
+                    f"symbol={row['symbol']} timeframe={row['primary_timeframe']}",
+                    exc_info=True,
+                )
+    except Exception as e:
+        logger.error(f"Trade plan outcome evaluation pass error: {e}", exc_info=True)

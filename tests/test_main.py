@@ -27,6 +27,7 @@ from apex.config import Settings
 from apex.data import market_universe
 from apex.data.candle_store import CandleStore
 from apex.data.reconnecting_ws import ReconnectingWebSocket
+from apex.db import repository as repo
 
 
 @pytest.fixture(autouse=True)
@@ -1361,6 +1362,9 @@ async def _run_startup_with_mocks(
     monkeypatch, tmp_path, *,
     candle_diagnostics_enabled: bool,
     candle_reconciliation_enabled: bool = False,
+    opportunity_engine_enabled: bool = False,
+    trade_plan_evidence_enabled: bool = False,
+    dry_run_mode: bool = True,
 ) -> "_FakeScheduler":
     """Drive the real run() startup path with every external-I/O boundary
     mocked (network refresh/backfill, uvicorn serve, log file setup) so the
@@ -1377,6 +1381,9 @@ async def _run_startup_with_mocks(
             apex_db_path=str(tmp_path / "apex.db"),
             candle_diagnostics_enabled=candle_diagnostics_enabled,
             candle_reconciliation_enabled=candle_reconciliation_enabled,
+            opportunity_engine_enabled=opportunity_engine_enabled,
+            trade_plan_evidence_enabled=trade_plan_evidence_enabled,
+            dry_run_mode=dry_run_mode,
         ),
     )
     monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC"]))
@@ -1421,6 +1428,375 @@ async def test_startup_does_not_set_membership_when_disabled(monkeypatch, tmp_pa
     await _run_startup_with_mocks(monkeypatch, tmp_path, candle_diagnostics_enabled=False)
     assert main._candle_store.diagnostics_enabled is False
     assert main._candle_store.diagnostics_membership_generation == 0
+
+
+# ============================================================================
+# Trade plans and outcome evidence v0.1 — scheduler registration triple
+# guard (trade_plan_evidence_enabled AND opportunity_engine_enabled AND
+# dry_run_mode), default off.
+# ============================================================================
+
+
+async def test_trade_plan_job_registered_when_all_three_guards_true(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True, dry_run_mode=True,
+    )
+    assert "trade_plan_outcome_evaluation" in scheduler.job_ids
+    assert scheduler.job_ids.count("trade_plan_outcome_evaluation") == 1
+    assert "opportunity_scan" in scheduler.job_ids
+
+
+async def test_trade_plan_job_omitted_by_default(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(monkeypatch, tmp_path, candle_diagnostics_enabled=False)
+    assert "trade_plan_outcome_evaluation" not in scheduler.job_ids
+    # Unrelated always-on jobs must still register normally.
+    assert set(scheduler.job_ids) >= {"universe_refresh", "signal_scan", "followup_check"}
+
+
+@pytest.mark.parametrize(
+    "opportunity_engine_enabled,trade_plan_evidence_enabled,dry_run_mode",
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+async def test_trade_plan_job_omitted_when_any_single_guard_false(
+    monkeypatch, tmp_path, opportunity_engine_enabled, trade_plan_evidence_enabled, dry_run_mode
+):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=opportunity_engine_enabled,
+        trade_plan_evidence_enabled=trade_plan_evidence_enabled,
+        dry_run_mode=dry_run_mode,
+    )
+    assert "trade_plan_outcome_evaluation" not in scheduler.job_ids
+
+
+async def test_trade_plan_evaluation_defensive_guard_when_called_directly(tmp_path):
+    """Mirrors run_opportunity_scan's own defensive re-check: calling
+    run_trade_plan_outcome_evaluation directly (outside main.run()'s
+    scheduler wiring) with any guard false must be a safe, total no-op —
+    no candle fetch, no query, no write.
+    """
+    from apex.db.connection import close_db, init_db
+    from apex.scheduler.tasks import run_trade_plan_outcome_evaluation
+
+    db_path = str(tmp_path / "guard_direct.db")
+    conn = init_db(db_path)
+    try:
+        settings = Settings(
+            apex_db_path=db_path,
+            opportunity_engine_enabled=False,
+            trade_plan_evidence_enabled=True,
+            dry_run_mode=True,
+        )
+
+        class _ExplodingCandleStore:
+            def get_df(self, *a, **kw):
+                raise AssertionError("must never be called when a guard is false")
+
+        await run_trade_plan_outcome_evaluation(conn, _ExplodingCandleStore(), settings)
+        assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plan_outcomes").fetchone()[0] == 0
+    finally:
+        close_db()
+
+
+# ============================================================================
+# Trade plans and outcome evidence v0.1 — positive-path evaluator behavior
+# (all three guards true): shared candle fetch, per-plan update isolation,
+# and write-surface containment to opportunity_trade_plan_outcomes only.
+# ============================================================================
+
+
+class _FixedTime:
+    """Stand-in for the stdlib `time` module reference inside
+    apex.scheduler.tasks — overrides only that module's own `time` name
+    (via monkeypatch), never the real global `time` module, so `time.time()`
+    is deterministic for exactly the call under test.
+    """
+
+    def __init__(self, epoch_seconds: float):
+        self._epoch_seconds = epoch_seconds
+
+    def time(self) -> float:
+        return self._epoch_seconds
+
+
+def _trade_plan_eval_settings(db_path: str) -> Settings:
+    return Settings(
+        apex_db_path=db_path,
+        opportunity_engine_enabled=True,
+        trade_plan_evidence_enabled=True,
+        dry_run_mode=True,
+    )
+
+
+def _insert_trade_plan_opportunity(conn, opportunity_uid: str) -> None:
+    from apex.opportunity.contract import Opportunity
+
+    repo.insert_opportunity(
+        conn,
+        Opportunity(
+            opportunity_uid=opportunity_uid,
+            fingerprint=f"fp-{opportunity_uid}",
+            symbol="BTC",
+            direction="LONG",
+            setup_family="SWEEP_RECLAIM",
+            detector_version="sweep_reclaim_v0_1",
+            primary_timeframe="5m",
+            first_detected_at="2026-09-15T00:00:00Z",
+            last_seen_at="2026-09-15T00:00:00Z",
+            source_candle_open_time=1_700_000_000_000 - 300_000,
+            source_candle_close_time=1_700_000_000_000,
+        ),
+    )
+
+
+def _make_trade_plan_for_eval(*, plan_uid: str, opportunity_uid: str, entry: float, stop: float):
+    from apex.opportunity.contract import PRIMARY_TIMEFRAME_DURATION_MS
+    from apex.opportunity.trade_plan import OUTCOME_HORIZON_BARS, TRADE_PLAN_CONTRACT_VERSION, TradePlan
+
+    not_before = 1_700_000_000_000
+    duration = PRIMARY_TIMEFRAME_DURATION_MS["5m"]
+    risk = abs(entry - stop)
+    return TradePlan(
+        plan_uid=plan_uid,
+        opportunity_uid=opportunity_uid,
+        symbol="BTC",
+        direction="LONG",
+        setup_family="SWEEP_RECLAIM",
+        primary_timeframe="5m",
+        detector_version="sweep_reclaim_v0_1",
+        opportunity_contract_version="opportunity_v0_1",
+        plan_contract_version=TRADE_PLAN_CONTRACT_VERSION,
+        source_candle_open_time=not_before - duration,
+        source_candle_close_time=not_before,
+        created_at="2026-09-15T00:00:00Z",
+        availability="AVAILABLE",
+        unavailable_reason=None,
+        entry_type="RESTING_LIMIT_AT_SOURCE_CLOSE",
+        entry_price=entry,
+        invalidation_price=stop,
+        stop_price=stop,
+        risk_distance=risk,
+        target_1r_price=entry + risk,
+        target_2r_price=entry + 2.0 * risk,
+        target_1r_multiple=1.0,
+        target_2r_multiple=2.0,
+        reward_risk_1r=1.0,
+        reward_risk_2r=2.0,
+        evaluation_not_before_ms=not_before,
+        evaluation_expiry_ms=not_before + OUTCOME_HORIZON_BARS * duration,
+        provenance_json="{}",
+        warnings_json="[]",
+    )
+
+
+class _SpyCandleStore:
+    """Records every get_df call; returns the same fixed frame regardless of args."""
+
+    def __init__(self, df):
+        self._df = df
+        self.calls: list[tuple[str, str, object]] = []
+
+    def get_df(self, symbol, timeframe, now_ms=None):
+        self.calls.append((symbol, timeframe, now_ms))
+        return self._df
+
+
+def _all_table_names(conn) -> list[str]:
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    ]
+
+
+def _table_row_counts(conn) -> dict:
+    return {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in _all_table_names(conn)
+    }
+
+
+async def test_trade_plan_outcome_evaluation_shares_one_candle_fetch_across_plans(monkeypatch, tmp_path):
+    """Two nonterminal plans sharing one (symbol, timeframe) must cause
+    exactly one CandleStore.get_df call, with the same captured now_ms, and
+    both plans' outcome rows must be updated from that single fetch.
+    """
+    import pandas as pd
+
+    from apex.db.connection import close_db, init_db
+    from apex.opportunity.trade_plan_outcome import build_initial_trade_plan_outcome
+    import apex.scheduler.tasks as tasks_module
+
+    db_path = str(tmp_path / "positive_path.db")
+    conn = init_db(db_path)
+    try:
+        _insert_trade_plan_opportunity(conn, "opp-a")
+        _insert_trade_plan_opportunity(conn, "opp-b")
+
+        plan_a = _make_trade_plan_for_eval(plan_uid="plan-a", opportunity_uid="opp-a", entry=109.0, stop=100.0)
+        plan_b = _make_trade_plan_for_eval(plan_uid="plan-b", opportunity_uid="opp-b", entry=115.0, stop=105.0)
+        repo.insert_trade_plan_with_outcome(conn, plan_a, build_initial_trade_plan_outcome(plan_a))
+        repo.insert_trade_plan_with_outcome(conn, plan_b, build_initial_trade_plan_outcome(plan_b))
+
+        not_before = plan_a.evaluation_not_before_ms
+        duration = 300_000
+        df = pd.DataFrame(
+            [{"open_time": not_before, "open": 110.0, "high": 112.0, "low": 108.0, "close": 110.0}]
+        )
+        store = _SpyCandleStore(df)
+        settings = _trade_plan_eval_settings(db_path)
+        monkeypatch.setattr(tasks_module, "time", _FixedTime((not_before + duration) / 1000.0))
+
+        await tasks_module.run_trade_plan_outcome_evaluation(conn, store, settings)
+
+        assert len(store.calls) == 1
+        symbol, timeframe, now_ms = store.calls[0]
+        assert (symbol, timeframe) == ("BTC", "5m")
+        assert now_ms == not_before + duration
+
+        row_a = conn.execute(
+            "SELECT state, entry_open_time FROM opportunity_trade_plan_outcomes WHERE plan_uid='plan-a'"
+        ).fetchone()
+        row_b = conn.execute(
+            "SELECT state, entry_open_time FROM opportunity_trade_plan_outcomes WHERE plan_uid='plan-b'"
+        ).fetchone()
+        assert row_a["state"] == "ENTERED"
+        assert row_a["entry_open_time"] == not_before
+        assert row_b["state"] == "ENTERED"
+        assert row_b["entry_open_time"] == not_before
+    finally:
+        close_db()
+
+
+async def test_trade_plan_outcome_evaluation_isolates_one_plan_failure(monkeypatch, tmp_path):
+    """A per-plan evaluation failure (here: trade_plan_from_row raising for
+    exactly one plan) must be caught and logged in isolation — the other
+    plan sharing the same pass still gets its outcome row updated.
+    """
+    import pandas as pd
+
+    from apex.db.connection import close_db, init_db
+    from apex.opportunity.trade_plan_outcome import build_initial_trade_plan_outcome
+    import apex.scheduler.tasks as tasks_module
+
+    db_path = str(tmp_path / "isolation.db")
+    conn = init_db(db_path)
+    try:
+        _insert_trade_plan_opportunity(conn, "opp-good")
+        _insert_trade_plan_opportunity(conn, "opp-bad")
+
+        plan_good = _make_trade_plan_for_eval(
+            plan_uid="plan-good", opportunity_uid="opp-good", entry=109.0, stop=100.0
+        )
+        plan_bad = _make_trade_plan_for_eval(
+            plan_uid="plan-bad", opportunity_uid="opp-bad", entry=115.0, stop=105.0
+        )
+        repo.insert_trade_plan_with_outcome(conn, plan_good, build_initial_trade_plan_outcome(plan_good))
+        repo.insert_trade_plan_with_outcome(conn, plan_bad, build_initial_trade_plan_outcome(plan_bad))
+
+        not_before = plan_good.evaluation_not_before_ms
+        duration = 300_000
+        df = pd.DataFrame(
+            [{"open_time": not_before, "open": 110.0, "high": 112.0, "low": 108.0, "close": 110.0}]
+        )
+        store = _SpyCandleStore(df)
+        settings = _trade_plan_eval_settings(db_path)
+        monkeypatch.setattr(tasks_module, "time", _FixedTime((not_before + duration) / 1000.0))
+
+        real_trade_plan_from_row = tasks_module.trade_plan_from_row
+
+        def _failing_trade_plan_from_row(row):
+            if row["plan_uid"] == "plan-bad":
+                raise RuntimeError("forced evaluation failure for test")
+            return real_trade_plan_from_row(row)
+
+        monkeypatch.setattr(tasks_module, "trade_plan_from_row", _failing_trade_plan_from_row)
+
+        await tasks_module.run_trade_plan_outcome_evaluation(conn, store, settings)
+
+        good_row = conn.execute(
+            "SELECT state FROM opportunity_trade_plan_outcomes WHERE plan_uid='plan-good'"
+        ).fetchone()
+        bad_row = conn.execute(
+            "SELECT state FROM opportunity_trade_plan_outcomes WHERE plan_uid='plan-bad'"
+        ).fetchone()
+        assert good_row["state"] == "ENTERED"
+        assert bad_row["state"] == "PENDING_ENTRY"  # unchanged — its failure was isolated
+    finally:
+        close_db()
+
+
+async def test_trade_plan_outcome_evaluation_writes_only_outcome_table(monkeypatch, tmp_path):
+    """The evaluator must never write to opportunity_trade_plans,
+    opportunity_observations, alerts, paper_trades, daily_risk, snoozes, or
+    any signal_* table — only opportunity_trade_plan_outcomes.
+    """
+    import pandas as pd
+
+    from apex.db.connection import close_db, init_db
+    from apex.opportunity.trade_plan_outcome import build_initial_trade_plan_outcome
+    import apex.scheduler.tasks as tasks_module
+
+    db_path = str(tmp_path / "containment.db")
+    conn = init_db(db_path)
+    try:
+        _insert_trade_plan_opportunity(conn, "opp-contain")
+        plan = _make_trade_plan_for_eval(
+            plan_uid="plan-contain", opportunity_uid="opp-contain", entry=109.0, stop=100.0
+        )
+        repo.insert_trade_plan_with_outcome(conn, plan, build_initial_trade_plan_outcome(plan))
+
+        not_before = plan.evaluation_not_before_ms
+        duration = 300_000
+        df = pd.DataFrame(
+            [{"open_time": not_before, "open": 110.0, "high": 112.0, "low": 108.0, "close": 110.0}]
+        )
+        store = _SpyCandleStore(df)
+        settings = _trade_plan_eval_settings(db_path)
+        monkeypatch.setattr(tasks_module, "time", _FixedTime((not_before + duration) / 1000.0))
+
+        before_counts = _table_row_counts(conn)
+        plan_row_before = dict(
+            conn.execute(
+                "SELECT * FROM opportunity_trade_plans WHERE plan_uid='plan-contain'"
+            ).fetchone()
+        )
+        opp_row_before = dict(
+            conn.execute(
+                "SELECT * FROM opportunity_observations WHERE opportunity_uid='opp-contain'"
+            ).fetchone()
+        )
+
+        await tasks_module.run_trade_plan_outcome_evaluation(conn, store, settings)
+
+        after_counts = _table_row_counts(conn)
+        assert after_counts == before_counts  # no table gained or lost any row
+
+        plan_row_after = dict(
+            conn.execute(
+                "SELECT * FROM opportunity_trade_plans WHERE plan_uid='plan-contain'"
+            ).fetchone()
+        )
+        opp_row_after = dict(
+            conn.execute(
+                "SELECT * FROM opportunity_observations WHERE opportunity_uid='opp-contain'"
+            ).fetchone()
+        )
+        assert plan_row_after == plan_row_before  # immutable plan row untouched
+        assert opp_row_after == opp_row_before    # opportunity row untouched
+
+        outcome_row = conn.execute(
+            "SELECT state FROM opportunity_trade_plan_outcomes WHERE plan_uid='plan-contain'"
+        ).fetchone()
+        assert outcome_row["state"] == "ENTERED"  # proves the evaluator did actually write
+    finally:
+        close_db()
 
 
 # ============================================================================

@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # to signal generation, alerting, or trade execution. See CLAUDE.md.
     opportunity_engine_enabled: bool = False
 
+    # Trade plans and outcome evidence v0.1 (research-only, additive — see
+    # src/apex/opportunity/trade_plan.py and trade_plan_outcome.py). Must be
+    # explicitly enabled AND requires opportunity_engine_enabled=true AND
+    # dry_run_mode=true; never influences detector eligibility/ranking,
+    # scoring, alerting, sizing, or trade execution. See CLAUDE.md.
+    trade_plan_evidence_enabled: bool = False
+
     # Candle-feed diagnostics (bounded, local, default-off — see
     # src/apex/data/candle_store.py and src/apex/data/reconnecting_ws.py).
     # Adds in-memory counters and a periodic local log snapshot only when

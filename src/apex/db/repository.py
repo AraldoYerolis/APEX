@@ -9,6 +9,8 @@ from typing import Optional
 from apex.db.models import Alert, DailyRisk, Market, PaperTrade, SignalFeature, SignalObservation, Snooze
 from apex.opportunity.contract import Opportunity
 from apex.opportunity.scoring import SCORE_VERSION
+from apex.opportunity.trade_plan import TradePlan
+from apex.opportunity.trade_plan_outcome import TERMINAL_OUTCOME_STATES, TradePlanOutcomeEvaluation
 
 
 def _now_utc() -> str:
@@ -887,3 +889,223 @@ def get_ranked_opportunities(
         """,
         query_params,
     ).fetchall()
+
+
+# ------------------------------------------------------------------ opportunity_trade_plans /
+# opportunity_trade_plan_outcomes
+# Trade plans and outcome evidence v0.1 — additive, research-only. See
+# src/apex/opportunity/trade_plan.py / trade_plan_outcome.py for the pure
+# contracts these functions persist. Only opportunity/engine.py (plan
+# creation) and scheduler/tasks.py (outcome evaluation) call these; neither
+# ever writes to opportunity_observations itself.
+
+def insert_trade_plan_with_outcome(
+    conn: sqlite3.Connection,
+    plan: TradePlan,
+    outcome: TradePlanOutcomeEvaluation,
+) -> None:
+    """Atomically insert the one immutable trade plan row and its initial
+    one-to-one outcome row for a brand-new opportunity. Never called for a
+    reconfirmation, and opportunity_trade_plans is never UPDATEd by any
+    function in this module — this INSERT is its only writer.
+
+    If either INSERT or the final commit fails, the transaction is
+    explicitly rolled back before the exception is re-raised, so a failed
+    pair never leaves a half-written row pending in the connection's
+    transaction state for an unrelated later commit() to accidentally
+    persist.
+    """
+    try:
+        _insert_trade_plan_with_outcome_unguarded(conn, plan, outcome)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _insert_trade_plan_with_outcome_unguarded(
+    conn: sqlite3.Connection,
+    plan: TradePlan,
+    outcome: TradePlanOutcomeEvaluation,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO opportunity_trade_plans (
+            plan_uid, opportunity_uid, symbol, direction, setup_family,
+            primary_timeframe, detector_version, opportunity_contract_version,
+            plan_contract_version, source_candle_open_time, source_candle_close_time,
+            created_at, availability, unavailable_reason, entry_type, entry_price,
+            invalidation_price, stop_price, risk_distance,
+            target_1r_price, target_2r_price, target_1r_multiple, target_2r_multiple,
+            reward_risk_1r, reward_risk_2r,
+            evaluation_not_before_ms, evaluation_expiry_ms,
+            provenance_json, warnings_json, research_only
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            plan.plan_uid,
+            plan.opportunity_uid,
+            plan.symbol,
+            plan.direction,
+            plan.setup_family,
+            plan.primary_timeframe,
+            plan.detector_version,
+            plan.opportunity_contract_version,
+            plan.plan_contract_version,
+            plan.source_candle_open_time,
+            plan.source_candle_close_time,
+            plan.created_at,
+            plan.availability,
+            plan.unavailable_reason,
+            plan.entry_type,
+            plan.entry_price,
+            plan.invalidation_price,
+            plan.stop_price,
+            plan.risk_distance,
+            plan.target_1r_price,
+            plan.target_2r_price,
+            plan.target_1r_multiple,
+            plan.target_2r_multiple,
+            plan.reward_risk_1r,
+            plan.reward_risk_2r,
+            plan.evaluation_not_before_ms,
+            plan.evaluation_expiry_ms,
+            plan.provenance_json,
+            plan.warnings_json,
+            int(plan.research_only),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO opportunity_trade_plan_outcomes (
+            plan_uid, opportunity_uid, contract_version, state,
+            last_evaluated_ms, last_evaluated_open_time,
+            entry_open_time, hit_1r_open_time, terminal_open_time, terminal_reason,
+            mfe_r, mae_r, data_quality, first_missing_boundary_ms,
+            is_ambiguous, decisive_ohlc_json, crossed_levels_json, evidence_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            outcome.plan_uid,
+            outcome.opportunity_uid,
+            outcome.contract_version,
+            outcome.state,
+            outcome.last_evaluated_ms,
+            outcome.last_evaluated_open_time,
+            outcome.entry_open_time,
+            outcome.hit_1r_open_time,
+            outcome.terminal_open_time,
+            outcome.terminal_reason,
+            outcome.mfe_r,
+            outcome.mae_r,
+            outcome.data_quality,
+            outcome.first_missing_boundary_ms,
+            int(outcome.is_ambiguous),
+            json.dumps(outcome.decisive_ohlc, sort_keys=True, allow_nan=False)
+            if outcome.decisive_ohlc is not None
+            else None,
+            json.dumps(list(outcome.crossed_levels), sort_keys=True, allow_nan=False),
+            outcome.evidence_json,
+        ),
+    )
+    conn.commit()
+
+
+def get_trade_plan_by_opportunity_uid(
+    conn: sqlite3.Connection, opportunity_uid: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM opportunity_trade_plans WHERE opportunity_uid=?",
+        (opportunity_uid,),
+    ).fetchone()
+
+
+def get_nonterminal_trade_plan_outcomes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every plan+outcome pair still in a nonterminal state, joined for the
+    scheduler's evaluation pass (see scheduler/tasks.py's
+    run_trade_plan_outcome_evaluation). Read-only; never writes anything.
+    """
+    placeholders = ",".join("?" for _ in TERMINAL_OUTCOME_STATES)
+    return conn.execute(
+        f"""
+        SELECT p.*, o.state AS outcome_state
+        FROM opportunity_trade_plan_outcomes o
+        JOIN opportunity_trade_plans p ON p.plan_uid = o.plan_uid
+        WHERE o.state NOT IN ({placeholders})
+        ORDER BY p.created_at ASC
+        """,
+        tuple(TERMINAL_OUTCOME_STATES),
+    ).fetchall()
+
+
+def update_trade_plan_outcome(
+    conn: sqlite3.Connection, evaluation: TradePlanOutcomeEvaluation
+) -> bool:
+    """Apply one evaluation pass's result to the matching outcome row.
+
+    Guarded so only a row currently in a NONTERMINAL state is ever touched
+    (`WHERE state NOT IN (...)`) — a row that has already become terminal
+    since it was read is left untouched rather than resurrected. Milestone
+    timestamps (`entry_open_time`, `hit_1r_open_time`) use COALESCE so a
+    value recorded by an earlier pass can never be cleared/overwritten by a
+    later one. `mfe_r`/`mae_r` are monotonic non-decreasing: the already-
+    recorded value is kept whenever this pass reports a lower or NULL value
+    (e.g. a later replay against a shorter/gapped frame), while the first
+    non-NULL value is still recorded and a genuinely higher value still
+    updates. Returns True if a row was actually updated.
+    """
+    placeholders = ",".join("?" for _ in TERMINAL_OUTCOME_STATES)
+    decisive_json = (
+        json.dumps(evaluation.decisive_ohlc, sort_keys=True, allow_nan=False)
+        if evaluation.decisive_ohlc is not None
+        else None
+    )
+    crossed_json = json.dumps(list(evaluation.crossed_levels), sort_keys=True, allow_nan=False)
+    cur = conn.execute(
+        f"""
+        UPDATE opportunity_trade_plan_outcomes
+        SET state=?, last_evaluated_ms=?, last_evaluated_open_time=?,
+            entry_open_time=COALESCE(entry_open_time, ?),
+            hit_1r_open_time=COALESCE(hit_1r_open_time, ?),
+            terminal_open_time=?, terminal_reason=?,
+            mfe_r=CASE
+                WHEN mfe_r IS NULL THEN ?
+                WHEN ? IS NULL THEN mfe_r
+                ELSE MAX(mfe_r, ?)
+            END,
+            mae_r=CASE
+                WHEN mae_r IS NULL THEN ?
+                WHEN ? IS NULL THEN mae_r
+                ELSE MAX(mae_r, ?)
+            END,
+            data_quality=?, first_missing_boundary_ms=?,
+            is_ambiguous=?, decisive_ohlc_json=?, crossed_levels_json=?,
+            evidence_json=?, updated_at=?
+        WHERE plan_uid=? AND state NOT IN ({placeholders})
+        """,
+        (
+            evaluation.state,
+            evaluation.last_evaluated_ms,
+            evaluation.last_evaluated_open_time,
+            evaluation.entry_open_time,
+            evaluation.hit_1r_open_time,
+            evaluation.terminal_open_time,
+            evaluation.terminal_reason,
+            evaluation.mfe_r,
+            evaluation.mfe_r,
+            evaluation.mfe_r,
+            evaluation.mae_r,
+            evaluation.mae_r,
+            evaluation.mae_r,
+            evaluation.data_quality,
+            evaluation.first_missing_boundary_ms,
+            int(evaluation.is_ambiguous),
+            decisive_json,
+            crossed_json,
+            evaluation.evidence_json,
+            _now_utc(),
+            evaluation.plan_uid,
+            *TERMINAL_OUTCOME_STATES,
+        ),
+    )
+    conn.commit()
+    return cur.rowcount > 0

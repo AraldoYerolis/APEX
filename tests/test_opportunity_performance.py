@@ -40,7 +40,7 @@ from apex.opportunity.context import (
     compute_symbol_trend_component,
     compute_volatility_component,
 )
-from apex.opportunity.contract import SetupFamily
+from apex.opportunity.contract import CONTRACT_VERSION, DetectorFinding, SetupFamily
 from apex.opportunity.detectors.support_resistance_breakout_retest import (
     detect_support_resistance_breakout_retest,
 )
@@ -53,6 +53,8 @@ from apex.opportunity.detectors.support_resistance_rejection import (
 from apex.opportunity.detectors.sweep_reclaim import detect_sweep_reclaim
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
 from apex.opportunity.scoring import score_opportunity
+from apex.opportunity.trade_plan import build_trade_plan
+from apex.opportunity.trade_plan_outcome import evaluate_trade_plan_outcome
 
 N_SYMBOLS = 30
 TIMEFRAMES = ("3m", "5m")
@@ -186,6 +188,48 @@ def _make_15m_df(now_ms: int, n: int = 100) -> pd.DataFrame:
     })
 
 
+def _dummy_finding_for_family(family: str, symbol: str, timeframe: str, source_close_time: int) -> DetectorFinding:
+    """Deterministic representative finding per family, valid enough to
+    exercise build_trade_plan's real (non-short-circuit) formula path for
+    every non-compression family — mirrors the scoring loop's own rationale
+    just above (one representative case per family, not a dependency on the
+    detector fixture above actually producing one of every family).
+    """
+    duration = TIMEFRAME_DURATION_MS[timeframe]
+    common = dict(
+        symbol=symbol,
+        direction="LONG",
+        setup_family=family,
+        detector_version="perf_v0_1",
+        primary_timeframe=timeframe,
+        source_candle_open_time=source_close_time - duration,
+        source_candle_close_time=source_close_time,
+        fingerprint_key="perf-fixture",
+    )
+    if family == "SWEEP_RECLAIM":
+        return DetectorFinding(
+            measurements={"reclaim_close": 110.0, "sweep_low": 100.0}, evidence={}, warnings=[], **common
+        )
+    if family == "VOLATILITY_COMPRESSION":
+        return DetectorFinding(measurements={}, evidence={}, warnings=[], **common)
+    return DetectorFinding(
+        evidence={"source_close": 105.0, "zone_lower": 100.0, "zone_upper": 108.0},
+        measurements={}, warnings=[], **common
+    )
+
+
+def _dummy_outcome_df(timeframe: str, not_before: int) -> pd.DataFrame:
+    """One closed candle exactly at evaluation_not_before, reaching the
+    LONG entry price used by _dummy_finding_for_family above — enough for
+    evaluate_trade_plan_outcome to do real (ENTERED) bounded work rather
+    than a trivial "nothing due yet" short-circuit.
+    """
+    return pd.DataFrame({
+        "open_time": [not_before],
+        "open": [108.0], "high": [111.0], "low": [104.0], "close": [108.0],
+    })
+
+
 def test_detectors_and_context_scoring_bounded_over_30_symbols_2_timeframes():
     symbols = [f"SYM{i}" for i in range(N_SYMBOLS)]
     df = _make_df()
@@ -194,6 +238,7 @@ def test_detectors_and_context_scoring_bounded_over_30_symbols_2_timeframes():
 
     start = time.perf_counter()
     total_calls = 0
+    total_plans = 0
 
     # Once per scan (see engine.py: BTC trend computed at most once/scan).
     btc_trend = compute_symbol_trend_component(df_15m, NOW_MS)
@@ -246,11 +291,33 @@ def test_detectors_and_context_scoring_bounded_over_30_symbols_2_timeframes():
                 assert result.total_score is not None
                 assert result.total_score == 100.0  # all three components aligned LONG
 
+                # Trade plans and outcome evidence v0.1 — same per-(symbol,
+                # timeframe, family) cost shape as engine._maybe_create_trade_plan
+                # (one build_trade_plan call) plus one evaluate_trade_plan_outcome
+                # replay, added to the SAME measured region and bound.
+                finding = _dummy_finding_for_family(_family, symbol, timeframe, NOW_MS)
+                plan = build_trade_plan(
+                    finding,
+                    plan_uid=f"{symbol}-{timeframe}-{_family}",
+                    opportunity_uid=f"{symbol}-{timeframe}-{_family}-opp",
+                    fingerprint="perf-fp",
+                    created_at="2026-09-15T00:00:00Z",
+                )
+                total_plans += 1
+                if plan.availability == "AVAILABLE":
+                    outcome_df = _dummy_outcome_df(timeframe, NOW_MS)
+                    outcome = evaluate_trade_plan_outcome(
+                        plan, outcome_df, NOW_MS + TIMEFRAME_DURATION_MS[timeframe]
+                    )
+                    assert outcome.state in ("ENTERED", "AMBIGUOUS")
+
     elapsed = time.perf_counter() - start
 
     assert total_calls == N_SYMBOLS * len(TIMEFRAMES) * N_DETECTORS
     assert len(FAMILIES) == N_DETECTORS
+    assert total_plans == N_SYMBOLS * len(TIMEFRAMES) * N_DETECTORS
+    assert plan.opportunity_contract_version == CONTRACT_VERSION
     assert elapsed < MAX_SECONDS, (
         f"30 symbols x {len(TIMEFRAMES)} timeframes x ({N_DETECTORS} detectors + context + "
-        f"scoring per family) took {elapsed:.3f}s, expected well under {MAX_SECONDS}s"
+        f"scoring + trade plan/outcome per family) took {elapsed:.3f}s, expected well under {MAX_SECONDS}s"
     )
