@@ -38,6 +38,7 @@ from apex.scheduler.tasks import (
     run_followup_check,
     run_observation_evaluation,
     run_signal_scan,
+    run_trade_plan_outcome_evaluation,
     run_universe_refresh,
 )
 
@@ -699,6 +700,26 @@ async def run() -> None:
             seconds=60,
             args=[conn, _candle_store, settings],
             id="opportunity_scan",
+        )
+
+    # Trade plans and outcome evidence v0.1 — additive, research-only (see
+    # src/apex/opportunity/trade_plan.py / trade_plan_outcome.py). Gated
+    # here AND inside run_trade_plan_outcome_evaluation itself (same
+    # defense-in-depth pattern as the opportunity scan job above): never
+    # registered unless explicitly enabled AND opportunity_engine_enabled
+    # AND dry_run_mode are all true. Never touches the existing signal/alert
+    # path, Pushover, or opportunity_observations itself.
+    if (
+        settings.trade_plan_evidence_enabled
+        and settings.opportunity_engine_enabled
+        and settings.dry_run_mode
+    ):
+        scheduler.add_job(
+            run_trade_plan_outcome_evaluation,
+            "interval",
+            seconds=60,
+            args=[conn, _candle_store, settings],
+            id="trade_plan_outcome_evaluation",
         )
 
     # Candle-feed diagnostics snapshot — bounded, local, research-only.

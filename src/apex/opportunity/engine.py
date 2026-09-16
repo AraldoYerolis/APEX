@@ -151,6 +151,8 @@ from apex.opportunity.detectors.support_resistance_rejection import (
 from apex.opportunity.detectors.sweep_reclaim import detect_sweep_reclaim
 from apex.opportunity.detectors.volatility_compression import detect_volatility_compression
 from apex.opportunity.scoring import SCORE_VERSION, component_scores_to_dict, score_opportunity
+from apex.opportunity.trade_plan import build_trade_plan
+from apex.opportunity.trade_plan_outcome import build_initial_trade_plan_outcome
 from apex.utils.ids import new_uid
 from apex.utils.time import minutes_ago_iso
 
@@ -213,6 +215,12 @@ class OpportunityScanSummary:
     # components, later timeframes, and later markets are unaffected.
     context_errors: int = 0
     score_errors: int = 0
+    # Trade plans and outcome evidence v0.1 — optional-enrichment counters,
+    # entirely separate from detector_errors/context_errors/score_errors.
+    # A plan-creation failure is contained (see engine._maybe_create_trade_plan)
+    # and never suppresses the opportunity row or any other market/timeframe.
+    trade_plans_created: int = 0
+    trade_plan_errors: int = 0
 
     def log(self, logger: logging.Logger) -> None:
         logger.info(
@@ -222,7 +230,9 @@ class OpportunityScanSummary:
             f"{self.expired} expired, {self.no_data} no data, {self.stale} stale, "
             f"{self.detector_errors} detector errors, "
             f"{self.context_errors} context fetch/computation errors, "
-            f"{self.score_errors} scoring errors"
+            f"{self.score_errors} scoring errors, "
+            f"{self.trade_plans_created} trade plans created, "
+            f"{self.trade_plan_errors} trade plan errors"
         )
 
 
@@ -565,7 +575,12 @@ async def run_opportunity_scan(
 
                 for finding in findings:
                     is_new = _record_finding(
-                        conn, finding, now, context_inputs=context_inputs, summary=summary
+                        conn,
+                        finding,
+                        now,
+                        context_inputs=context_inputs,
+                        summary=summary,
+                        settings=settings,
                     )
                     summary.findings += 1
                     if is_new:
@@ -646,6 +661,61 @@ def _build_score_snapshot(
         return None, None, None, SCORE_VERSION, json.dumps(["CONTEXT_SCORING_FAILED"])
 
 
+def _maybe_create_trade_plan(
+    conn: sqlite3.Connection,
+    finding: DetectorFinding,
+    opportunity_uid: str,
+    fingerprint: str,
+    now: str,
+    settings: Optional[Settings],
+    summary: Optional[OpportunityScanSummary],
+) -> None:
+    """Create the one immutable trade plan (+ initial outcome row) for a
+    brand-new opportunity only — never called for a reconfirmation (see
+    _record_finding's NEW-row branch below). Fully additive and isolated:
+    any failure here is counted/logged and never raises out to the caller,
+    so a plan-creation failure can never suppress the opportunity row
+    already committed, nor any other finding/market/timeframe.
+
+    Rechecks all three safety guards itself (trade_plan_evidence_enabled AND
+    opportunity_engine_enabled AND dry_run_mode) — defense in depth mirroring
+    run_opportunity_scan's own top-of-function guard, so this stays safe
+    even if _record_finding is ever called directly (e.g. by a test) without
+    going through that guard.
+    """
+    if settings is None:
+        return
+    if not (
+        settings.trade_plan_evidence_enabled
+        and settings.opportunity_engine_enabled
+        and settings.dry_run_mode
+    ):
+        return
+    try:
+        plan = build_trade_plan(
+            finding,
+            plan_uid=new_uid(),
+            opportunity_uid=opportunity_uid,
+            fingerprint=fingerprint,
+            created_at=now,
+        )
+        outcome = build_initial_trade_plan_outcome(plan)
+        repo.insert_trade_plan_with_outcome(conn, plan, outcome)
+        if summary is not None:
+            summary.trade_plans_created += 1
+    except Exception:
+        if summary is not None:
+            summary.trade_plan_errors += 1
+        logger.error(
+            "Trade plan creation error: opportunity_uid=%s symbol=%s family=%s timeframe=%s",
+            opportunity_uid,
+            finding.symbol,
+            finding.setup_family,
+            finding.primary_timeframe,
+            exc_info=True,
+        )
+
+
 def _record_finding(
     conn: sqlite3.Connection,
     finding: DetectorFinding,
@@ -653,14 +723,15 @@ def _record_finding(
     *,
     context_inputs: Optional[ContextInputs] = None,
     summary: Optional[OpportunityScanSummary] = None,
+    settings: Optional[Settings] = None,
 ) -> bool:
     """Insert or touch the opportunity row for this finding.
 
     Returns True if a new row was inserted, False if an existing ACTIVE
-    opportunity was touched instead. `context_inputs`/`summary` are
-    optional keyword-only additions (Context and ranking v0.1) so existing
-    callers that pass only `(conn, finding, now)` keep working unchanged —
-    see _build_score_snapshot.
+    opportunity was touched instead. `context_inputs`/`summary`/`settings`
+    are optional keyword-only additions so existing callers that pass only
+    `(conn, finding, now)` keep working unchanged — see
+    _build_score_snapshot / _maybe_create_trade_plan.
     """
     fingerprint = compute_fingerprint(finding)
     existing = repo.get_active_opportunity_by_fingerprint(conn, fingerprint)
@@ -721,4 +792,7 @@ def _record_finding(
         score_warnings_json=score_warnings_json,
     )
     opportunity.id = repo.insert_opportunity(conn, opportunity)
+    _maybe_create_trade_plan(
+        conn, finding, opportunity.opportunity_uid, fingerprint, now, settings, summary
+    )
     return True

@@ -325,3 +325,113 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_observations_lookup
     ON opportunity_observations(symbol, setup_family, primary_timeframe, status);
 CREATE INDEX IF NOT EXISTS idx_opportunity_observations_uid
     ON opportunity_observations(opportunity_uid);
+
+-- ---------------------------------------------------------------
+-- opportunity_trade_plans
+-- Trade plans and outcome evidence v0.1 — additive, research-only.
+-- Exactly one immutable row per opportunity_uid, written only in the
+-- successful NEW-opportunity branch of opportunity/engine.py's
+-- _record_finding — never backfilled for historical opportunities, never
+-- UPDATEd after insert. See src/apex/opportunity/trade_plan.py for the
+-- exact formulas/versioning this row records. Deliberately excludes any
+-- account size, dollar risk, quantity, notional, margin, leverage, or
+-- execution instruction field.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS opportunity_trade_plans (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_uid                        TEXT NOT NULL UNIQUE,
+    opportunity_uid                 TEXT NOT NULL UNIQUE
+                                        REFERENCES opportunity_observations(opportunity_uid),
+    symbol                          TEXT NOT NULL,
+    direction                       TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+    setup_family                    TEXT NOT NULL CHECK(setup_family IN (
+                                        'VOLATILITY_COMPRESSION','SWEEP_RECLAIM',
+                                        'SUPPORT_RESISTANCE_REJECTION','SUPPORT_RESISTANCE_BREAKOUT_RETEST',
+                                        'SUPPORT_RESISTANCE_FAILED_BREAKOUT'
+                                     )),
+    primary_timeframe               TEXT NOT NULL CHECK(primary_timeframe IN ('3m','5m')),
+    detector_version                TEXT NOT NULL,
+    opportunity_contract_version    TEXT NOT NULL,
+    plan_contract_version           TEXT NOT NULL,
+    source_candle_open_time         INTEGER NOT NULL,
+    source_candle_close_time        INTEGER NOT NULL,
+    created_at                      TEXT NOT NULL,          -- ISO8601 UTC; the plan's created/as-of time
+    availability                    TEXT NOT NULL CHECK(availability IN ('AVAILABLE','UNAVAILABLE')),
+    unavailable_reason              TEXT,
+    entry_type                      TEXT,
+    entry_price                     REAL,
+    invalidation_price              REAL,
+    stop_price                      REAL,
+    risk_distance                   REAL,
+    target_1r_price                 REAL,
+    target_2r_price                 REAL,
+    target_1r_multiple              REAL,
+    target_2r_multiple              REAL,
+    reward_risk_1r                  REAL,
+    reward_risk_2r                  REAL,
+    evaluation_not_before_ms        INTEGER,                -- Unix ms; == source_candle_close_time
+    evaluation_expiry_ms            INTEGER,                -- Unix ms; fixed research horizon
+    provenance_json                 TEXT NOT NULL,
+    warnings_json                   TEXT NOT NULL,
+    research_only                   INTEGER NOT NULL DEFAULT 1,
+    CHECK (
+        (availability = 'UNAVAILABLE' AND unavailable_reason IS NOT NULL
+            AND entry_price IS NULL AND stop_price IS NULL
+            AND target_1r_price IS NULL AND target_2r_price IS NULL)
+        OR
+        (availability = 'AVAILABLE' AND unavailable_reason IS NULL
+            AND entry_type IS NOT NULL AND entry_price IS NOT NULL AND stop_price IS NOT NULL
+            AND target_1r_price IS NOT NULL AND target_2r_price IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plans_opportunity_uid
+    ON opportunity_trade_plans(opportunity_uid);
+CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plans_symbol
+    ON opportunity_trade_plans(symbol, primary_timeframe);
+
+-- ---------------------------------------------------------------
+-- opportunity_trade_plan_outcomes
+-- Trade plans and outcome evidence v0.1 — additive, research-only.
+-- One mutable-until-terminal outcome row per plan_uid (one-to-one).
+-- Nonterminal rows are updated pass over pass by
+-- scheduler/tasks.py's run_trade_plan_outcome_evaluation via
+-- db/repository.py's update_trade_plan_outcome (which never updates a
+-- row already in a terminal state — see
+-- src/apex/opportunity/trade_plan_outcome.py for state semantics).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS opportunity_trade_plan_outcomes (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_uid                     TEXT NOT NULL UNIQUE
+                                     REFERENCES opportunity_trade_plans(plan_uid),
+    opportunity_uid              TEXT NOT NULL
+                                     REFERENCES opportunity_observations(opportunity_uid),
+    contract_version              TEXT NOT NULL,
+    state                         TEXT NOT NULL CHECK(state IN (
+                                     'NOT_EVALUABLE','PENDING_ENTRY','ENTERED','HIT_1R',
+                                     'HIT_2R','STOPPED','EXPIRED_UNENTERED','EXPIRED_OPEN',
+                                     'AMBIGUOUS','INSUFFICIENT_DATA'
+                                  )),
+    last_evaluated_ms             INTEGER,
+    last_evaluated_open_time      INTEGER,
+    entry_open_time               INTEGER,
+    hit_1r_open_time              INTEGER,
+    terminal_open_time            INTEGER,
+    terminal_reason               TEXT,
+    mfe_r                         REAL CHECK(mfe_r IS NULL OR mfe_r >= 0),
+    mae_r                         REAL CHECK(mae_r IS NULL OR mae_r >= 0),
+    data_quality                  TEXT NOT NULL DEFAULT 'COMPLETE'
+                                     CHECK(data_quality IN ('COMPLETE','INSUFFICIENT_DATA')),
+    first_missing_boundary_ms     INTEGER,
+    is_ambiguous                  INTEGER NOT NULL DEFAULT 0,
+    decisive_ohlc_json            TEXT,
+    crossed_levels_json           TEXT,
+    evidence_json                 TEXT NOT NULL,
+    created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plan_outcomes_state
+    ON opportunity_trade_plan_outcomes(state);
+CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plan_outcomes_plan_uid
+    ON opportunity_trade_plan_outcomes(plan_uid);
