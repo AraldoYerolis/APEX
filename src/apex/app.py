@@ -18,6 +18,12 @@ def create_app(settings=None, conn=None) -> FastAPI:
 
     settings and conn are injected at startup from main.py.
     """
+    from apex.config import get_settings
+
+    # Resolved once, here, purely to decide whether to mount the Live
+    # Opportunity Board router below — never used for any other purpose in
+    # this function.
+    mount_cfg = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -37,6 +43,16 @@ def create_app(settings=None, conn=None) -> FastAPI:
     )
 
     app.include_router(actions_router)
+
+    # Live Opportunity Board v0.1 — local, development-only, read-only
+    # research UI/API (see src/apex/opportunity/board.py). Mounted only when
+    # explicitly enabled AND apex_env=="development"; production never
+    # mounts these routes even if the flag is somehow set true there — there
+    # is no override, token, or other escape hatch for that check.
+    if mount_cfg.live_opportunity_board_enabled and mount_cfg.apex_env == "development":
+        from apex.opportunity.board import create_board_router
+
+        app.include_router(create_board_router(conn))
 
     @app.get("/health")
     async def health() -> dict[str, str]:
