@@ -1,0 +1,103 @@
+# EXAMPLE ONLY — not installed, enabled, or started by any automation in
+# this repository. A real deployment requires Aaron's separate, explicit
+# approval and provisioning of the restricted runtime directory, the
+# dedicated OS user/group, the environment file, and read-only database
+# access described in docs/LIVE_OPPORTUNITY_BOARD_ACCESS.md.
+#
+# This unit runs one Python process serving the Protected Live Opportunity
+# Board (src/apex/opportunity/protected_board.py) over a permission-
+# restricted Unix domain socket only — it never opens a TCP listener, and it
+# is a wholly separate process/unit from the main apex.service.
+
+[Unit]
+Description=APEX Protected Live Opportunity Board (board-only, read-only)
+After=network.target
+# Deliberately does not use network-online.target / Wants=network-online.target
+# the way apex.service does — this process serves only a local Unix socket
+# and has no reason to wait on outbound network readiness.
+
+[Service]
+Type=simple
+
+# Dedicated, unprivileged OS identity — never the main apex user/group, so a
+# compromise of this process cannot reach anything apex.service can.
+User=apex-board
+Group=apex-board
+
+# Dedicated environment file — never /opt/apex/.env. Populate with
+# APEX_BOARD_ENABLED, APEX_BOARD_DB_PATH, APEX_BOARD_SOCKET_PATH,
+# APEX_BOARD_ALLOWED_IDENTITY, and APEX_BOARD_LOG_LEVEL only. This file must
+# never contain a trading credential, exchange key, or Pushover/action token
+# — this process has no use for any of them.
+EnvironmentFile=/etc/apex/apex-board.env
+
+# systemd creates and owns /run/apex-board (mode 0750, owned by
+# apex-board:apex-board) for the lifetime of this unit; this process never
+# creates its own runtime directory.
+RuntimeDirectory=apex-board
+RuntimeDirectoryMode=0750
+UMask=0007
+
+# ExecStart intentionally has no --host/--port equivalent: the socket path
+# below is the only listener. APEX_BOARD_SOCKET_PATH in the environment
+# file must match /run/apex-board/apex-board.sock exactly.
+WorkingDirectory=/opt/apex
+ExecStart=/opt/apex/.venv/bin/python -m apex.opportunity.protected_board
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing — deliberately tighter than apex.service's. This unit has no
+# writable APEX data directory and no ReadWritePaths=/opt/apex/data: it must
+# never be able to write to the database, its WAL/SHM siblings, or anywhere
+# else under /opt/apex/data. InaccessiblePaths below makes the main
+# environment file unreadable/unwritable/unexecutable to this process at the
+# systemd mount-namespace level, in addition to any operator-provisioned
+# filesystem permission.
+#
+# The board user needs read-only access to /opt/apex/data/apex.db (and its
+# -wal / -shm siblings, which SQLite requires read access to even in
+# mode=ro/query_only) provisioned later by whoever operates the host — e.g.
+# via a POSIX ACL or a dedicated read-only group membership decided at
+# deploy time. No specific command, group name, or ACL syntax is prescribed
+# here; this is a later, separately-approved provisioning step, not part of
+# this milestone.
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/opt/apex/.env
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# No capabilities are ever needed by this process.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# This process only ever needs a local AF_UNIX socket (this unit's own) and
+# whatever local journald/syslog socket StandardOutput=journal already uses;
+# it never makes or accepts a network connection.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Logging — journald only, and only the sanitized access-log lines this
+# process itself emits (see protected_board.py). Never logs raw identity
+# values, query strings, request/response bodies, database values,
+# filesystem paths, SQL, tokens, or credentials.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex-board
+
+[Install]
+WantedBy=multi-user.target
