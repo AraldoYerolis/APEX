@@ -1037,6 +1037,109 @@ def get_nonterminal_trade_plan_outcomes(conn: sqlite3.Connection) -> list[sqlite
     ).fetchall()
 
 
+def get_board_opportunities(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[str] = None,
+    setup_family: Optional[str] = None,
+    symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    primary_timeframe: Optional[str] = None,
+    status: Optional[str] = "ACTIVE",
+    limit: int = 200,
+) -> list[sqlite3.Row]:
+    """Read-only joined query for Live Opportunity Board v0.1 — never used by
+    the engine/scheduler, and never writes anything (SELECT only).
+
+    LEFT JOINs opportunity_observations (aliased `o`) to its at-most-one
+    opportunity_trade_plans row (`p`, on `p.opportunity_uid = o.opportunity_uid`)
+    and that plan's at-most-one opportunity_trade_plan_outcomes row (`po`, on
+    `po.plan_uid = p.plan_uid`). Every plan/outcome column is aliased with a
+    `plan_`/`outcome_` prefix so it can never collide with one of `o.*`'s own
+    column names; a row with no plan has every `plan_*` column NULL, and a
+    row with no outcome (no plan, or a plan not yet evaluated) has every
+    `outcome_*` column NULL — ordinary LEFT JOIN semantics, not a special case.
+
+    Filters, the `rank_group` score-compatibility CASE, and the full-set-
+    before-limit deterministic ORDER BY are byte-for-byte the same rules as
+    get_ranked_opportunities above (see its docstring for the exact
+    semantics) — reapplied here against the `o.` alias so this query ranks
+    identically to the existing ranked report. `status` defaults to 'ACTIVE'
+    the same way; pass `status=None` to disable the status filter entirely.
+    """
+    conditions = []
+    params: list = []
+    if since:
+        conditions.append("o.last_seen_at >= ?")
+        params.append(since)
+    if setup_family:
+        conditions.append("o.setup_family = ?")
+        params.append(setup_family)
+    if symbol:
+        conditions.append("o.symbol = ?")
+        params.append(symbol.upper())
+    if direction:
+        conditions.append("o.direction = ?")
+        params.append(direction)
+    if primary_timeframe:
+        conditions.append("o.primary_timeframe = ?")
+        params.append(primary_timeframe)
+    if status:
+        conditions.append("o.status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    query_params = [SCORE_VERSION, *params, limit]
+    return conn.execute(
+        f"""
+        SELECT o.*,
+            CASE
+                WHEN o.score_version = ?
+                     AND o.total_score IS NOT NULL
+                     AND typeof(o.total_score) IN ('integer', 'real')
+                     AND o.total_score >= 0 AND o.total_score <= 100
+                THEN 0 ELSE 1
+            END AS rank_group,
+            p.plan_uid AS plan_plan_uid,
+            p.availability AS plan_availability,
+            p.unavailable_reason AS plan_unavailable_reason,
+            p.entry_type AS plan_entry_type,
+            p.entry_price AS plan_entry_price,
+            p.invalidation_price AS plan_invalidation_price,
+            p.stop_price AS plan_stop_price,
+            p.target_1r_price AS plan_target_1r_price,
+            p.target_2r_price AS plan_target_2r_price,
+            p.reward_risk_1r AS plan_reward_risk_1r,
+            p.reward_risk_2r AS plan_reward_risk_2r,
+            p.evaluation_not_before_ms AS plan_evaluation_not_before_ms,
+            p.evaluation_expiry_ms AS plan_evaluation_expiry_ms,
+            p.plan_contract_version AS plan_contract_version,
+            po.state AS outcome_state,
+            po.last_evaluated_ms AS outcome_last_evaluated_ms,
+            po.data_quality AS outcome_data_quality,
+            po.is_ambiguous AS outcome_is_ambiguous,
+            po.mfe_r AS outcome_mfe_r,
+            po.mae_r AS outcome_mae_r,
+            po.contract_version AS outcome_contract_version
+        FROM opportunity_observations o
+        LEFT JOIN opportunity_trade_plans p ON p.opportunity_uid = o.opportunity_uid
+        LEFT JOIN opportunity_trade_plan_outcomes po ON po.plan_uid = p.plan_uid
+        {where}
+        ORDER BY
+            rank_group ASC,
+            o.total_score DESC,
+            o.last_seen_at DESC,
+            o.symbol ASC,
+            o.primary_timeframe ASC,
+            o.setup_family ASC,
+            o.direction ASC,
+            o.opportunity_uid ASC
+        LIMIT ?
+        """,
+        query_params,
+    ).fetchall()
+
+
 def update_trade_plan_outcome(
     conn: sqlite3.Connection, evaluation: TradePlanOutcomeEvaluation
 ) -> bool:

@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     # scoring, alerting, sizing, or trade execution. See CLAUDE.md.
     trade_plan_evidence_enabled: bool = False
 
+    # Live Opportunity Board v0.1 (research-only, additive — see
+    # src/apex/opportunity/board.py). Local, development-only read-only UI/API
+    # over existing ranked opportunities, trade plans, and outcome evidence.
+    # Must be explicitly enabled AND apex_env=="development" (create_app never
+    # mounts the board otherwise, in production or anywhere else); it never
+    # writes anything, sizes a position, or calls alerting/trading code.
+    live_opportunity_board_enabled: bool = False
+
     # Candle-feed diagnostics (bounded, local, default-off — see
     # src/apex/data/candle_store.py and src/apex/data/reconnecting_ws.py).
     # Adds in-memory counters and a periodic local log snapshot only when
