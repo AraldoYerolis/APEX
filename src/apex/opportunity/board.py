@@ -1,6 +1,9 @@
-"""Live Opportunity Board v0.1 — local, development-only, read-only research
+"""Live Opportunity Board v0.2 — local, development-only, read-only research
 UI/API over existing ranked opportunity observations, immutable trade plans,
-and prospective outcome evidence.
+and prospective outcome evidence. v0.2 is a phone-first, server-rendered
+HTML redesign only: the joined query, `_project_row` projection, JSON
+response schema/values, eligibility/freshness semantics, and route/filter
+behavior are unchanged from v0.1 (see each function's own docstring).
 
 Safety boundary
 ----------------
@@ -31,6 +34,7 @@ import json
 import logging
 import math
 import sqlite3
+from decimal import ROUND_HALF_UP, Decimal, DecimalException
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -345,25 +349,65 @@ _PAGE_HEAD = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>APEX — Live Opportunity Board (research only)</title>
+  <title>APEX — Mobile Opportunity Board v0.2 (research only)</title>
   <style>
-    body { font-family: -apple-system, sans-serif; background: #0f1220; color: #e8e8f0;
-           margin: 0; padding: 0 0 2rem 0; }
-    header { background: #1a1a2e; padding: 1rem; position: sticky; top: 0; }
-    header h1 { margin: 0 0 0.35rem 0; font-size: 1.1rem; color: #e94560; }
-    .notice { font-size: 0.78rem; line-height: 1.4; color: #f5c542; margin: 0; }
-    .meta { font-size: 0.75rem; color: #999; padding: 0.5rem 1rem 0 1rem; }
-    .cards { display: flex; flex-direction: column; gap: 0.75rem; padding: 1rem; }
-    .card { background: #16213e; border-radius: 10px; padding: 0.9rem 1rem; }
-    .card h2 { margin: 0 0 0.4rem 0; font-size: 1rem; color: #fff; }
-    .row { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; font-size: 0.82rem; color: #cfcfe0; }
-    .row .label { color: #8888a0; }
-    .badge { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 6px;
-             font-size: 0.72rem; font-weight: 600; background: #333a5c; color: #cfd2ff; }
-    .badge.eligible { background: #1f6f43; color: #d8ffe8; }
-    .badge.stale, .badge.unknown, .badge.not-eligible { background: #6f2f2f; color: #ffd8d8; }
-    .section { margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #2a2f4d; }
-    .empty { padding: 1rem; color: #999; }
+    * { box-sizing: border-box; }
+    html, body { overflow-x: hidden; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: #0f1220; color: #f0f0f6; margin: 0; padding: 0 0 2.5rem 0;
+           font-size: 16px; line-height: 1.5; }
+    header { background: #1a1a2e; padding: 0.7rem 0.9rem; }
+    header .title { margin: 0 0 0.35rem 0; font-size: 0.95rem; font-weight: 700; color: #ffffff; }
+    header .notice { margin: 0; font-size: 0.82rem; line-height: 1.5; color: #ffd15c; }
+    .meta { font-size: 0.78rem; color: #a9a9c0; padding: 0.6rem 0.9rem 0 0.9rem; word-break: break-word; }
+    .summary { display: flex; flex-wrap: wrap; gap: 0.6rem; padding: 0.8rem 0.9rem 0 0.9rem; }
+    .summary-item { flex: 1 1 8.5rem; border-radius: 12px; padding: 0.7rem 0.8rem;
+                    font-size: 0.92rem; font-weight: 600; background: #1c2340; color: #e8e8f4; }
+    .summary-item .count { display: block; font-size: 1.5rem; font-weight: 700; line-height: 1.2; }
+    .summary-item.ready { background: #163a28; color: #d8ffe8; }
+    .summary-item.watching { background: #3a3418; color: #fff3cf; }
+    .summary-item.old { background: #3a1f1f; color: #ffdada; }
+    .summary-caption { padding: 0.5rem 0.9rem 0 0.9rem; font-size: 0.76rem; color: #a9a9c0; }
+    .group { padding: 0.9rem 0.9rem 0.2rem 0.9rem; }
+    .group > h2 { font-size: 1.02rem; margin: 0 0 0.6rem 0; color: #ffffff; }
+    details.old-group { margin: 0.9rem 0.9rem 0.2rem 0.9rem; }
+    details.old-group > summary { font-size: 1rem; font-weight: 700; padding: 0.85rem 0.9rem;
+                                   min-height: 44px; display: flex; align-items: center;
+                                   background: #1c2340; border-radius: 12px; color: #ffffff;
+                                   cursor: pointer; }
+    details.old-group[open] > summary { border-radius: 12px 12px 0 0; }
+    .cards { display: flex; flex-direction: column; gap: 0.85rem; margin-top: 0.7rem; }
+    .card { background: #16213e; border-radius: 14px; padding: 1rem; overflow-wrap: anywhere; }
+    .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.45rem;
+                 font-size: 1.08rem; font-weight: 700; color: #ffffff; }
+    .direction.long { color: #7cffb2; }
+    .direction.short { color: #ff9b9b; }
+    .setup { margin-top: 0.2rem; font-size: 0.9rem; color: #c7c9e8; }
+    .status-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.55rem; }
+    .badge { display: inline-block; padding: 0.28rem 0.65rem; border-radius: 999px;
+             font-size: 0.8rem; font-weight: 700; }
+    .badge.ready { background: #1f6f43; color: #eaffef; }
+    .badge.watching { background: #7a5e12; color: #fff3d6; }
+    .badge.old { background: #6f2f2f; color: #ffe1e1; }
+    .age { font-size: 0.85rem; color: #b7b9d6; }
+    .plan-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-top: 0.75rem; }
+    .plan-cell { background: #0f1530; border-radius: 10px; padding: 0.55rem 0.65rem; }
+    .plan-label { display: block; font-size: 0.72rem; text-transform: uppercase;
+                  letter-spacing: 0.03em; color: #9294bd; }
+    .plan-value { display: block; font-size: 1.08rem; font-weight: 700; color: #ffffff; margin-top: 0.1rem; }
+    .context-score { margin-top: 0.7rem; font-size: 0.9rem; color: #d6d7ef; }
+    .context-score .context-note { font-size: 0.78rem; color: #9294bd; }
+    .reason { margin-top: 0.45rem; font-size: 0.88rem; color: #c7c9e8; line-height: 1.5; }
+    details.technical { margin-top: 0.75rem; }
+    details.technical > summary { padding: 0.6rem 0.15rem; min-height: 44px; display: flex;
+                                   align-items: center; font-size: 0.85rem; color: #9294bd;
+                                   cursor: pointer; }
+    .tech-grid { font-size: 0.78rem; color: #b7b9d6; display: flex; flex-direction: column;
+                 gap: 0.32rem; padding: 0.3rem 0.15rem 0 0.15rem; overflow-wrap: anywhere;
+                 word-break: break-word; }
+    .tech-row { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+    .tech-row .tech-label { color: #7d7fa3; }
+    .empty { padding: 1rem 0.9rem; color: #a9a9c0; }
   </style>
 </head>
 <body>
@@ -372,103 +416,358 @@ _PAGE_HEAD = """<!DOCTYPE html>
 _PAGE_FOOT = """</body>
 </html>"""
 
+_PRICE_DASH = "—"
 
-def _badge_class(value: str) -> str:
-    upper = (value or "").upper()
-    if upper in ("FRESH", "REVIEW_ELIGIBLE", "AVAILABLE"):
-        return "eligible"
-    if upper in ("STALE", "UNKNOWN", "NOT_ELIGIBLE", "UNAVAILABLE"):
-        return "not-eligible"
-    return ""
+_GROUP_READY = "ready"
+_GROUP_WATCHING = "watching"
+_GROUP_OLD = "old"
+
+_GROUP_LABELS = {
+    _GROUP_READY: "Ready to review",
+    _GROUP_WATCHING: "Watching",
+    _GROUP_OLD: "Old / no longer actionable",
+}
+
+# Plain-English display mappings for phone scanning. An unrecognized value
+# is returned unchanged by `_plain_label` (never dropped, never silently
+# treated as safe/eligible) so `_esc`/`html.escape` at the call site still
+# shows and escapes it.
+_SETUP_FAMILY_LABELS = {
+    "VOLATILITY_COMPRESSION": "Volatility squeeze",
+    "SWEEP_RECLAIM": "Sweep & reclaim",
+    "SUPPORT_RESISTANCE_REJECTION": "Level rejection",
+    "SUPPORT_RESISTANCE_BREAKOUT_RETEST": "Breakout retest",
+    "SUPPORT_RESISTANCE_FAILED_BREAKOUT": "Failed breakout",
+}
+
+_DIRECTION_LABELS = {"LONG": "Long", "SHORT": "Short"}
+_DIRECTION_CLASSES = {"LONG": "long", "SHORT": "short"}
+
+_ENTRY_TYPE_LABELS = {
+    "RESTING_LIMIT_AT_SOURCE_CLOSE": "Limit order at setup close",
+}
+
+_AVAILABILITY_LABELS = {
+    "AVAILABLE": "Plan available",
+    "UNAVAILABLE": "No plan available",
+}
+
+_OUTCOME_STATE_LABELS = {
+    "NOT_EVALUABLE": "Not evaluable",
+    "PENDING_ENTRY": "Waiting for entry",
+    "ENTERED": "Entered, in progress",
+    "HIT_1R": "Hit target 1",
+    "HIT_2R": "Hit target 2",
+    "STOPPED": "Stopped out",
+    "EXPIRED_UNENTERED": "Expired, never entered",
+    "EXPIRED_OPEN": "Expired while open",
+    "AMBIGUOUS": "Ambiguous outcome",
+    "INSUFFICIENT_DATA": "Insufficient data",
+}
+
+_ELIGIBILITY_REASON_LABELS = {
+    REASON_STATUS_NOT_ACTIVE: "no longer active",
+    REASON_NOT_RESEARCH_ONLY: "not flagged research-only",
+    REASON_NOT_FRESH: "no longer fresh",
+    REASON_SCORE_NOT_CURRENT_COMPATIBLE: "scored with an older method",
+    REASON_PLAN_NOT_AVAILABLE: "no trade plan available",
+    REASON_OUTCOME_NOT_PRESENT: "outcome not yet tracked",
+    REASON_OUTCOME_TERMINAL: "outcome already resolved",
+    REASON_OUTCOME_STATE_NOT_PENDING_ENTRY: "past the entry stage",
+}
 
 
-def _render_row_html(row: dict) -> str:
+def _plain_label(mapping: dict[str, str], value: Optional[str]) -> Optional[str]:
+    """Look up a known plain-English label for a raw code; an unrecognized
+    value is returned unchanged, never dropped, so it still surfaces
+    (escaped, at the call site) instead of disappearing or reading as safe.
+    """
+    if value is None:
+        return None
+    return mapping.get(value, value)
+
+
+def _labeled_esc(mapping: dict[str, str], value: Optional[str]) -> str:
+    """Escaped 'Plain label (RAW_CODE)' for a technical-detail field with a
+    known plain-English mapping, or just the escaped raw value if unmapped
+    or missing — the raw code is always still visible, escaped, never
+    dropped.
+    """
+    if value is None:
+        return "—"
+    label = mapping.get(value)
+    if label is None:
+        return _esc(value)
+    return f"{_esc(label)} ({_esc(value)})"
+
+
+def _format_price(value: Any) -> str:
+    """Deterministic, display-only price formatting. `Decimal(str(value))`
+    round-trips a float's own shortest decimal representation, so this never
+    reintroduces binary floating-point noise (e.g. 0.1 + 0.2). Uses 2
+    decimal places at or above 1, and 4 significant figures below 1 so a
+    sub-dollar or very small positive price keeps meaningful precision
+    instead of rounding away to 0.00. Purely a rendering helper — it never
+    touches the underlying API numeric value. A pathologically large or
+    small (but finite) value can make the fixed-precision `quantize()` call
+    exceed the default Decimal context's precision (e.g. 1e120), which
+    raises `decimal.InvalidOperation` rather than producing a value; that
+    and any other Decimal edge case is treated as unrenderable and falls
+    back to the display dash, same as None/non-finite.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _PRICE_DASH
+    fv = float(value)
+    if not math.isfinite(fv):
+        return _PRICE_DASH
+    try:
+        dec = Decimal(str(fv))
+        if dec == 0:
+            return "0.00"
+        sign = "-" if dec < 0 else ""
+        abs_dec = abs(dec)
+        if abs_dec >= 1:
+            quant = Decimal("0.01")
+        else:
+            quant = Decimal(1).scaleb(abs_dec.adjusted() - 3)
+        quantized = abs_dec.quantize(quant, rounding=ROUND_HALF_UP)
+    except DecimalException:
+        return _PRICE_DASH
+    return f"{sign}{format(quantized, 'f')}"
+
+
+def _format_score(value: Any) -> str:
+    """Display-only rounding of the already-projected score to one decimal
+    place — never touches the raw API `score_value`.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _PRICE_DASH
+    if not math.isfinite(value):
+        return _PRICE_DASH
+    return f"{value:.1f}"
+
+
+def _format_age(age_seconds: Any) -> str:
+    """Honest, display-only human age derived from the already-computed
+    freshness age. Missing or invalid input always stays 'unknown age'
+    rather than inventing a value.
+    """
+    if (
+        age_seconds is None
+        or isinstance(age_seconds, bool)
+        or not isinstance(age_seconds, (int, float))
+    ):
+        return "unknown age"
+    if not math.isfinite(age_seconds) or age_seconds < 0:
+        return "unknown age"
+    if age_seconds < 60:
+        return "just now"
+    minutes = int(age_seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def _presentation_group(row: dict) -> str:
+    """Pure, presentation-only phone-scanning bucket for one already-
+    projected row. Never hides a row (every group is always rendered in
+    full, see `_render_html`) and is never itself a trade recommendation or
+    execution signal — purely a restatement of facts `_project_row` already
+    computed (eligibility, freshness, status, outcome terminality).
+
+    - `ready`: eligibility_state is REVIEW_ELIGIBLE.
+    - `watching`: not ready, but fresh, active, and not terminal.
+    - `old`: everything else (stale/unknown freshness, non-active status,
+      or a terminal outcome).
+    """
+    if row["eligibility_state"] == ELIGIBILITY_REVIEW_ELIGIBLE:
+        return _GROUP_READY
+    if (
+        row["freshness_state"] == "FRESH"
+        and row["status"] == "ACTIVE"
+        and not row["outcome_is_terminal"]
+    ):
+        return _GROUP_WATCHING
+    return _GROUP_OLD
+
+
+def _group_rows(rows: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {_GROUP_READY: [], _GROUP_WATCHING: [], _GROUP_OLD: []}
+    for row in rows:
+        grouped[_presentation_group(row)].append(row)
+    return grouped
+
+
+def _plain_reason_text(reasons: list[str]) -> str:
+    """Plain-English join of eligibility reasons for primary card content.
+    A raw reason code is never surfaced here, even for one this module
+    doesn't yet have a label for — the full raw list always remains
+    available in the technical disclosure (see `_render_technical`).
+    """
+    if not reasons:
+        return "an unresolved review condition"
+    return ", ".join(
+        _ELIGIBILITY_REASON_LABELS.get(code, "an additional review condition")
+        for code in reasons
+    )
+
+
+def _reason_line(row: dict, group: str) -> str:
+    """One plain-English sentence for why a card sits in its group — purely
+    descriptive of facts already computed elsewhere in this module, never
+    itself a trade recommendation or execution signal.
+    """
+    if group == _GROUP_READY:
+        return "Meets every research-review condition right now (not a trade recommendation)."
+    detail = _plain_reason_text(row["eligibility_reasons"])
+    if group == _GROUP_WATCHING:
+        return f"Fresh and active, but not yet ready to review: {detail}."
+    return f"No longer actionable for review: {detail}."
+
+
+def _render_header() -> str:
+    return (
+        "<header>"
+        '<p class="title">APEX — Mobile Opportunity Board v0.2 (research only)</p>'
+        f'<p class="notice">{html.escape(_RESEARCH_ONLY_NOTICE, quote=True)}</p>'
+        "</header>"
+    )
+
+
+def _render_summary(grouped: dict[str, list[dict]]) -> str:
+    items = "".join(
+        f'<div class="summary-item {key}"><span class="count">{len(grouped[key])}</span>'
+        f"{html.escape(_GROUP_LABELS[key], quote=True)}</div>"
+        for key in (_GROUP_READY, _GROUP_WATCHING, _GROUP_OLD)
+    )
+    return (
+        f'<div class="summary">{items}</div>'
+        '<p class="summary-caption">Grouping is presentation-only, based on the existing '
+        "status/freshness/plan/outcome facts below — it is never a trade recommendation or "
+        "execution signal.</p>"
+    )
+
+
+def _render_plan_grid(row: dict) -> str:
+    cells = (
+        ("Entry", row["plan_entry_price"]),
+        ("Stop", row["plan_stop_price"]),
+        ("Target 1", row["plan_target_1r_price"]),
+        ("Target 2", row["plan_target_2r_price"]),
+    )
+    parts = "".join(
+        f'<div class="plan-cell"><span class="plan-label">{label}</span>'
+        f'<span class="plan-value">{_format_price(value)}</span></div>'
+        for label, value in cells
+    )
+    return f'<div class="plan-grid">{parts}</div>'
+
+
+def _render_technical(row: dict) -> str:
+    fields = (
+        ("Opportunity ID", _esc(row["opportunity_uid"])),
+        ("First detected", _esc(row["first_detected_at"])),
+        ("Last seen", _esc(row["last_seen_at"])),
+        ("Occurrences", _esc(row["occurrence_count"])),
+        ("Freshness state", _esc(row["freshness_state"])),
+        ("Freshness age (s)", _esc(row["freshness_age_seconds"])),
+        ("Stale after (min)", _esc(row["freshness_stale_threshold_minutes"])),
+        ("Freshness as of", _esc(row["freshness_as_of"])),
+        ("Score version", _esc(row["score_version"])),
+        ("Score current-compatible", _esc(row["score_current_compatible"])),
+        ("Score warnings", _esc_list(row["score_warnings"])),
+        ("Plan availability", _labeled_esc(_AVAILABILITY_LABELS, row["plan_availability"])),
+        ("Plan unavailable reason", _esc(row["plan_unavailable_reason"])),
+        ("Entry type", _labeled_esc(_ENTRY_TYPE_LABELS, row["plan_entry_type"])),
+        ("Invalidation price", _esc(row["plan_invalidation_price"])),
+        ("Reward:risk 1R", _esc(row["plan_reward_risk_1r"])),
+        ("Reward:risk 2R", _esc(row["plan_reward_risk_2r"])),
+        ("Evaluation not-before (ms)", _esc(row["plan_evaluation_not_before_ms"])),
+        ("Evaluation expiry (ms)", _esc(row["plan_evaluation_expiry_ms"])),
+        ("Plan contract version", _esc(row["plan_contract_version"])),
+        ("Outcome present", _esc(row["outcome_present"])),
+        ("Outcome state", _labeled_esc(_OUTCOME_STATE_LABELS, row["outcome_state"])),
+        ("Outcome terminal", _esc(row["outcome_is_terminal"])),
+        ("Outcome last evaluated (ms)", _esc(row["outcome_last_evaluated_ms"])),
+        ("Outcome data quality", _esc(row["outcome_data_quality"])),
+        ("Outcome ambiguous", _esc(row["outcome_is_ambiguous"])),
+        ("MFE (R)", _esc(row["outcome_mfe_r"])),
+        ("MAE (R)", _esc(row["outcome_mae_r"])),
+        ("Opportunity contract version", _esc(row["opportunity_contract_version"])),
+        ("Detector version", _esc(row["detector_version"])),
+        ("Outcome contract version", _esc(row["outcome_contract_version"])),
+        ("Raw eligibility state", _esc(row["eligibility_state"])),
+        ("Raw eligibility reasons", _esc_list(row["eligibility_reasons"])),
+    )
+    rows_html = "".join(
+        f'<div class="tech-row"><span class="tech-label">{label}</span><span>{value}</span></div>'
+        for label, value in fields
+    )
+    return (
+        '<details class="technical"><summary>Technical details</summary>'
+        f'<div class="tech-grid">{rows_html}</div></details>'
+    )
+
+
+def _render_card(row: dict, *, group: str) -> str:
+    direction_class = _DIRECTION_CLASSES.get(row["direction"], "")
+    direction_label = _esc(_plain_label(_DIRECTION_LABELS, row["direction"]))
+    setup_label = _esc(_plain_label(_SETUP_FAMILY_LABELS, row["setup_family"]))
+    badge_label = html.escape(_GROUP_LABELS[group], quote=True)
+    age_label = html.escape(_format_age(row["freshness_age_seconds"]), quote=True)
+    score_label = html.escape(_format_score(row["score_value"]), quote=True)
+    reason_label = html.escape(_reason_line(row, group), quote=True)
     return f"""
-    <div class="card">
-      <h2>{_esc(row['symbol'])} {_esc(row['direction'])} · {_esc(row['setup_family'])} · {_esc(row['primary_timeframe'])}</h2>
-      <div class="row">
-        <span class="label">status</span> <span>{_esc(row['status'])}</span>
-        <span class="label">research_only</span> <span>{_esc(row['research_only'])}</span>
-        <span class="label">opportunity_uid</span> <span>{_esc(row['opportunity_uid'])}</span>
+    <article class="card">
+      <div class="card-head">
+        <span class="symbol">{_esc(row['symbol'])}</span>
+        <span class="direction {direction_class}">{direction_label}</span>
+        <span class="timeframe">{_esc(row['primary_timeframe'])}</span>
       </div>
-      <div class="row">
-        <span class="label">first_detected_at</span> <span>{_esc(row['first_detected_at'])}</span>
-        <span class="label">last_seen_at</span> <span>{_esc(row['last_seen_at'])}</span>
-        <span class="label">occurrence_count</span> <span>{_esc(row['occurrence_count'])}</span>
+      <div class="setup">{setup_label}</div>
+      <div class="status-row">
+        <span class="badge {group}">{badge_label}</span>
+        <span class="age">{age_label}</span>
       </div>
-      <div class="section">
-        <div class="row">
-          <span class="label">freshness</span>
-          <span class="badge {_badge_class(row['freshness_state'])}">{_esc(row['freshness_state'])}</span>
-          <span class="label">age_s</span> <span>{_esc(row['freshness_age_seconds'])}</span>
-          <span class="label">stale_after_min</span> <span>{_esc(row['freshness_stale_threshold_minutes'])}</span>
-          <span class="label">as_of</span> <span>{_esc(row['freshness_as_of'])}</span>
-        </div>
-        <div class="row">
-          <span class="label">score</span> <span>{_esc(row['score_value'])}</span>
-          <span class="label">score_version</span> <span>{_esc(row['score_version'])}</span>
-          <span class="label">current_compatible</span> <span>{_esc(row['score_current_compatible'])}</span>
-          <span class="label">score_warnings</span> <span>{_esc_list(row['score_warnings'])}</span>
-        </div>
-      </div>
-      <div class="section">
-        <div class="row">
-          <span class="label">plan_present</span> <span>{_esc(row['plan_present'])}</span>
-          <span class="label">plan_availability</span>
-          <span class="badge {_badge_class(row['plan_availability'] or '')}">{_esc(row['plan_availability'])}</span>
-          <span class="label">unavailable_reason</span> <span>{_esc(row['plan_unavailable_reason'])}</span>
-          <span class="label">entry_type</span> <span>{_esc(row['plan_entry_type'])}</span>
-        </div>
-        <div class="row">
-          <span class="label">entry</span> <span>{_esc(row['plan_entry_price'])}</span>
-          <span class="label">invalidation</span> <span>{_esc(row['plan_invalidation_price'])}</span>
-          <span class="label">stop</span> <span>{_esc(row['plan_stop_price'])}</span>
-          <span class="label">1R</span> <span>{_esc(row['plan_target_1r_price'])}</span>
-          <span class="label">2R</span> <span>{_esc(row['plan_target_2r_price'])}</span>
-          <span class="label">RR1</span> <span>{_esc(row['plan_reward_risk_1r'])}</span>
-          <span class="label">RR2</span> <span>{_esc(row['plan_reward_risk_2r'])}</span>
-        </div>
-        <div class="row">
-          <span class="label">eval_not_before_ms</span> <span>{_esc(row['plan_evaluation_not_before_ms'])}</span>
-          <span class="label">eval_expiry_ms</span> <span>{_esc(row['plan_evaluation_expiry_ms'])}</span>
-        </div>
-      </div>
-      <div class="section">
-        <div class="row">
-          <span class="label">outcome_present</span> <span>{_esc(row['outcome_present'])}</span>
-          <span class="label">outcome_state</span> <span>{_esc(row['outcome_state'])}</span>
-          <span class="label">terminal</span> <span>{_esc(row['outcome_is_terminal'])}</span>
-          <span class="label">last_evaluated_ms</span> <span>{_esc(row['outcome_last_evaluated_ms'])}</span>
-          <span class="label">data_quality</span> <span>{_esc(row['outcome_data_quality'])}</span>
-          <span class="label">ambiguous</span> <span>{_esc(row['outcome_is_ambiguous'])}</span>
-          <span class="label">MFE_R</span> <span>{_esc(row['outcome_mfe_r'])}</span>
-          <span class="label">MAE_R</span> <span>{_esc(row['outcome_mae_r'])}</span>
-        </div>
-      </div>
-      <div class="section">
-        <div class="row">
-          <span class="label">opportunity_contract</span> <span>{_esc(row['opportunity_contract_version'])}</span>
-          <span class="label">detector</span> <span>{_esc(row['detector_version'])}</span>
-          <span class="label">plan_contract</span> <span>{_esc(row['plan_contract_version'])}</span>
-          <span class="label">outcome_contract</span> <span>{_esc(row['outcome_contract_version'])}</span>
-        </div>
-        <div class="row">
-          <span class="label">review_eligibility</span>
-          <span class="badge {_badge_class(row['eligibility_state'])}">{_esc(row['eligibility_state'])}</span>
-          <span class="label">reasons</span> <span>{_esc_list(row['eligibility_reasons'])}</span>
-        </div>
-      </div>
-    </div>"""
+      {_render_plan_grid(row)}
+      <div class="context-score">Research context score: {score_label}
+        <span class="context-note">(not a probability or confidence rating)</span></div>
+      <div class="reason">{reason_label}</div>
+      {_render_technical(row)}
+    </article>"""
+
+
+def _render_group_section(group_key: str, rows: list[dict]) -> str:
+    label = html.escape(_GROUP_LABELS[group_key], quote=True)
+    if not rows:
+        body = '<div class="empty">None right now.</div>'
+    else:
+        body = '<div class="cards">' + "".join(
+            _render_card(r, group=group_key) for r in rows
+        ) + "</div>"
+    return f'<section class="group group-{group_key}"><h2>{label} ({len(rows)})</h2>{body}</section>'
+
+
+def _render_old_group_section(rows: list[dict]) -> str:
+    label = html.escape(_GROUP_LABELS[_GROUP_OLD], quote=True)
+    if not rows:
+        body = '<div class="empty">None right now.</div>'
+    else:
+        body = '<div class="cards">' + "".join(
+            _render_card(r, group=_GROUP_OLD) for r in rows
+        ) + "</div>"
+    return f'<details class="group old-group"><summary>{label} ({len(rows)})</summary>{body}</details>'
 
 
 def _render_html(rows: list[dict], *, as_of: datetime, status: str, limit: int) -> str:
     as_of_iso = as_of.strftime("%Y-%m-%dT%H:%M:%SZ")
     body = [
         _PAGE_HEAD,
-        "<header>",
-        "<h1>APEX — Live Opportunity Board v0.1 (research only)</h1>",
-        f'<p class="notice">{html.escape(_RESEARCH_ONLY_NOTICE, quote=True)}</p>',
-        "</header>",
+        _render_header(),
         f'<div class="meta">as_of={html.escape(as_of_iso, quote=True)} '
         f'status_filter={html.escape(str(status), quote=True)} '
         f'limit={html.escape(str(limit), quote=True)} '
@@ -477,9 +776,11 @@ def _render_html(rows: list[dict], *, as_of: datetime, status: str, limit: int) 
     if not rows:
         body.append('<div class="empty">No opportunities match this filter.</div>')
     else:
-        body.append('<div class="cards">')
-        body.extend(_render_row_html(r) for r in rows)
-        body.append("</div>")
+        grouped = _group_rows(rows)
+        body.append(_render_summary(grouped))
+        body.append(_render_group_section(_GROUP_READY, grouped[_GROUP_READY]))
+        body.append(_render_group_section(_GROUP_WATCHING, grouped[_GROUP_WATCHING]))
+        body.append(_render_old_group_section(grouped[_GROUP_OLD]))
     body.append(_PAGE_FOOT)
     return "".join(body)
 
@@ -487,7 +788,7 @@ def _render_html(rows: list[dict], *, as_of: datetime, status: str, limit: int) 
 def _error_html() -> str:
     return (
         _PAGE_HEAD
-        + "<header><h1>APEX — Live Opportunity Board v0.1 (research only)</h1></header>"
+        + _render_header()
         + f'<div class="empty">{html.escape(_GENERIC_ERROR_MESSAGE, quote=True)}</div>'
         + _PAGE_FOOT
     )
@@ -563,10 +864,11 @@ def create_board_router(conn: Optional[sqlite3.Connection] = None) -> APIRouter:
                 setup_family=setup_family,
                 limit=limit,
             )
+            html_content = _render_html(rows, as_of=as_of, status=status, limit=limit)
         except Exception:
             logger.exception("Live Opportunity Board: HTML read/assembly failed")
             return HTMLResponse(content=_error_html(), status_code=500)
-        return HTMLResponse(content=_render_html(rows, as_of=as_of, status=status, limit=limit))
+        return HTMLResponse(content=html_content)
 
     @router.get("/opportunities/api")
     async def opportunities_api(
