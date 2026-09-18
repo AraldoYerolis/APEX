@@ -648,6 +648,34 @@ def test_injected_repository_exception_returns_generic_500_html_and_json(tmp_pat
         close_db()
 
 
+def test_injected_html_renderer_exception_returns_generic_500_and_does_not_leak(tmp_path, monkeypatch):
+    conn = init_db(str(tmp_path / "render_exception.db"))
+    try:
+        _seed_opportunity(conn, opportunity_uid="uid-render-exc", fingerprint="fp-render-exc")
+        secret_detail = "RENDER_INTERNAL_SECRET_SENTINEL_abc123"
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError(secret_detail)
+
+        # Only the HTML renderer is broken; the read/assembly path (and the
+        # separate JSON route, which never calls _render_html) stay intact.
+        monkeypatch.setattr(board, "_render_html", _raise)
+        client = _client(conn, enabled=True, env="development")
+
+        html_resp = client.get("/opportunities")
+        assert html_resp.status_code == 500
+        assert board._GENERIC_ERROR_MESSAGE in html_resp.text
+        for leak in (secret_detail, "RENDER_INTERNAL_SECRET_SENTINEL", "Traceback", "RuntimeError"):
+            assert leak not in html_resp.text
+
+        # The 503 connection-unavailable and JSON-route behavior are
+        # unaffected by a rendering failure.
+        api_resp = client.get("/opportunities/api")
+        assert api_resp.status_code == 200
+    finally:
+        close_db()
+
+
 # ------------------------------------------------------------------ valid filters via HTTP
 
 def test_direction_filter_restricts_rows_via_api(tmp_path):
@@ -800,3 +828,381 @@ def test_repository_and_route_reads_never_mutate_connection(tmp_path):
         assert conn.total_changes == before
     finally:
         close_db()
+
+
+# ------------------------------------------------------------------ v0.2 phone readability
+#
+# The tests below cover the v0.2 HTML redesign: presentation grouping,
+# display-only helpers (price/age/score formatting, plain-English mappings),
+# and the technical-disclosure confinement of raw/machine values. They build
+# synthetic already-projected row dicts (the exact shape `_project_row`
+# returns) so they can exercise rendering/grouping edge cases — including
+# deliberately invalid/unknown values — without needing a `setup_family`,
+# `direction`, etc. that would violate the real database's CHECK
+# constraints. Every field `_project_row` produces is present, so these
+# stay a faithful stand-in for a real projected row.
+
+def _projected_row(**overrides) -> dict:
+    base = dict(
+        opportunity_uid="uid-synthetic",
+        symbol="BTC",
+        direction="LONG",
+        setup_family="SWEEP_RECLAIM",
+        primary_timeframe="5m",
+        status="ACTIVE",
+        research_only=True,
+        first_detected_at="2026-09-17T00:00:00Z",
+        last_seen_at="2026-09-17T00:00:00Z",
+        occurrence_count=1,
+        source_candle_open_time=1000,
+        source_candle_close_time=1300,
+        score_value=70.0,
+        score_version=SCORE_VERSION,
+        score_current_compatible=True,
+        score_warnings=[],
+        freshness_state="FRESH",
+        freshness_age_seconds=300.0,
+        freshness_stale_threshold_minutes=25,
+        freshness_as_of="2026-09-17T00:05:00Z",
+        plan_present=True,
+        plan_availability="AVAILABLE",
+        plan_unavailable_reason=None,
+        plan_entry_type="RESTING_LIMIT_AT_SOURCE_CLOSE",
+        plan_entry_price=110.0,
+        plan_invalidation_price=100.0,
+        plan_stop_price=100.0,
+        plan_target_1r_price=120.0,
+        plan_target_2r_price=130.0,
+        plan_reward_risk_1r=1.0,
+        plan_reward_risk_2r=2.0,
+        plan_evaluation_not_before_ms=1300,
+        plan_evaluation_expiry_ms=1300 + 24 * 300_000,
+        plan_contract_version=TRADE_PLAN_CONTRACT_VERSION,
+        outcome_present=True,
+        outcome_state="PENDING_ENTRY",
+        outcome_is_terminal=False,
+        outcome_last_evaluated_ms=1_600_000,
+        outcome_data_quality="COMPLETE",
+        outcome_is_ambiguous=False,
+        outcome_mfe_r=None,
+        outcome_mae_r=None,
+        opportunity_contract_version="opportunity_v0_1",
+        detector_version="sweep_reclaim_v0_1",
+        outcome_contract_version=TRADE_PLAN_OUTCOME_CONTRACT_VERSION,
+        eligibility_state=board.ELIGIBILITY_REVIEW_ELIGIBLE,
+        eligibility_reasons=[],
+    )
+    base.update(overrides)
+    return base
+
+
+def _not_eligible_row(**overrides) -> dict:
+    overrides.setdefault("eligibility_state", board.ELIGIBILITY_NOT_ELIGIBLE)
+    return _projected_row(**overrides)
+
+
+# ------------------------------------------------------------------ display helpers: price
+
+def test_format_price_high_ordinary_subdollar_verysmall_none_nonfinite():
+    assert board._format_price(68123.4) == "68123.40"           # high-priced
+    assert board._format_price(110.0) == "110.00"                # ordinary
+    assert board._format_price(0.85) == "0.8500"                 # sub-dollar
+    assert board._format_price(0.0000001234) == "0.0000001234"   # very small positive
+    assert board._format_price(0) == "0.00"
+    assert board._format_price(None) == "—"
+    assert board._format_price(True) == "—"  # bool is never treated as numeric
+    assert board._format_price(float("nan")) == "—"
+    assert board._format_price(float("inf")) == "—"
+    assert board._format_price(float("-inf")) == "—"
+
+
+def test_format_price_extreme_finite_values_never_raise():
+    # A pathologically large but finite value overflows the default Decimal
+    # context's precision inside quantize() (2 decimal places fixed for
+    # values >= 1) and must degrade to the display dash, not raise
+    # decimal.InvalidOperation and crash the request.
+    assert board._format_price(1e120) == "—"
+    assert board._format_price(-1e120) == "—"
+    assert board._format_price(1e300) == "—"
+    # The sub-1 branch scales its quantization exponent to the value's own
+    # magnitude, so extreme small-but-finite values stay well within
+    # precision and must keep formatting normally (never crash, never
+    # degrade to the dash).
+    tiny = board._format_price(5e-300)
+    assert tiny != "—"
+    assert tiny.startswith("0.")
+    smallest_subnormal = board._format_price(5e-324)
+    assert smallest_subnormal != "—"
+    assert smallest_subnormal.startswith("0.")
+
+
+def test_format_score_rounds_for_display_only():
+    assert board._format_score(82.53) == "82.5"
+    assert board._format_score(None) == "—"
+    assert board._format_score(float("nan")) == "—"
+
+
+def test_format_age_buckets_and_unknown_fallback():
+    assert board._format_age(None) == "unknown age"
+    assert board._format_age(float("nan")) == "unknown age"
+    assert board._format_age(-5) == "unknown age"
+    assert board._format_age(True) == "unknown age"
+    assert board._format_age(10) == "just now"
+    assert board._format_age(125) == "2m ago"
+    assert board._format_age(3700) == "1h ago"
+    assert board._format_age(90000) == "1d ago"
+
+
+def test_price_display_formatting_never_changes_raw_api_json_values(tmp_path):
+    conn = init_db(str(tmp_path / "price_fmt.db"))
+    try:
+        uid = _seed_opportunity(conn, opportunity_uid="uid-price", fingerprint="fp-price")
+        provenance = json.dumps({"note": "PROVENANCE_SENTINEL"})
+        plan = TradePlan(
+            plan_uid="plan-price", opportunity_uid=uid, symbol="BTC", direction="LONG",
+            setup_family="SWEEP_RECLAIM", primary_timeframe="5m", detector_version="sweep_reclaim_v0_1",
+            opportunity_contract_version="opportunity_v0_1", plan_contract_version=TRADE_PLAN_CONTRACT_VERSION,
+            source_candle_open_time=1000, source_candle_close_time=1300, created_at="2026-09-17T00:00:00Z",
+            availability="AVAILABLE", unavailable_reason=None, entry_type="RESTING_LIMIT_AT_SOURCE_CLOSE",
+            entry_price=0.0000001234, invalidation_price=0.5, stop_price=0.85, risk_distance=0.0001,
+            target_1r_price=68123.4, target_2r_price=110.0, target_1r_multiple=1.0, target_2r_multiple=2.0,
+            reward_risk_1r=1.0, reward_risk_2r=2.0, evaluation_not_before_ms=1300,
+            evaluation_expiry_ms=1300 + 24 * 300_000, provenance_json=provenance, warnings_json="[]",
+        )
+        outcome = _make_outcome(plan_uid="plan-price", opportunity_uid=uid, state="PENDING_ENTRY")
+        repo.insert_trade_plan_with_outcome(conn, plan, outcome)
+
+        client = _client(conn, enabled=True, env="development")
+        api_payload = client.get("/opportunities/api").json()
+        row = api_payload["rows"][0]
+        assert row["plan_entry_price"] == 0.0000001234
+        assert row["plan_stop_price"] == 0.85
+        assert row["plan_target_1r_price"] == 68123.4
+        assert row["plan_target_2r_price"] == 110.0
+
+        html_body = client.get("/opportunities").text
+        assert "0.0000001234" in html_body
+        assert "0.8500" in html_body
+        assert "68123.40" in html_body
+        assert "110.00" in html_body
+    finally:
+        close_db()
+
+
+def test_extreme_price_display_dash_never_affects_raw_api_json_value(tmp_path):
+    # An extreme finite price that _format_price cannot render (see
+    # test_format_price_extreme_finite_values_never_raise) must still pass
+    # through the JSON API untouched — display-only formatting failure must
+    # never mutate, drop, or null out the raw API numeric value.
+    conn = init_db(str(tmp_path / "price_extreme_fmt.db"))
+    try:
+        uid = _seed_opportunity(conn, opportunity_uid="uid-price-extreme", fingerprint="fp-price-extreme")
+        provenance = json.dumps({"note": "PROVENANCE_SENTINEL"})
+        plan = TradePlan(
+            plan_uid="plan-price-extreme", opportunity_uid=uid, symbol="BTC", direction="LONG",
+            setup_family="SWEEP_RECLAIM", primary_timeframe="5m", detector_version="sweep_reclaim_v0_1",
+            opportunity_contract_version="opportunity_v0_1", plan_contract_version=TRADE_PLAN_CONTRACT_VERSION,
+            source_candle_open_time=1000, source_candle_close_time=1300, created_at="2026-09-17T00:00:00Z",
+            availability="AVAILABLE", unavailable_reason=None, entry_type="RESTING_LIMIT_AT_SOURCE_CLOSE",
+            entry_price=1e120, invalidation_price=100.0, stop_price=100.0, risk_distance=10.0,
+            target_1r_price=120.0, target_2r_price=130.0, target_1r_multiple=1.0, target_2r_multiple=2.0,
+            reward_risk_1r=1.0, reward_risk_2r=2.0, evaluation_not_before_ms=1300,
+            evaluation_expiry_ms=1300 + 24 * 300_000, provenance_json=provenance, warnings_json="[]",
+        )
+        outcome = _make_outcome(plan_uid="plan-price-extreme", opportunity_uid=uid, state="PENDING_ENTRY")
+        repo.insert_trade_plan_with_outcome(conn, plan, outcome)
+
+        client = _client(conn, enabled=True, env="development")
+        api_payload = client.get("/opportunities/api").json()
+        row = api_payload["rows"][0]
+        assert row["plan_entry_price"] == 1e120  # untouched raw value, not a display dash
+
+        html_resp = client.get("/opportunities")
+        assert html_resp.status_code == 200  # the extreme value degrades gracefully, no crash
+        assert "—" in html_resp.text  # the unrenderable price shows the display dash
+    finally:
+        close_db()
+
+
+# ------------------------------------------------------------------ grouping, order, summary
+
+def test_summary_counts_group_order_and_full_row_preservation():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    ready = _projected_row(opportunity_uid="uid-ready")
+    watching = _not_eligible_row(
+        opportunity_uid="uid-watch",
+        eligibility_reasons=[board.REASON_PLAN_NOT_AVAILABLE, board.REASON_OUTCOME_NOT_PRESENT],
+        plan_present=False, plan_availability=None, plan_unavailable_reason=None,
+        plan_entry_type=None, plan_entry_price=None, plan_invalidation_price=None,
+        plan_stop_price=None, plan_target_1r_price=None, plan_target_2r_price=None,
+        plan_reward_risk_1r=None, plan_reward_risk_2r=None, plan_evaluation_not_before_ms=None,
+        plan_evaluation_expiry_ms=None, plan_contract_version=None,
+        outcome_present=False, outcome_state=None, outcome_is_terminal=None,
+        outcome_last_evaluated_ms=None, outcome_data_quality=None, outcome_is_ambiguous=None,
+        outcome_contract_version=None,
+    )
+    old = _not_eligible_row(
+        opportunity_uid="uid-old",
+        eligibility_reasons=[board.REASON_NOT_FRESH],
+        freshness_state="STALE",
+    )
+    rows = [ready, watching, old]
+
+    grouped = board._group_rows(rows)
+    assert [r["opportunity_uid"] for r in grouped[board._GROUP_READY]] == ["uid-ready"]
+    assert [r["opportunity_uid"] for r in grouped[board._GROUP_WATCHING]] == ["uid-watch"]
+    assert [r["opportunity_uid"] for r in grouped[board._GROUP_OLD]] == ["uid-old"]
+
+    html_body = board._render_html(rows, as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+
+    # Every row is preserved in the HTML, including the collapsed old/stale
+    # group (a native <details> without `open` still contains its content).
+    for uid in ("uid-ready", "uid-watch", "uid-old"):
+        assert uid in html_body
+    assert 'class="summary-item ready"><span class="count">1</span>' in html_body
+    assert 'class="summary-item watching"><span class="count">1</span>' in html_body
+    assert 'class="summary-item old"><span class="count">1</span>' in html_body
+
+    # Use the unique section/card container markers, not the group-label
+    # text — that same text also appears earlier in the fixed-order summary
+    # bar (_render_summary), so asserting on label text alone would pass
+    # even if the actual section order below the summary were wrong.
+    ready_pos = html_body.index('class="group group-ready"')
+    watching_pos = html_body.index('class="group group-watching"')
+    old_pos = html_body.index('class="group old-group"')
+    assert ready_pos < watching_pos < old_pos
+
+
+def test_group_rows_preserves_input_order_within_each_group():
+    w1 = _not_eligible_row(
+        opportunity_uid="w1", eligibility_reasons=[board.REASON_PLAN_NOT_AVAILABLE],
+        outcome_present=False, outcome_state=None, outcome_is_terminal=None,
+    )
+    o1 = _not_eligible_row(
+        opportunity_uid="o1", eligibility_reasons=[board.REASON_NOT_FRESH], freshness_state="STALE",
+    )
+    w2 = _not_eligible_row(
+        opportunity_uid="w2", eligibility_reasons=[board.REASON_PLAN_NOT_AVAILABLE],
+        outcome_present=False, outcome_state=None, outcome_is_terminal=None,
+    )
+    o2 = _not_eligible_row(
+        opportunity_uid="o2", eligibility_reasons=[board.REASON_STATUS_NOT_ACTIVE], status="EXPIRED",
+    )
+
+    grouped = board._group_rows([w1, o1, w2, o2])
+    assert [r["opportunity_uid"] for r in grouped[board._GROUP_WATCHING]] == ["w1", "w2"]
+    assert [r["opportunity_uid"] for r in grouped[board._GROUP_OLD]] == ["o1", "o2"]
+
+
+def test_current_actionable_content_precedes_stale_regardless_of_input_order():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    watching = _not_eligible_row(
+        opportunity_uid="uid-watch-order", eligibility_reasons=[board.REASON_PLAN_NOT_AVAILABLE],
+        outcome_present=False, outcome_state=None, outcome_is_terminal=None,
+    )
+    old = _not_eligible_row(
+        opportunity_uid="uid-old-order", eligibility_reasons=[board.REASON_NOT_FRESH],
+        freshness_state="STALE",
+    )
+    # Input order is [old, watching] — the renderer must still place the
+    # current/actionable group before the stale one.
+    html_body = board._render_html([old, watching], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+    assert html_body.index("uid-watch-order") < html_body.index("uid-old-order")
+
+
+# ------------------------------------------------------------------ default card content
+
+def test_default_card_shows_plain_english_age_and_bounded_price():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    row = _projected_row(setup_family="VOLATILITY_COMPRESSION")
+    html_body = board._render_html([row], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+
+    assert "Volatility squeeze" in html_body  # plain-English setup label, not the raw code
+    assert "5m ago" in html_body              # human age from freshness_age_seconds=300.0
+    assert "110.00" in html_body              # plan_entry_price bounded to 2 significant decimals
+    assert "Meets every research-review condition right now" in html_body  # plain-English reason
+
+
+def test_raw_ids_epochs_contract_versions_and_reason_codes_confined_to_technical():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    row = _not_eligible_row(
+        opportunity_uid="uid-confine-technical",
+        eligibility_reasons=[board.REASON_NOT_FRESH],
+        freshness_state="STALE",
+    )
+    html_body = board._render_html([row], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+    prefix, marker, suffix = html_body.partition('<details class="technical">')
+    assert marker  # the technical disclosure exists
+
+    raw_values = (
+        "uid-confine-technical",
+        board.REASON_NOT_FRESH,
+        row["opportunity_contract_version"],
+        row["detector_version"],
+        str(row["plan_evaluation_not_before_ms"]),
+        str(row["outcome_last_evaluated_ms"]),
+    )
+    for raw in raw_values:
+        assert raw not in prefix, f"{raw!r} leaked into primary card content"
+        assert raw in suffix, f"{raw!r} missing from technical disclosure"
+
+
+def test_unknown_setup_family_direction_and_reason_code_remain_escaped_and_visible():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    row = _not_eligible_row(
+        setup_family="<b>UNKNOWN_FAMILY</b>",
+        direction="SIDEWAYS",
+        eligibility_reasons=["SOME_FUTURE_REASON_CODE"],
+        freshness_state="STALE",
+    )
+    html_body = board._render_html([row], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+
+    # An unrecognized setup family/direction is never dropped or treated as
+    # safe — it is escaped and still visible.
+    assert "<b>UNKNOWN_FAMILY</b>" not in html_body
+    assert "&lt;b&gt;UNKNOWN_FAMILY&lt;/b&gt;" in html_body
+    assert "SIDEWAYS" in html_body
+
+    # An unrecognized eligibility reason code never leaks into primary card
+    # content (it gets a generic plain-English fallback there)...
+    primary_content, _, technical_content = html_body.partition('<details class="technical">')
+    assert "SOME_FUTURE_REASON_CODE" not in primary_content
+    # ...but it must still be visible, escaped, in the technical disclosure.
+    assert "SOME_FUTURE_REASON_CODE" in technical_content
+
+
+# ------------------------------------------------------------------ required warnings / safety scan
+
+def test_required_research_warnings_visible_in_html_and_error_page():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    html_body = board._render_html([], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT)
+    error_body = board._error_html()
+    for body in (html_body, error_body):
+        assert "RESEARCH ONLY" in body
+        assert "NOT A RECOMMENDATION" in body
+        assert "NOT a probability" in body
+        assert "places, sizes, or recommends a trade" in body
+
+
+def test_rendered_html_has_no_scripts_forms_handlers_or_action_controls():
+    as_of = datetime(2026, 9, 17, 0, 5, 0, tzinfo=timezone.utc)
+    row = _projected_row()
+    stale_row = _not_eligible_row(
+        opportunity_uid="uid-stale-scan",
+        eligibility_reasons=[board.REASON_NOT_FRESH],
+        freshness_state="STALE",
+    )
+    html_body = board._render_html(
+        [row, stale_row], as_of=as_of, status="ACTIVE", limit=board.DEFAULT_LIMIT
+    )
+    error_body = board._error_html()
+
+    for body in (html_body, error_body):
+        lowered = body.lower()
+        for forbidden in ("<script", "<form", " onclick=", " onload=", " onerror=", "javascript:"):
+            assert forbidden not in lowered
+        assert "src=" not in lowered
+        assert "http://" not in lowered
+        assert "https://" not in lowered
+        for action_word in ("approve", "execute", "place order", "buy now", "sell now"):
+            assert action_word not in lowered
