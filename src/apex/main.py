@@ -34,6 +34,7 @@ from apex.db import repository as repo
 from apex.logging_config import configure_logging
 from apex.notifications.pushover_client import PushoverClient
 from apex.opportunity.engine import run_opportunity_scan
+from apex.research.gmgn.runtime import run_gmgn_research_scan
 from apex.scheduler.tasks import (
     run_followup_check,
     run_observation_evaluation,
@@ -74,6 +75,12 @@ WS_REJECTION_KEYS = ("error", "message", "reason")
 CANDLE_DIAGNOSTICS_SNAPSHOT_MINUTES = 5
 MAX_DIAGNOSTIC_SNAPSHOT_LINES = 120
 MAX_DIAGNOSTIC_LINE_CHARS = 512
+
+# GMGN read-only research runtime seam v0.1 — bounded, local, default-off
+# (see settings.gmgn_research_enabled and apex.research.gmgn.runtime). A
+# conservative fixed interval since every scan reaches out to an external
+# vendor per watchlist identity, unlike the local-data jobs above.
+GMGN_RESEARCH_SCAN_INTERVAL_MINUTES = 15
 
 # Module-level state (accessible by tasks)
 _candle_store: Optional[CandleStore] = None
@@ -752,6 +759,27 @@ async def run() -> None:
             "interval",
             seconds=_candle_reconciler.config.tick_interval_seconds,
             id="candle_reconciliation",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
+        )
+
+    # GMGN read-only research runtime scan — additive, research-only, bounded,
+    # default-off (see settings.gmgn_research_enabled and
+    # apex.research.gmgn.runtime). Gated here AND inside
+    # run_gmgn_research_scan itself (same defense-in-depth pattern as the
+    # jobs above). Deliberately passes settings only — no transport is
+    # injected by this wiring, so the job always takes
+    # run_gmgn_research_scan's enabled-with-no-transport fail-closed path
+    # for this milestone; a real (still fake-only, per approved scope)
+    # transport requires separate explicit wiring authorization.
+    if settings.gmgn_research_enabled:
+        scheduler.add_job(
+            run_gmgn_research_scan,
+            "interval",
+            minutes=GMGN_RESEARCH_SCAN_INTERVAL_MINUTES,
+            args=[settings],
+            id="gmgn_research_scan",
             max_instances=1,
             coalesce=True,
             misfire_grace_time=1,
