@@ -700,6 +700,9 @@ async def run() -> None:
             seconds=60,
             args=[conn, _candle_store, settings],
             id="opportunity_scan",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
         )
 
     # Trade plans and outcome evidence v0.1 — additive, research-only (see
@@ -720,6 +723,9 @@ async def run() -> None:
             seconds=60,
             args=[conn, _candle_store, settings],
             id="trade_plan_outcome_evaluation",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
         )
 
     # Candle-feed diagnostics snapshot — bounded, local, research-only.

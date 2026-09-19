@@ -1337,9 +1337,11 @@ class _FakeScheduler:
 
     def __init__(self):
         self.job_ids: list[str] = []
+        self.job_kwargs: dict[str, dict] = {}
 
     def add_job(self, func, trigger, **kwargs) -> None:
         self.job_ids.append(kwargs.get("id"))
+        self.job_kwargs[kwargs.get("id")] = kwargs
 
     def start(self) -> None:
         pass
@@ -1447,6 +1449,24 @@ async def test_trade_plan_job_registered_when_all_three_guards_true(monkeypatch,
     assert "opportunity_scan" in scheduler.job_ids
 
 
+async def test_opportunity_scan_and_trade_plan_jobs_are_single_flight(monkeypatch, tmp_path):
+    """Both interval jobs must be registered with the exact single-flight/
+    coalescing options — max_instances=1, coalesce=True,
+    misfire_grace_time=1 — so a slow pass can never overlap itself.
+    """
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True, dry_run_mode=True,
+    )
+    for job_id in ("opportunity_scan", "trade_plan_outcome_evaluation"):
+        kwargs = scheduler.job_kwargs[job_id]
+        assert kwargs["max_instances"] == 1
+        assert kwargs["coalesce"] is True
+        assert kwargs["misfire_grace_time"] == 1
+        # Every existing flag/interval/args wiring stays untouched.
+        assert kwargs["seconds"] == 60
+
+
 async def test_trade_plan_job_omitted_by_default(monkeypatch, tmp_path):
     scheduler = await _run_startup_with_mocks(monkeypatch, tmp_path, candle_diagnostics_enabled=False)
     assert "trade_plan_outcome_evaluation" not in scheduler.job_ids
@@ -1499,6 +1519,131 @@ async def test_trade_plan_evaluation_defensive_guard_when_called_directly(tmp_pa
 
         await run_trade_plan_outcome_evaluation(conn, _ExplodingCandleStore(), settings)
         assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plan_outcomes").fetchone()[0] == 0
+    finally:
+        close_db()
+
+
+# ============================================================================
+# Trade plans and outcome evidence v0.1 — bounded per-pass completion
+# telemetry (no row IDs/symbols/prices, exactly one INFO summary per pass).
+# ============================================================================
+
+
+async def test_completion_summary_emitted_for_zero_nonterminal_rows(tmp_path, caplog):
+    from apex.db.connection import close_db, init_db
+    from apex.scheduler.tasks import run_trade_plan_outcome_evaluation
+
+    db_path = str(tmp_path / "zero_rows.db")
+    conn = init_db(db_path)
+    try:
+        settings = _trade_plan_eval_settings(db_path)
+
+        class _UnusedCandleStore:
+            def get_df(self, *a, **kw):
+                raise AssertionError("must never be called with zero nonterminal rows")
+
+        with caplog.at_level(logging.INFO, logger="apex.scheduler.tasks"):
+            await run_trade_plan_outcome_evaluation(conn, _UnusedCandleStore(), settings)
+
+        summaries = [
+            r.getMessage() for r in caplog.records
+            if "Trade plan outcome evaluation complete" in r.getMessage()
+        ]
+        assert summaries == ["Trade plan outcome evaluation complete: pending=0 evaluated=0 errors=0"]
+    finally:
+        close_db()
+
+
+async def test_completion_summary_suppressed_for_pass_level_failure(monkeypatch, tmp_path, caplog):
+    """A failure before evaluation starts must not claim the pass completed."""
+    from apex.db.connection import close_db, init_db
+    from apex.scheduler import tasks as tasks_module
+
+    db_path = str(tmp_path / "pass_failure.db")
+    conn = init_db(db_path)
+    try:
+        settings = _trade_plan_eval_settings(db_path)
+
+        def _raise_pass_failure(_conn):
+            raise RuntimeError("forced pass-level failure for test")
+
+        monkeypatch.setattr(
+            tasks_module.repo,
+            "get_nonterminal_trade_plan_outcomes",
+            _raise_pass_failure,
+        )
+
+        with caplog.at_level(logging.INFO, logger="apex.scheduler.tasks"):
+            await tasks_module.run_trade_plan_outcome_evaluation(conn, object(), settings)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any(
+            "Trade plan outcome evaluation complete" in message for message in messages
+        )
+        assert any(
+            "Trade plan outcome evaluation pass error" in message for message in messages
+        )
+    finally:
+        close_db()
+
+
+async def test_completion_summary_counts_success_and_isolated_failure(monkeypatch, tmp_path, caplog):
+    """One pass with one successfully-evaluated plan and one isolated
+    per-plan failure must emit exactly one completion summary reflecting
+    both, without ever leaking plan_uid/symbol/price into that summary line.
+    """
+    import pandas as pd
+
+    from apex.db.connection import close_db, init_db
+    from apex.opportunity.trade_plan_outcome import build_initial_trade_plan_outcome
+    import apex.scheduler.tasks as tasks_module
+
+    db_path = str(tmp_path / "summary_counts.db")
+    conn = init_db(db_path)
+    try:
+        _insert_trade_plan_opportunity(conn, "opp-good")
+        _insert_trade_plan_opportunity(conn, "opp-bad")
+
+        plan_good = _make_trade_plan_for_eval(
+            plan_uid="plan-good", opportunity_uid="opp-good", entry=109.0, stop=100.0
+        )
+        plan_bad = _make_trade_plan_for_eval(
+            plan_uid="plan-bad", opportunity_uid="opp-bad", entry=115.0, stop=105.0
+        )
+        repo.insert_trade_plan_with_outcome(conn, plan_good, build_initial_trade_plan_outcome(plan_good))
+        repo.insert_trade_plan_with_outcome(conn, plan_bad, build_initial_trade_plan_outcome(plan_bad))
+
+        not_before = plan_good.evaluation_not_before_ms
+        duration = 300_000
+        df = pd.DataFrame(
+            [{"open_time": not_before, "open": 110.0, "high": 112.0, "low": 108.0, "close": 110.0}]
+        )
+        store = _SpyCandleStore(df)
+        settings = _trade_plan_eval_settings(db_path)
+        monkeypatch.setattr(tasks_module, "time", _FixedTime((not_before + duration) / 1000.0))
+
+        real_trade_plan_from_row = tasks_module.trade_plan_from_row
+
+        def _failing_trade_plan_from_row(row):
+            if row["plan_uid"] == "plan-bad":
+                raise RuntimeError("forced evaluation failure for test")
+            return real_trade_plan_from_row(row)
+
+        monkeypatch.setattr(tasks_module, "trade_plan_from_row", _failing_trade_plan_from_row)
+
+        with caplog.at_level(logging.INFO, logger="apex.scheduler.tasks"):
+            await tasks_module.run_trade_plan_outcome_evaluation(conn, store, settings)
+
+        summaries = [
+            r.getMessage() for r in caplog.records
+            if "Trade plan outcome evaluation complete" in r.getMessage()
+        ]
+        assert summaries == ["Trade plan outcome evaluation complete: pending=2 evaluated=1 errors=1"]
+        # No row content leaked into the completion summary itself.
+        for line in summaries:
+            assert "plan-good" not in line
+            assert "plan-bad" not in line
+            assert "BTC" not in line
     finally:
         close_db()
 
@@ -2404,3 +2549,78 @@ class TestReconciliationShutdown:
         await main.run()
 
         stop_spy.assert_awaited_once()
+
+
+# ============================================================================
+# /status observability: the four new guardrail booleans, read-only from the
+# already-loaded Settings object, alongside the existing safety fields.
+# ============================================================================
+
+
+class TestStatusGuardrailBooleans:
+    def test_status_reflects_supplied_settings_and_preserves_safety_fields(self, monkeypatch, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from apex.app import create_app
+        from apex.db.connection import close_db, init_db
+
+        conn = init_db(str(tmp_path / "status.db"))
+        try:
+            settings = Settings(
+                opportunity_engine_enabled=True,
+                trade_plan_evidence_enabled=True,
+                candle_reconciliation_enabled=True,
+                candle_diagnostics_enabled=True,
+                alerts_enabled=False,
+                dry_run_mode=True,
+            )
+            # /status resolves settings via get_settings() (cached), matching
+            # every other existing /status field — not the `settings` object
+            # create_app was constructed with.
+            monkeypatch.setattr("apex.config.get_settings", lambda: settings)
+
+            app = create_app(settings=settings, conn=conn)
+            client = TestClient(app)
+
+            resp = client.get("/status")
+            assert resp.status_code == 200
+            body = resp.json()
+
+            assert body["opportunity_engine_enabled"] is True
+            assert body["trade_plan_evidence_enabled"] is True
+            assert body["candle_reconciliation_enabled"] is True
+            assert body["candle_diagnostics_enabled"] is True
+
+            # Existing safety fields remain correct and untouched.
+            assert body["alerts_enabled"] is False
+            assert body["dry_run_mode"] is True
+            assert body["status"] == "ok"
+        finally:
+            close_db()
+
+    def test_status_guardrail_booleans_reflect_all_disabled(self, monkeypatch, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from apex.app import create_app
+        from apex.db.connection import close_db, init_db
+
+        conn = init_db(str(tmp_path / "status_disabled.db"))
+        try:
+            settings = Settings(
+                opportunity_engine_enabled=False,
+                trade_plan_evidence_enabled=False,
+                candle_reconciliation_enabled=False,
+                candle_diagnostics_enabled=False,
+            )
+            monkeypatch.setattr("apex.config.get_settings", lambda: settings)
+
+            app = create_app(settings=settings, conn=conn)
+            client = TestClient(app)
+
+            body = client.get("/status").json()
+            assert body["opportunity_engine_enabled"] is False
+            assert body["trade_plan_evidence_enabled"] is False
+            assert body["candle_reconciliation_enabled"] is False
+            assert body["candle_diagnostics_enabled"] is False
+        finally:
+            close_db()
