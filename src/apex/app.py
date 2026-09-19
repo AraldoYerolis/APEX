@@ -93,6 +93,10 @@ def create_app(settings=None, conn=None) -> FastAPI:
                 "daily_max_loss_usd": daily["max_planned_loss_usd"],
                 "daily_lockout": bool(daily["lockout_active"]),
                 "scheduler_running": scheduler_running,
+                "opportunity_engine_enabled": cfg.opportunity_engine_enabled,
+                "trade_plan_evidence_enabled": cfg.trade_plan_evidence_enabled,
+                "candle_reconciliation_enabled": cfg.candle_reconciliation_enabled,
+                "candle_diagnostics_enabled": cfg.candle_diagnostics_enabled,
             }
         except Exception as e:
             return {"status": "degraded", "error": str(e)}

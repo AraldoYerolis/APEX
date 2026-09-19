@@ -845,6 +845,12 @@ async def run_trade_plan_outcome_evaluation(
     evaluation) is isolated and logged — it never aborts the rest of the
     pass, and this function never writes to opportunity_observations or any
     table other than opportunity_trade_plan_outcomes.
+
+    Exactly one bounded INFO completion summary (pending/evaluated/errors
+    counts only — no row IDs, symbols, prices, or other row content) is
+    emitted per pass once the guard has passed, whether or not there were
+    any nonterminal rows. A pass-level failure (the outer except below)
+    skips the summary entirely rather than risk claiming a false success.
     """
     if not (
         settings.trade_plan_evidence_enabled
@@ -856,10 +862,13 @@ async def run_trade_plan_outcome_evaluation(
     try:
         rows = repo.get_nonterminal_trade_plan_outcomes(conn)
         if not rows:
+            logger.info("Trade plan outcome evaluation complete: pending=0 evaluated=0 errors=0")
             return
 
         now_ms = int(time.time()) * 1000
         frames: dict[tuple[str, str], object] = {}
+        evaluated = 0
+        errors = 0
 
         for row in rows:
             key = (row["symbol"], row["primary_timeframe"])
@@ -870,11 +879,18 @@ async def run_trade_plan_outcome_evaluation(
                 plan = trade_plan_from_row(row)
                 evaluation = evaluate_trade_plan_outcome(plan, df, now_ms)
                 repo.update_trade_plan_outcome(conn, evaluation)
+                evaluated += 1
             except Exception:
+                errors += 1
                 logger.error(
                     f"Trade plan outcome evaluation error: plan_uid={row['plan_uid']} "
                     f"symbol={row['symbol']} timeframe={row['primary_timeframe']}",
                     exc_info=True,
                 )
+
+        logger.info(
+            f"Trade plan outcome evaluation complete: pending={len(rows)} "
+            f"evaluated={evaluated} errors={errors}"
+        )
     except Exception as e:
         logger.error(f"Trade plan outcome evaluation pass error: {e}", exc_info=True)
