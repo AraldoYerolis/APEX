@@ -2,11 +2,70 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from apex.research.gmgn.contract import SUPPORTED_CHAINS as _GMGN_RESEARCH_SUPPORTED_CHAINS
+
+# At most this many comma-separated `chain:contract_address` identities are
+# accepted in gmgn_research_watchlist — see _parse_gmgn_research_watchlist.
+GMGN_RESEARCH_MAX_WATCHLIST_IDENTITIES = 10
+
+
+@dataclass(frozen=True)
+class GmgnWatchlistIdentity:
+    """One validated `chain:contract_address` identity parsed from
+    `Settings.gmgn_research_watchlist`. A ticker/symbol is never identity —
+    only `chain` + `contract_address` (see apex.research.gmgn.normalize)."""
+
+    chain: str
+    contract_address: str
+
+
+def _parse_gmgn_research_watchlist(raw: str) -> tuple[GmgnWatchlistIdentity, ...]:
+    """Parses `gmgn_research_watchlist` into at most
+    GMGN_RESEARCH_MAX_WATCHLIST_IDENTITIES validated, deduplicated (exact
+    identity, first-seen order) identities.
+
+    Fails closed to an empty tuple — never a partial/best-effort result — on
+    any malformed segment (not exactly one `:`), any empty or
+    whitespace-only comma-separated segment (leading, trailing, or interior,
+    e.g. doubled commas), empty chain/address, an unsupported chain, an
+    empty watchlist, or more than GMGN_RESEARCH_MAX_WATCHLIST_IDENTITIES
+    comma-separated segments. Address case is preserved exactly (only
+    surrounding whitespace is trimmed).
+    """
+    if not raw or not raw.strip():
+        return ()
+    raw_segments = raw.split(",")
+    if len(raw_segments) > GMGN_RESEARCH_MAX_WATCHLIST_IDENTITIES:
+        return ()
+    segments: list[str] = []
+    for raw_segment in raw_segments:
+        segment = raw_segment.strip()
+        if not segment:
+            return ()
+        segments.append(segment)
+    seen: dict[tuple[str, str], None] = {}
+    for segment in segments:
+        # Exactly one colon required — "chain:contract_address" only, never
+        # "chain:addr:extra" (no known supported address format uses a
+        # colon, so treating extra colons as malformed is the fail-closed
+        # choice rather than guessing which part is the real address).
+        parts = segment.split(":")
+        if len(parts) != 2:
+            return ()
+        chain, address = parts[0].strip(), parts[1].strip()
+        if not chain or not address:
+            return ()
+        if chain not in _GMGN_RESEARCH_SUPPORTED_CHAINS:
+            return ()
+        seen.setdefault((chain, address), None)
+    return tuple(GmgnWatchlistIdentity(chain=c, contract_address=a) for c, a in seen)
 
 
 class Settings(BaseSettings):
@@ -68,6 +127,24 @@ class Settings(BaseSettings):
     # fixed, code-reviewed default in CandleReconciler — not runtime
     # configuration — per the approved scope for this flag.
     candle_reconciliation_enabled: bool = False
+
+    # GMGN read-only research runtime seam v0.1 (research-only, additive —
+    # see src/apex/research/gmgn/runtime.py). Default-off. When true, main.py
+    # registers exactly one additional scheduler job that calls
+    # run_gmgn_research_scan with settings only — that wiring deliberately
+    # never injects a real transport for this milestone, so the job always
+    # takes the enabled-with-no-transport fail-closed path (see
+    # runtime.run_gmgn_research_scan). The runtime itself re-checks this flag
+    # at entry (defense in depth) and never performs I/O, touches an
+    # injected transport, or parses the watchlist when disabled. Never
+    # imports apex.notifications/apex.strategy/apex.actions, writes to a
+    # database, or reaches a broker/exchange.
+    gmgn_research_enabled: bool = False
+    # Comma-separated `chain:contract_address` identities (at most
+    # GMGN_RESEARCH_MAX_WATCHLIST_IDENTITIES), validated and deduplicated by
+    # gmgn_research_watchlist_identities below. A ticker/symbol is never
+    # identity — only chain+contract_address.
+    gmgn_research_watchlist: str = ""
 
     # FastAPI
     apex_host: str = "127.0.0.1"
@@ -140,6 +217,10 @@ class Settings(BaseSettings):
     @property
     def excluded_symbols_list(self) -> list[str]:
         return [s.strip().upper() for s in self.excluded_symbols.split(",") if s.strip()]
+
+    @property
+    def gmgn_research_watchlist_identities(self) -> tuple[GmgnWatchlistIdentity, ...]:
+        return _parse_gmgn_research_watchlist(self.gmgn_research_watchlist)
 
     @property
     def max_risk_usd(self) -> float:

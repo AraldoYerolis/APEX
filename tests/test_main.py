@@ -1367,6 +1367,7 @@ async def _run_startup_with_mocks(
     opportunity_engine_enabled: bool = False,
     trade_plan_evidence_enabled: bool = False,
     dry_run_mode: bool = True,
+    gmgn_research_enabled: bool = False,
 ) -> "_FakeScheduler":
     """Drive the real run() startup path with every external-I/O boundary
     mocked (network refresh/backfill, uvicorn serve, log file setup) so the
@@ -1386,6 +1387,7 @@ async def _run_startup_with_mocks(
             opportunity_engine_enabled=opportunity_engine_enabled,
             trade_plan_evidence_enabled=trade_plan_evidence_enabled,
             dry_run_mode=dry_run_mode,
+            gmgn_research_enabled=gmgn_research_enabled,
         ),
     )
     monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC"]))
@@ -1521,6 +1523,82 @@ async def test_trade_plan_evaluation_defensive_guard_when_called_directly(tmp_pa
         assert conn.execute("SELECT COUNT(*) FROM opportunity_trade_plan_outcomes").fetchone()[0] == 0
     finally:
         close_db()
+
+
+# ============================================================================
+# GMGN read-only research runtime seam v0.1 — scheduler registration,
+# default off, additive-only (see apex.research.gmgn.runtime).
+# ============================================================================
+
+
+async def test_scheduler_registers_gmgn_research_scan_job_when_enabled(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False, gmgn_research_enabled=True,
+    )
+    assert "gmgn_research_scan" in scheduler.job_ids
+    assert scheduler.job_ids.count("gmgn_research_scan") == 1
+
+
+async def test_scheduler_omits_gmgn_research_scan_job_when_disabled(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False, gmgn_research_enabled=False,
+    )
+    assert "gmgn_research_scan" not in scheduler.job_ids
+    # Unrelated always-on jobs must still register normally.
+    assert set(scheduler.job_ids) >= {"universe_refresh", "signal_scan", "followup_check"}
+
+
+async def test_gmgn_research_scan_job_uses_a_conservative_single_flight_interval(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False, gmgn_research_enabled=True,
+    )
+    kwargs = scheduler.job_kwargs["gmgn_research_scan"]
+    assert kwargs["minutes"] == main.GMGN_RESEARCH_SCAN_INTERVAL_MINUTES
+    assert kwargs["max_instances"] == 1
+    assert kwargs["coalesce"] is True
+    assert kwargs["misfire_grace_time"] == 1
+
+
+async def test_gmgn_research_scan_job_is_passed_settings_only_no_real_transport(monkeypatch, tmp_path):
+    """The job wiring must never inject a real transport for this
+    milestone — args must be exactly [settings]."""
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False, gmgn_research_enabled=True,
+    )
+    kwargs = scheduler.job_kwargs["gmgn_research_scan"]
+    assert len(kwargs["args"]) == 1
+    assert isinstance(kwargs["args"][0], Settings)
+
+
+async def test_gmgn_research_flag_does_not_disturb_preexisting_jobs(monkeypatch, tmp_path):
+    """Enabling the new flag must not add, remove, or reconfigure any
+    other job."""
+    tmp_path_a = tmp_path / "run_a"
+    tmp_path_a.mkdir()
+    tmp_path_b = tmp_path / "run_b"
+    tmp_path_b.mkdir()
+
+    baseline = await _run_startup_with_mocks(
+        monkeypatch, tmp_path_a, candle_diagnostics_enabled=True,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        gmgn_research_enabled=False,
+    )
+    with_gmgn = await _run_startup_with_mocks(
+        monkeypatch, tmp_path_b, candle_diagnostics_enabled=True,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        gmgn_research_enabled=True,
+    )
+    baseline_ids = set(baseline.job_ids)
+    with_gmgn_ids = set(with_gmgn.job_ids)
+    assert with_gmgn_ids - baseline_ids == {"gmgn_research_scan"}
+    for job_id in baseline_ids:
+        # "args" holds per-run objects (DB connections, CandleStore, etc.)
+        # that are never equal across two separate run() calls even when
+        # unchanged in shape — compare every other scheduling parameter
+        # instead (interval, single-flight options, ...).
+        baseline_kwargs = {k: v for k, v in baseline.job_kwargs[job_id].items() if k != "args"}
+        with_gmgn_kwargs = {k: v for k, v in with_gmgn.job_kwargs[job_id].items() if k != "args"}
+        assert baseline_kwargs == with_gmgn_kwargs
 
 
 # ============================================================================
