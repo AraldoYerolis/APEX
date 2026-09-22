@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -1212,3 +1214,217 @@ def update_trade_plan_outcome(
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+# ------------------------------------------------------------------ shadow_alert_decisions
+# Shadow Alert Runtime Wiring v0.1 — additive, append-only, research-only.
+# Only apex.opportunity.shadow_runtime calls these; never the engine,
+# scheduler tasks, or any alert/trade path. See schema.sql's
+# shadow_alert_decisions table docstring.
+
+
+def get_active_shadow_candidate_rows(conn: sqlite3.Connection, *, limit: int) -> list[sqlite3.Row]:
+    """Read-only join for Shadow Alert Runtime Wiring v0.1 candidate
+    evidence — LEFT JOINs opportunity_observations (status='ACTIVE') to its
+    at-most-one trade plan and that plan's at-most-one outcome row,
+    mirroring get_board_opportunities' join shape. Only
+    apex.opportunity.shadow_runtime calls this. Ordered by opportunity_uid
+    ASC for deterministic, stable batch ordering across runs. Bounded by
+    `limit`; the caller must fail closed on overflow rather than silently
+    truncate.
+    """
+    return conn.execute(
+        """
+        SELECT
+            o.opportunity_uid AS opportunity_uid,
+            o.symbol AS symbol,
+            o.direction AS direction,
+            o.setup_family AS setup_family,
+            o.primary_timeframe AS primary_timeframe,
+            o.status AS opportunity_status,
+            o.research_only AS research_only,
+            o.contract_version AS opportunity_contract_version,
+            o.last_seen_at AS last_seen_at,
+            o.score_version AS score_version,
+            p.plan_contract_version AS plan_contract_version,
+            p.availability AS plan_availability,
+            p.entry_price AS entry_price,
+            p.stop_price AS stop_price,
+            p.target_1r_price AS target_1r_price,
+            p.target_2r_price AS target_2r_price,
+            p.evaluation_not_before_ms AS evaluation_not_before_ms,
+            p.evaluation_expiry_ms AS evaluation_expiry_ms,
+            po.contract_version AS outcome_contract_version,
+            po.state AS outcome_state,
+            po.data_quality AS outcome_data_quality,
+            po.is_ambiguous AS outcome_is_ambiguous
+        FROM opportunity_observations o
+        LEFT JOIN opportunity_trade_plans p ON p.opportunity_uid = o.opportunity_uid
+        LEFT JOIN opportunity_trade_plan_outcomes po ON po.plan_uid = p.plan_uid
+        WHERE o.status = 'ACTIVE'
+        ORDER BY o.opportunity_uid ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def get_shadow_quality_rows(conn: sqlite3.Connection, *, limit: int) -> list[sqlite3.Row]:
+    """Read-only join mirroring scripts/report_opportunity_quality.py's own
+    load_rows join shape, scoped for the live shadow runtime's exact-cohort
+    quality report input (see apex.opportunity.shadow_runtime) rather than
+    that standalone read-only report script's own separate mode=ro
+    connection. Ordered by opportunity_uid ASC for determinism. Bounded by
+    `limit`; the caller must fail closed on overflow rather than silently
+    truncate.
+    """
+    return conn.execute(
+        """
+        SELECT
+            o.opportunity_uid AS opportunity_uid,
+            o.symbol AS symbol,
+            o.direction AS direction,
+            o.setup_family AS setup_family,
+            o.primary_timeframe AS primary_timeframe,
+            o.total_score AS total_score,
+            o.score_version AS score_version,
+            p.availability AS plan_availability,
+            p.evaluation_not_before_ms AS evaluation_not_before_ms,
+            p.evaluation_expiry_ms AS evaluation_expiry_ms,
+            po.state AS outcome_state
+        FROM opportunity_observations o
+        LEFT JOIN opportunity_trade_plans p ON p.opportunity_uid = o.opportunity_uid
+        LEFT JOIN opportunity_trade_plan_outcomes po ON po.plan_uid = p.plan_uid
+        ORDER BY o.opportunity_uid ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def get_shadow_emitted_decisions(
+    conn: sqlite3.Connection, pilot_id: str, *, limit: int
+) -> list[sqlite3.Row]:
+    """Every would_emit=1 shadow_alert_decisions row for this pilot,
+    read-only, ordered by run_at ASC then opportunity_uid ASC for
+    deterministic reconstruction — see apex.opportunity.shadow_runtime,
+    which uses this to rebuild PriorShadowState (emitted uids, open
+    evaluation-window clusters, cooldowns, hourly/daily caps) on every run
+    so a process restart never resets suppression state. Bounded by
+    `limit`; the caller must fail closed on overflow rather than silently
+    truncate.
+    """
+    return conn.execute(
+        """
+        SELECT opportunity_uid, symbol, direction, run_at,
+               evaluation_not_before_ms, evaluation_expiry_ms
+        FROM shadow_alert_decisions
+        WHERE pilot_id = ? AND would_emit = 1
+        ORDER BY run_at ASC, opportunity_uid ASC
+        LIMIT ?
+        """,
+        (pilot_id, limit),
+    ).fetchall()
+
+
+@dataclass(frozen=True)
+class ShadowDecisionRecord:
+    """One row's worth of already-fully-computed Shadow Alert Runtime
+    Wiring v0.1 decision evidence, built by apex.opportunity.shadow_runtime
+    and persisted verbatim by insert_shadow_decisions below. Every JSON
+    field is already-serialized text; this module never re-derives or
+    re-validates it.
+    """
+
+    pilot_id: str
+    evaluator_version: str
+    runtime_version: str
+    run_at: str
+    opportunity_uid: str
+    symbol: str
+    direction: str
+    setup_family: str
+    primary_timeframe: str
+    evaluation_not_before_ms: Optional[int]
+    evaluation_expiry_ms: Optional[int]
+    entry_price: Optional[float]
+    stop_price: Optional[float]
+    target_1r_price: Optional[float]
+    target_2r_price: Optional[float]
+    market_snapshot_json: Optional[str]
+    cost_fee_r: Optional[float]
+    cost_slippage_r: Optional[float]
+    cost_total_r: Optional[float]
+    cohort_evidence_json: Optional[str]
+    would_emit: bool
+    reason_codes_json: str
+    message: Optional[str]
+    rule_evidence_json: str
+
+
+def insert_shadow_decisions(
+    conn: sqlite3.Connection, records: Sequence[ShadowDecisionRecord]
+) -> int:
+    """Append-only, all-or-nothing batch insert into shadow_alert_decisions.
+
+    The whole batch runs inside one explicit transaction — on any failure
+    everything is rolled back rather than partially persisted. Idempotent
+    via INSERT OR IGNORE against the table's own
+    UNIQUE(pilot_id, run_at, opportunity_uid) constraint: an exact repeated
+    (run_at, opportunity_uid) pair for the same pilot is silently a no-op,
+    never a duplicate row or an error. Returns the number of rows actually
+    newly inserted (0 for an exact-repeat batch). Never writes to alerts,
+    paper_trades, daily_risk, any signal table, or any opportunity/plan/
+    outcome table.
+    """
+    if not records:
+        return 0
+    try:
+        conn.execute("BEGIN")
+        inserted = 0
+        for r in records:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO shadow_alert_decisions (
+                    pilot_id, evaluator_version, runtime_version, run_at,
+                    opportunity_uid, symbol, direction, setup_family, primary_timeframe,
+                    evaluation_not_before_ms, evaluation_expiry_ms,
+                    entry_price, stop_price, target_1r_price, target_2r_price,
+                    market_snapshot_json, cost_fee_r, cost_slippage_r, cost_total_r,
+                    cohort_evidence_json, would_emit, reason_codes_json, message,
+                    rule_evidence_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    r.pilot_id,
+                    r.evaluator_version,
+                    r.runtime_version,
+                    r.run_at,
+                    r.opportunity_uid,
+                    r.symbol,
+                    r.direction,
+                    r.setup_family,
+                    r.primary_timeframe,
+                    r.evaluation_not_before_ms,
+                    r.evaluation_expiry_ms,
+                    r.entry_price,
+                    r.stop_price,
+                    r.target_1r_price,
+                    r.target_2r_price,
+                    r.market_snapshot_json,
+                    r.cost_fee_r,
+                    r.cost_slippage_r,
+                    r.cost_total_r,
+                    r.cohort_evidence_json,
+                    int(r.would_emit),
+                    r.reason_codes_json,
+                    r.message,
+                    r.rule_evidence_json,
+                ),
+            )
+            inserted += cur.rowcount
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise

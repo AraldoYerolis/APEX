@@ -230,6 +230,31 @@ class ReconciliationTarget:
 
 
 @dataclass(frozen=True)
+class LiveWsSnapshot:
+    """Immutable, copy-safe snapshot of the latest ACCEPTED live WS candle
+    observation for one (symbol, timeframe) — forming or closed, whichever
+    this store most recently accepted on source="ws" (never backfill,
+    preload, or reconciliation — see CandleStore.get_latest_live_snapshot).
+    `received_at_ms` is exactly the `now_ms` (or its wall-clock default)
+    `update()` was called with for this observation — never a separate,
+    later clock read — so a caller judges this snapshot's own freshness
+    against its own later `now`, not against whatever real time.time()
+    happens to read when it asks. A plain-field frozen dataclass, never a
+    reference into this store's own mutable in-memory row.
+    """
+
+    symbol: str
+    timeframe: str
+    open_time: int
+    close_time: Optional[int]
+    open: float
+    high: float
+    low: float
+    close: float
+    received_at_ms: int
+
+
+@dataclass(frozen=True)
 class CandleUpdateResult:
     """Backwards-compatible richer outcome of one `update()` call.
 
@@ -504,6 +529,14 @@ class CandleStore:
         # {(symbol, timeframe): deque of dicts sorted oldest-first}
         self._data: dict[tuple[str, str], list[dict]] = defaultdict(list)
         self._last_update: dict[tuple[str, str], float] = {}
+        # Bounded (one entry per (symbol, timeframe) actually observed on
+        # the live WS path — see update()'s source="ws" branch), always-on,
+        # read-only-facing snapshot of the latest accepted live WS
+        # observation. Independent of diagnostics/reconciliation: never
+        # gated by diagnostics_enabled/reconciliation_enabled, and never
+        # cleared by their membership-epoch resets. See LiveWsSnapshot and
+        # get_latest_live_snapshot.
+        self._live_ws_snapshots: dict[tuple[str, str], LiveWsSnapshot] = {}
         # Bounded, opt-in diagnostics (see CandleDiagnostics). Disabled by
         # default: nothing is allocated or updated unless explicitly enabled.
         self._diagnostics_enabled = diagnostics_enabled
@@ -1122,6 +1155,25 @@ class CandleStore:
 
         self._last_update[key] = time.time()
 
+        # Bounded live-WS-only snapshot bookkeeping (see LiveWsSnapshot /
+        # get_latest_live_snapshot). Recorded only for an actually-accepted
+        # source="ws" observation (the finalized-sample-protection early
+        # return above already exited before this point), forming or
+        # closed — this is deliberately independent of is_closed/persist
+        # decisions below, and never itself reads a real clock.
+        if source == "ws":
+            self._live_ws_snapshots[key] = LiveWsSnapshot(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                close_time=close_time,
+                open=normalized["open"],
+                high=normalized["high"],
+                low=normalized["low"],
+                close=normalized["close"],
+                received_at_ms=effective_now_ms,
+            )
+
         # Reconciliation gap-window bookkeeping (see module docstring
         # section above). WS-only max-open tracking/candidate registration
         # happens regardless of persist outcome — it is about in-memory
@@ -1403,6 +1455,17 @@ class CandleStore:
 
     def candle_count(self, symbol: str, timeframe: str) -> int:
         return len(self._data.get((symbol, timeframe), []))
+
+    def get_latest_live_snapshot(self, symbol: str, timeframe: str) -> Optional[LiveWsSnapshot]:
+        """Read-only access to the latest ACCEPTED live WS observation for
+        (symbol, timeframe) — forming or closed. None if this store has
+        never accepted a source="ws" update for this pair. Never falls back
+        to preload/backfill/reconciliation data, a closed-candle timestamp,
+        `time.time()`, or a fabricated current timestamp — a missing/stale
+        live WS observation stays missing/stale to the caller (see
+        apex.opportunity.shadow_runtime, the only intended consumer).
+        """
+        return self._live_ws_snapshots.get((symbol, timeframe))
 
 
 def _normalize(

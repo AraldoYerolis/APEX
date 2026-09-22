@@ -34,6 +34,7 @@ from apex.db import repository as repo
 from apex.logging_config import configure_logging
 from apex.notifications.pushover_client import PushoverClient
 from apex.opportunity.engine import run_opportunity_scan
+from apex.opportunity.shadow_runtime import run_shadow_alert_runtime
 from apex.research.gmgn.runtime import run_gmgn_research_scan
 from apex.scheduler.tasks import (
     run_followup_check,
@@ -81,6 +82,12 @@ MAX_DIAGNOSTIC_LINE_CHARS = 512
 # conservative fixed interval since every scan reaches out to an external
 # vendor per watchlist identity, unlike the local-data jobs above.
 GMGN_RESEARCH_SCAN_INTERVAL_MINUTES = 15
+
+# Shadow Alert Runtime Wiring v0.1 — bounded, local, default-off (see
+# settings.shadow_alert_pilot_enabled and apex.opportunity.shadow_runtime).
+# A conservative fixed interval suitable for shadow_alerts.py's own
+# 120-second market-snapshot freshness gate.
+SHADOW_ALERT_RUNTIME_SCAN_INTERVAL_SECONDS = 60
 
 # Module-level state (accessible by tasks)
 _candle_store: Optional[CandleStore] = None
@@ -780,6 +787,33 @@ async def run() -> None:
             minutes=GMGN_RESEARCH_SCAN_INTERVAL_MINUTES,
             args=[settings],
             id="gmgn_research_scan",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
+        )
+
+    # Shadow Alert Runtime Wiring v0.1 — additive, research-only, bounded,
+    # default-off (see settings.shadow_alert_pilot_enabled and
+    # apex.opportunity.shadow_runtime). Registered here AND re-checked
+    # inside run_shadow_alert_runtime itself (same defense-in-depth pattern
+    # as the jobs above): only when every one of shadow_alert_pilot_enabled,
+    # opportunity_engine_enabled, trade_plan_evidence_enabled,
+    # dry_run_mode, and (not alerts_enabled) all hold. Never sends anything,
+    # never touches alerts/paper_trades/daily_risk, and never reaches a
+    # broker/exchange.
+    if (
+        settings.shadow_alert_pilot_enabled
+        and settings.opportunity_engine_enabled
+        and settings.trade_plan_evidence_enabled
+        and settings.dry_run_mode
+        and not settings.alerts_enabled
+    ):
+        scheduler.add_job(
+            run_shadow_alert_runtime,
+            "interval",
+            seconds=SHADOW_ALERT_RUNTIME_SCAN_INTERVAL_SECONDS,
+            args=[conn, _candle_store, settings],
+            id="shadow_alert_runtime",
             max_instances=1,
             coalesce=True,
             misfire_grace_time=1,
