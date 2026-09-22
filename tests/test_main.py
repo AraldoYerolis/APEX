@@ -1367,7 +1367,9 @@ async def _run_startup_with_mocks(
     opportunity_engine_enabled: bool = False,
     trade_plan_evidence_enabled: bool = False,
     dry_run_mode: bool = True,
+    alerts_enabled: bool = False,
     gmgn_research_enabled: bool = False,
+    shadow_alert_pilot_enabled: bool = False,
 ) -> "_FakeScheduler":
     """Drive the real run() startup path with every external-I/O boundary
     mocked (network refresh/backfill, uvicorn serve, log file setup) so the
@@ -1387,7 +1389,14 @@ async def _run_startup_with_mocks(
             opportunity_engine_enabled=opportunity_engine_enabled,
             trade_plan_evidence_enabled=trade_plan_evidence_enabled,
             dry_run_mode=dry_run_mode,
+            alerts_enabled=alerts_enabled,
             gmgn_research_enabled=gmgn_research_enabled,
+            shadow_alert_pilot_enabled=shadow_alert_pilot_enabled,
+            shadow_alert_pilot_id="pilot-001",
+            shadow_alert_pilot_start_at="2026-01-01T00:00:00Z",
+            shadow_alert_pilot_deadline_at="2026-01-02T00:00:00Z",
+            shadow_alert_pilot_fee_r=0.02,
+            shadow_alert_pilot_slippage_r=0.01,
         ),
     )
     monkeypatch.setattr(main, "run_universe_refresh", AsyncMock(return_value=["BTC"]))
@@ -1628,6 +1637,137 @@ async def test_completion_summary_emitted_for_zero_nonterminal_rows(tmp_path, ca
             if "Trade plan outcome evaluation complete" in r.getMessage()
         ]
         assert summaries == ["Trade plan outcome evaluation complete: pending=0 evaluated=0 errors=0"]
+    finally:
+        close_db()
+
+
+# ============================================================================
+# Shadow Alert Runtime Wiring v0.1 — scheduler registration, default off,
+# quintuple guard (shadow_alert_pilot_enabled AND opportunity_engine_enabled
+# AND trade_plan_evidence_enabled AND dry_run_mode AND NOT alerts_enabled).
+# ============================================================================
+
+
+async def test_shadow_alert_runtime_job_registered_when_all_five_guards_true(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        dry_run_mode=True, alerts_enabled=False, shadow_alert_pilot_enabled=True,
+    )
+    assert "shadow_alert_runtime" in scheduler.job_ids
+    assert scheduler.job_ids.count("shadow_alert_runtime") == 1
+
+
+async def test_shadow_alert_runtime_job_omitted_by_default(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(monkeypatch, tmp_path, candle_diagnostics_enabled=False)
+    assert "shadow_alert_runtime" not in scheduler.job_ids
+    # Unrelated always-on jobs must still register normally.
+    assert set(scheduler.job_ids) >= {"universe_refresh", "signal_scan", "followup_check"}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"opportunity_engine_enabled": False, "trade_plan_evidence_enabled": True, "dry_run_mode": True, "alerts_enabled": False},
+        {"opportunity_engine_enabled": True, "trade_plan_evidence_enabled": False, "dry_run_mode": True, "alerts_enabled": False},
+        {"opportunity_engine_enabled": True, "trade_plan_evidence_enabled": True, "dry_run_mode": False, "alerts_enabled": False},
+        {"opportunity_engine_enabled": True, "trade_plan_evidence_enabled": True, "dry_run_mode": True, "alerts_enabled": True},
+    ],
+)
+async def test_shadow_alert_runtime_job_omitted_when_any_single_guard_false(monkeypatch, tmp_path, overrides):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        shadow_alert_pilot_enabled=True, **overrides,
+    )
+    assert "shadow_alert_runtime" not in scheduler.job_ids
+
+
+async def test_shadow_alert_runtime_job_is_single_flight_with_conservative_interval(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        dry_run_mode=True, alerts_enabled=False, shadow_alert_pilot_enabled=True,
+    )
+    kwargs = scheduler.job_kwargs["shadow_alert_runtime"]
+    assert kwargs["seconds"] == main.SHADOW_ALERT_RUNTIME_SCAN_INTERVAL_SECONDS
+    assert kwargs["seconds"] <= 60
+    assert kwargs["max_instances"] == 1
+    assert kwargs["coalesce"] is True
+    assert kwargs["misfire_grace_time"] == 1
+
+
+async def test_shadow_alert_runtime_job_passed_conn_candle_store_settings(monkeypatch, tmp_path):
+    scheduler = await _run_startup_with_mocks(
+        monkeypatch, tmp_path, candle_diagnostics_enabled=False,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        dry_run_mode=True, alerts_enabled=False, shadow_alert_pilot_enabled=True,
+    )
+    kwargs = scheduler.job_kwargs["shadow_alert_runtime"]
+    assert len(kwargs["args"]) == 3
+    conn, candle_store, settings = kwargs["args"]
+    assert isinstance(settings, Settings)
+    from apex.data.candle_store import CandleStore
+    assert isinstance(candle_store, CandleStore)
+
+
+async def test_shadow_alert_pilot_flag_does_not_disturb_preexisting_jobs(monkeypatch, tmp_path):
+    """Enabling the new flag (with its guards satisfied) must not add,
+    remove, or reconfigure any other job."""
+    tmp_path_a = tmp_path / "run_a"
+    tmp_path_a.mkdir()
+    tmp_path_b = tmp_path / "run_b"
+    tmp_path_b.mkdir()
+
+    baseline = await _run_startup_with_mocks(
+        monkeypatch, tmp_path_a, candle_diagnostics_enabled=True,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        dry_run_mode=True, alerts_enabled=False, shadow_alert_pilot_enabled=False,
+    )
+    with_shadow = await _run_startup_with_mocks(
+        monkeypatch, tmp_path_b, candle_diagnostics_enabled=True,
+        opportunity_engine_enabled=True, trade_plan_evidence_enabled=True,
+        dry_run_mode=True, alerts_enabled=False, shadow_alert_pilot_enabled=True,
+    )
+    baseline_ids = set(baseline.job_ids)
+    with_shadow_ids = set(with_shadow.job_ids)
+    assert with_shadow_ids - baseline_ids == {"shadow_alert_runtime"}
+    for job_id in baseline_ids:
+        baseline_kwargs = {k: v for k, v in baseline.job_kwargs[job_id].items() if k != "args"}
+        with_shadow_kwargs = {k: v for k, v in with_shadow.job_kwargs[job_id].items() if k != "args"}
+        assert baseline_kwargs == with_shadow_kwargs
+
+
+async def test_shadow_alert_runtime_defensive_guard_when_called_directly(tmp_path):
+    """Mirrors run_opportunity_scan's own defensive re-check: calling
+    run_shadow_alert_runtime directly (outside main.run()'s scheduler
+    wiring) with a guard false must be a safe, total no-op — no candidate
+    read, no query, no write.
+    """
+    from apex.db.connection import close_db, init_db
+    from apex.opportunity.shadow_runtime import run_shadow_alert_runtime
+
+    db_path = str(tmp_path / "guard_direct.db")
+    conn = init_db(db_path)
+    try:
+        settings = Settings(
+            apex_db_path=db_path,
+            shadow_alert_pilot_enabled=True,
+            opportunity_engine_enabled=False,  # guard false
+            trade_plan_evidence_enabled=True,
+            dry_run_mode=True,
+            alerts_enabled=False,
+            shadow_alert_pilot_id="pilot-001",
+            shadow_alert_pilot_start_at="2026-01-01T00:00:00Z",
+            shadow_alert_pilot_deadline_at="2026-01-02T00:00:00Z",
+        )
+
+        class _ExplodingCandleStore:
+            def get_latest_live_snapshot(self, *a, **kw):
+                raise AssertionError("must never be called when a guard is false")
+
+        result = await run_shadow_alert_runtime(conn, _ExplodingCandleStore(), settings)
+        assert result.ran is False
+        assert conn.execute("SELECT COUNT(*) FROM shadow_alert_decisions").fetchone()[0] == 0
     finally:
         close_db()
 

@@ -128,6 +128,33 @@ class Settings(BaseSettings):
     # configuration — per the approved scope for this flag.
     candle_reconciliation_enabled: bool = False
 
+    # Shadow Alert Runtime Wiring v0.1 (research-only, additive, default-off
+    # — see src/apex/opportunity/shadow_runtime.py). The runtime re-checks
+    # every one of these, plus opportunity_engine_enabled,
+    # trade_plan_evidence_enabled, dry_run_mode, and alerts_enabled, at its
+    # own entry point (defense in depth) before any candidate/cohort/
+    # history/database read — see shadow_runtime.py and main.py's scheduler
+    # wiring. Never sends anything, never mutates configuration to stop
+    # itself, never writes to alerts/paper_trades/daily_risk/signal tables/
+    # opportunity rows/plans/outcomes, and never reaches a broker/exchange,
+    # notification transport, or order/trade path.
+    shadow_alert_pilot_enabled: bool = False
+    # Free-text pilot identity; must be non-empty for the runtime to ever
+    # run (see shadow_runtime.resolve_pilot_state).
+    shadow_alert_pilot_id: str = ""
+    # ISO8601 UTC ("%Y-%m-%dT%H:%M:%SZ"), aware, start < deadline, spanning
+    # at most 24 hours. Missing/malformed/non-UTC/nonfinite/negative/
+    # reversed/expired/more-than-24-hours-apart settings fail the pilot
+    # closed without evaluating any candidate — see
+    # shadow_runtime.resolve_pilot_state.
+    shadow_alert_pilot_start_at: str = ""
+    shadow_alert_pilot_deadline_at: str = ""
+    # Explicit, nonnegative round-trip cost assumptions in R. fee_r +
+    # slippage_r is the one total cost both the exact cohort report and the
+    # shadow-alert evaluator use — see shadow_runtime.py.
+    shadow_alert_pilot_fee_r: float = 0.0
+    shadow_alert_pilot_slippage_r: float = 0.0
+
     # GMGN read-only research runtime seam v0.1 (research-only, additive —
     # see src/apex/research/gmgn/runtime.py). Default-off. When true, main.py
     # registers exactly one additional scheduler job that calls

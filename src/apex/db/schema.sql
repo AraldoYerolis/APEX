@@ -435,3 +435,53 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plan_outcomes_state
     ON opportunity_trade_plan_outcomes(state);
 CREATE INDEX IF NOT EXISTS idx_opportunity_trade_plan_outcomes_plan_uid
     ON opportunity_trade_plan_outcomes(plan_uid);
+
+-- ---------------------------------------------------------------
+-- shadow_alert_decisions
+-- Shadow Alert Runtime Wiring v0.1 — additive, append-only, research-only
+-- evidence of every apex.opportunity.shadow_alerts decision the runtime
+-- adapter (apex.opportunity.shadow_runtime) actually evaluated during a
+-- bounded shadow-alert pilot. Never written to by the engine, scheduler
+-- tasks, or any alert/trade path, and never read by them either.
+-- Completely separate from alerts, paper_trades, daily_risk, signal
+-- tables, opportunity_observations, opportunity_trade_plans, and
+-- opportunity_trade_plan_outcomes — nothing here is ever joined back into
+-- those tables' own write paths. UNIQUE(pilot_id, run_at, opportunity_uid)
+-- enforces exact-repeated-run/candidate idempotency at the database level
+-- (see db/repository.py's insert_shadow_decisions, INSERT OR IGNORE).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shadow_alert_decisions (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pilot_id                    TEXT NOT NULL,
+    evaluator_version           TEXT NOT NULL,
+    runtime_version             TEXT NOT NULL,
+    run_at                      TEXT NOT NULL,       -- ISO8601 UTC, millisecond precision;
+                                                       -- the one deterministic run identity/timestamp for this batch
+    opportunity_uid             TEXT NOT NULL,
+    symbol                      TEXT NOT NULL,
+    direction                   TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+    setup_family                TEXT NOT NULL,
+    primary_timeframe           TEXT NOT NULL,
+    evaluation_not_before_ms    INTEGER,
+    evaluation_expiry_ms        INTEGER,
+    entry_price                 REAL,
+    stop_price                  REAL,
+    target_1r_price             REAL,
+    target_2r_price             REAL,
+    market_snapshot_json        TEXT,
+    cost_fee_r                  REAL,
+    cost_slippage_r             REAL,
+    cost_total_r                REAL,
+    cohort_evidence_json        TEXT,
+    would_emit                  INTEGER NOT NULL DEFAULT 0,
+    reason_codes_json           TEXT NOT NULL,
+    message                     TEXT,
+    rule_evidence_json          TEXT NOT NULL,
+    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(pilot_id, run_at, opportunity_uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_alert_decisions_pilot_emitted
+    ON shadow_alert_decisions(pilot_id, would_emit, run_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_alert_decisions_pilot_uid
+    ON shadow_alert_decisions(pilot_id, opportunity_uid);
